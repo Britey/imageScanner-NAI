@@ -3,12 +3,15 @@ from __future__ import annotations
 import html
 import json
 import mimetypes
+import ctypes
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import tempfile
 import urllib.parse
+from ctypes import wintypes
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -310,20 +313,24 @@ def _make_handler(state: WebState):
             if row is None:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            path = Path(row["path"])
-            subprocess.Popen(
-                ["explorer.exe", f'/select,"{path}"'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            path = Path(row["path"]).resolve()
+            _show_path_in_folder(path)
             text = _text(lang)
             self._send_html(
                 _page(
                     text["folder_opened"],
                     f"""
-                    <nav><a href="javascript:history.back()">{text['new_search']}</a></nav>
-                    <h1>{text['folder_opened']}</h1>
-                    <p class="path">{html.escape(str(path))}</p>
+                    <p class="muted">{text['folder_opened']}</p>
+                    <script>
+                      if (history.length > 1) {{
+                        history.back();
+                      }} else {{
+                        window.close();
+                        setTimeout(() => {{
+                          window.location.href = "/";
+                        }}, 200);
+                      }}
+                    </script>
                     """,
                     lang=lang,
                 )
@@ -897,6 +904,72 @@ def _write_thumbnail(source: Path, target: Path, thumbnail_size: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def _show_path_in_folder(path: Path) -> None:
+    if os.name == "nt" and path.exists():
+        try:
+            _sh_open_folder_and_select(path)
+            return
+        except OSError:
+            pass
+    target = path.parent if path.exists() else path.parent
+    subprocess.Popen(
+        ["explorer.exe", str(target)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _sh_open_folder_and_select(path: Path) -> None:
+    ole32 = ctypes.OleDLL("ole32")
+    shell32 = ctypes.OleDLL("shell32")
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoInitialize.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    shell32.SHParseDisplayName.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    shell32.SHParseDisplayName.restype = ctypes.c_long
+    shell32.SHOpenFolderAndSelectItems.argtypes = [
+        ctypes.c_void_p,
+        wintypes.UINT,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+
+    pidl = ctypes.c_void_p()
+    sfgao = wintypes.DWORD()
+    initialized = ole32.CoInitialize(None)
+    try:
+        result = shell32.SHParseDisplayName(
+            str(path),
+            None,
+            ctypes.byref(pidl),
+            0,
+            ctypes.byref(sfgao),
+        )
+        if result != 0:
+            raise ctypes.WinError(result)
+        result = shell32.SHOpenFolderAndSelectItems(
+            pidl,
+            0,
+            None,
+            0,
+        )
+        if result != 0:
+            raise ctypes.WinError(result)
+    finally:
+        if pidl:
+            ole32.CoTaskMemFree(pidl)
+        if initialized in (0, 1):
+            ole32.CoUninitialize()
 
 
 def _boundary_from_content_type(content_type: str) -> bytes:

@@ -1,10 +1,10 @@
 # imgdupe
 
-Local query-by-image search for large personal image collections.
+Local image and NovelAI prompt-tag search for large personal image collections.
 
 [中文说明](README.zh.md)
 
-`imgdupe` indexes image files with perceptual hashes, then lets you search by uploading or selecting an example image. It is designed for near-identical visual matches: resized images, recompressed JPEGs, mild blur, small edits, and some cropped variants.
+`imgdupe` indexes image files with perceptual hashes, then lets you search by uploading or selecting an example image. It can also extract NovelAI prompts into searchable tags while keeping the original prompt text in SQLite.
 
 It does **not** delete files. It stores paths, metadata, and hashes in SQLite.
 
@@ -16,6 +16,9 @@ It does **not** delete files. It stores paths, metadata, and hashes in SQLite.
 - Local web UI for image search
 - Upload or paste an image into the web UI
 - NovelAI prompt tag indexing and search
+- Prompt-tag autocomplete ranked by database frequency
+- Unique-prompt filtering for prompt search results
+- Show-in-folder buttons for local result files
 - Search controls for strict/balanced/loose matching
 - Optional tryhard crop search
 - Optional similar-image grouping and static review pages
@@ -64,6 +67,11 @@ hash. For existing databases, backfill prompt metadata without rebuilding hashes
 imgdupe scan "E:\Images" --db images.sqlite --workers 16 --reindex-prompts
 ```
 
+Prompt text is stored as-is, but searchable tags are cleaned during indexing:
+NovelAI weight markers such as `1.2::tag::`, bare `::`, `{}`, `[]`, and
+underscores are ignored for search. For example, `sanoba_witch::` is indexed as
+`sanoba witch`.
+
 NovelAI stealth metadata extraction is available, but off by default because it
 requires decoding PNG pixels and can be expensive on large collections:
 
@@ -108,6 +116,9 @@ The web UI supports:
 - showing or hiding exact file matches
 - tryhard crop search
 - prompt tag search using commas, Chinese commas, or newlines
+- prompt-tag autocomplete with up/down/enter keyboard selection
+- optional unique-prompt results, so duplicate prompts show only one image
+- show-in-folder buttons that open Explorer and select the image
 
 Tryhard mode can run on a normal index by splitting the query image into many temporary crop and tile variants. It works best with the optional crop index described below.
 
@@ -150,6 +161,9 @@ imgdupe tags "1girl, blue eyes" --db images.sqlite
 imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 ```
+
+Tag search uses the same cleaning rules as indexing, so searching for
+`sanoba witch` can match prompts containing `sanoba_witch::`.
 
 ## Similar Image Groups
 

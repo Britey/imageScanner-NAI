@@ -1,8 +1,8 @@
 # imgdupe
 
-面向大型个人图片收藏的本地以图搜图工具。
+面向大型个人图片收藏的本地以图搜图和 NovelAI 提示词标签搜索工具。
 
-`imgdupe` 会使用感知哈希为图片建立索引，然后你可以上传、选择或粘贴一张示例图片来搜索相似图片。它主要适合查找近似相同的视觉匹配，例如缩放图、重新压缩的 JPEG、轻微模糊、小幅编辑，以及部分裁剪变体。
+`imgdupe` 会使用感知哈希为图片建立索引，然后你可以上传、选择或粘贴一张示例图片来搜索相似图片。它也可以提取 NovelAI 提示词并建立可搜索的标签索引，同时在 SQLite 中保留原始提示词文本。
 
 它**不会删除文件**。它只会把文件路径、元数据和哈希存入 SQLite 数据库。
 
@@ -14,6 +14,9 @@
 - 本地网页界面
 - 支持上传或粘贴图片进行搜索
 - 支持 NovelAI 提示词标签索引和搜索
+- 按数据库出现频率排序的提示词标签自动补全
+- 提示词搜索结果可只显示唯一提示词
+- 结果页支持在文件夹中显示本地图片
 - 支持严格、平衡、宽松匹配模式
 - 可选的深度裁剪搜索
 - 可选的相似图片分组和静态审查页面
@@ -62,6 +65,10 @@ imgdupe scan "E:\Images" --db images.sqlite --workers 16
 imgdupe scan "E:\Images" --db images.sqlite --workers 16 --reindex-prompts
 ```
 
+原始提示词会照原样保存，但用于搜索的标签会在索引时清理：
+NovelAI 权重标记（例如 `1.2::tag::`）、单独的 `::`、`{}`、`[]` 以及下划线都会在搜索标签中被忽略。
+例如 `sanoba_witch::` 会作为 `sanoba witch` 建立索引。
+
 NovelAI stealth 元数据提取也可用，但默认关闭，因为它需要解码 PNG 像素，
 在大图库上成本较高：
 
@@ -106,6 +113,9 @@ imgdupe scan "E:\Images" "F:\Downloads" --db images.sqlite --workers 16
 - 显示或隐藏完全相同的文件
 - 深度裁剪搜索
 - 使用英文逗号、中文逗号或换行分隔的提示词标签搜索
+- 提示词标签自动补全，支持上下方向键和回车选择
+- 可选择只显示唯一提示词，重复提示词只展示一张图片
+- 结果卡片支持打开资源管理器并选中图片
 
 深度模式可以在普通索引上运行：它会把查询图片临时切成许多裁剪和分块变体再搜索。如果建立了下面介绍的可选裁剪索引，效果会更好。
 
@@ -148,6 +158,8 @@ imgdupe tags "1girl, blue eyes" --db images.sqlite
 imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 ```
+
+标签搜索使用与索引相同的清理规则，因此搜索 `sanoba witch` 可以匹配包含 `sanoba_witch::` 的提示词。
 
 ## 相似图片分组
 
