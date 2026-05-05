@@ -6,6 +6,7 @@ import mimetypes
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import urllib.parse
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ class PromptSearchOptions:
     limit: int
     offset: int
     lang: str
+    unique_prompts: bool
 
 
 TRANSLATIONS = {
@@ -55,6 +57,9 @@ TRANSLATIONS = {
         "all_tags": "All tags",
         "any_tag": "Any tag",
         "autocomplete": "Autocomplete",
+        "unique_prompts": "Unique prompts only",
+        "show_in_folder": "Show in folder",
+        "folder_opened": "Folder Opened",
         "expand_prompt": "Expand prompt",
         "collapse_prompt": "Collapse prompt",
         "language": "Language",
@@ -113,6 +118,9 @@ TRANSLATIONS = {
         "all_tags": "全部标签",
         "any_tag": "任一标签",
         "autocomplete": "自动补全",
+        "unique_prompts": "仅显示唯一提示词",
+        "show_in_folder": "在文件夹中显示",
+        "folder_opened": "已打开文件夹",
         "expand_prompt": "展开提示词",
         "collapse_prompt": "收起提示词",
         "language": "语言",
@@ -224,6 +232,9 @@ def _make_handler(state: WebState):
             if parsed.path == "/suggest-tags":
                 self._send_json(_tag_suggestions(state, parsed.query))
                 return
+            if parsed.path == "/show-in-folder":
+                self._show_in_folder(parsed.query, lang)
+                return
             if parsed.path.startswith("/thumb/"):
                 self._send_thumbnail(parsed.path.removeprefix("/thumb/"))
                 return
@@ -240,6 +251,7 @@ def _make_handler(state: WebState):
                         match_mode=options.match_mode,
                         limit=options.limit,
                         offset=options.offset,
+                        unique_prompts=options.unique_prompts,
                     )
                     self._send_html(_prompt_results_page(results, options))
                 except Exception as exc:
@@ -281,6 +293,40 @@ def _make_handler(state: WebState):
                 limit=max(1, min(_int_field(fields, "limit", state.limit), 500)),
                 offset=max(0, _int_field(fields, "offset", 0)),
                 lang=_normalize_lang(fields.get("lang")),
+                unique_prompts=fields.get("unique_prompts") == "1",
+            )
+
+        def _show_in_folder(self, query: str, lang: str) -> None:
+            values = urllib.parse.parse_qs(query)
+            try:
+                image_id = int(values.get("id", [""])[0])
+            except ValueError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "invalid image id")
+                return
+            row = state.conn.execute(
+                "SELECT path FROM images WHERE id = ?",
+                (image_id,),
+            ).fetchone()
+            if row is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            path = Path(row["path"])
+            subprocess.Popen(
+                ["explorer.exe", f'/select,"{path}"'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            text = _text(lang)
+            self._send_html(
+                _page(
+                    text["folder_opened"],
+                    f"""
+                    <nav><a href="javascript:history.back()">{text['new_search']}</a></nav>
+                    <h1>{text['folder_opened']}</h1>
+                    <p class="path">{html.escape(str(path))}</p>
+                    """,
+                    lang=lang,
+                )
             )
 
         def _save_upload(self) -> tuple[Path, SearchOptions]:
@@ -428,6 +474,10 @@ def _index_page(state: WebState, lang: str) -> str:
           <input id="autocomplete-enabled" type="checkbox" checked>
           {text['autocomplete']}
         </label>
+        <label class="autocomplete-toggle">
+          <input name="unique_prompts" type="checkbox" value="1">
+          {text['unique_prompts']}
+        </label>
         <div class="controls prompt-controls">
           <input type="hidden" name="lang" value="{lang}">
           <label>
@@ -459,6 +509,7 @@ def _index_page(state: WebState, lang: str) -> str:
       const suggestions = document.querySelector("#tag-suggestions");
       const autocomplete = document.querySelector("#autocomplete-enabled");
       const scores = {{ strict: "75", balanced: "{state.min_score:.0f}", loose: "40" }};
+      let activeSuggestion = -1;
       language.addEventListener("change", () => {{
         window.location.href = "/?lang=" + encodeURIComponent(language.value);
       }});
@@ -486,12 +537,27 @@ def _index_page(state: WebState, lang: str) -> str:
       const hideSuggestions = () => {{
         suggestions.hidden = true;
         suggestions.innerHTML = "";
+        activeSuggestion = -1;
+      }};
+      const suggestionButtons = () => [...suggestions.querySelectorAll("button[data-tag]")];
+      const setActiveSuggestion = index => {{
+        const buttons = suggestionButtons();
+        if (!buttons.length) {{
+          activeSuggestion = -1;
+          return;
+        }}
+        activeSuggestion = (index + buttons.length) % buttons.length;
+        buttons.forEach((button, buttonIndex) => {{
+          button.classList.toggle("is-active", buttonIndex === activeSuggestion);
+        }});
       }};
       const applySuggestion = tag => {{
         const info = tokenInfo();
         const value = promptInput.value;
         const leading = value.slice(info.start, info.end).match(/^\\s*/)?.[0] || "";
-        const insert = leading + tag;
+        const after = value.slice(info.end);
+        const separator = after.startsWith(",") || after.startsWith("，") ? "" : ", ";
+        const insert = leading + tag + separator;
         promptInput.value = value.slice(0, info.start) + insert + value.slice(info.end);
         const caret = info.start + insert.length;
         promptInput.focus();
@@ -514,9 +580,28 @@ def _index_page(state: WebState, lang: str) -> str:
            </button>`
         )).join("");
         suggestions.hidden = false;
+        setActiveSuggestion(0);
       }};
       promptInput.addEventListener("input", refreshSuggestions);
       promptInput.addEventListener("click", refreshSuggestions);
+      promptInput.addEventListener("keydown", event => {{
+        if (suggestions.hidden) return;
+        const buttons = suggestionButtons();
+        if (!buttons.length) return;
+        if (event.key === "ArrowDown") {{
+          event.preventDefault();
+          setActiveSuggestion(activeSuggestion + 1);
+        }} else if (event.key === "ArrowUp") {{
+          event.preventDefault();
+          setActiveSuggestion(activeSuggestion - 1);
+        }} else if (event.key === "Enter") {{
+          event.preventDefault();
+          const button = buttons[activeSuggestion >= 0 ? activeSuggestion : 0];
+          if (button) applySuggestion(button.dataset.tag);
+        }} else if (event.key === "Escape") {{
+          hideSuggestions();
+        }}
+      }});
       autocomplete.addEventListener("change", refreshSuggestions);
       suggestions.addEventListener("click", event => {{
         const button = event.target.closest("button[data-tag]");
@@ -543,6 +628,7 @@ def _results_page(results, options: SearchOptions) -> str:
               <div class="score">{score.score:.2f}</div>
               <div>{html.escape(_label(score.decision, options.lang))}</div>
               <div>{image_row['width']}x{image_row['height']} &middot; {human_size(image_row['size_bytes'])}</div>
+              <a class="folder-link" href="/show-in-folder?id={int(image_row['id'])}&lang={options.lang}">{text['show_in_folder']}</a>
               <div class="details">pHash {score.phash_dist} &middot; wHash {score.whash_dist} &middot; dHash {score.dhash_dist} &middot; grid {score.grid_match_count} &middot; crop {score.crop_min_dist} &middot; bands {candidate.total_hits}</div>
               <p class="path">{html.escape(image_row['path'])}</p>
             </article>
@@ -595,6 +681,7 @@ def _prompt_results_page(
               <div class="score">{result.matched_count}</div>
               <div>{html.escape(', '.join(result.matched_tags))}</div>
               <div>{image_row['width']}x{image_row['height']} &middot; {human_size(image_row['size_bytes'])}</div>
+              <a class="folder-link" href="/show-in-folder?id={int(image_row['id'])}&lang={options.lang}">{text['show_in_folder']}</a>
               <p class="prompt is-collapsed">{prompt_html}</p>
               {prompt_button}
               <p class="path">{html.escape(image_row['path'])}</p>
@@ -607,6 +694,8 @@ def _prompt_results_page(
         limit=options.limit,
         offset=options.offset,
     )
+    if options.unique_prompts:
+        summary = f"{summary} · {text['unique_prompts']}"
     empty = f"<p>{text['no_prompt_results']}</p>" if not cards else ""
     body = f"""
     <nav><a href="/?lang={options.lang}">{text['new_search']}</a></nav>
@@ -758,7 +847,7 @@ def _page(title: str, body: str, *, lang: str = "en") -> str:
     .autocomplete-toggle {{ display: flex; align-items: center; gap: 8px; color: #3e4c59; font-size: 13px; }}
     .suggestions {{ position: absolute; z-index: 10; left: 0; right: 0; top: calc(100% + 6px); border: 1px solid #bcccdc; border-radius: 6px; background: #fff; box-shadow: 0 8px 20px rgba(15, 23, 42, 0.14); overflow: hidden; }}
     .suggestions button {{ display: flex; justify-content: space-between; gap: 12px; width: 100%; border: 0; border-radius: 0; background: #fff; color: #20262d; padding: 9px 12px; font-weight: 500; text-align: left; }}
-    .suggestions button:hover, .suggestions button:focus {{ background: #eef2f6; outline: 0; }}
+    .suggestions button:hover, .suggestions button:focus, .suggestions button.is-active {{ background: #eef2f6; outline: 0; }}
     .suggestions small {{ color: #52606d; }}
     .prompt-controls {{ grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }}
     .dropzone {{ display: grid; place-items: center; min-height: 220px; border: 2px dashed #9fb3c8; border-radius: 8px; background: #fff; cursor: pointer; }}
@@ -780,6 +869,8 @@ def _page(title: str, body: str, *, lang: str = "en") -> str:
     .prompt.is-collapsed::after {{ content: ""; position: absolute; inset: auto 0 0 0; height: 2em; background: linear-gradient(to bottom, rgba(255,255,255,0), #fff); }}
     .prompt mark {{ background: #ffe58f; color: inherit; padding: 0 2px; border-radius: 3px; }}
     .prompt-toggle {{ justify-self: start; background: transparent; color: #245b9f; padding: 0; font-weight: 700; }}
+    .folder-link {{ display: inline-block; justify-self: start; margin-top: 4px; border: 1px solid #bcccdc; border-radius: 6px; background: #fff; color: #245b9f; padding: 7px 10px; font-size: 13px; font-weight: 700; text-decoration: none; }}
+    .folder-link:hover, .folder-link:focus {{ background: #eef2f6; outline: 0; }}
     .path {{ word-break: break-all; color: #3e4c59; font-size: 13px; }}
     table {{ border-collapse: collapse; width: 100%; background: #fff; }}
     th, td {{ border-bottom: 1px solid #d9e1e8; padding: 8px; text-align: left; vertical-align: top; }}

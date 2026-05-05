@@ -19,6 +19,8 @@ TEXT_KEYS = ("Comment", "Description", "parameters", "prompt")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 SPLIT_PATTERN = re.compile(r"[,，\n]+")
 SPACE_PATTERN = re.compile(r"\s+")
+WEIGHT_PREFIX_PATTERN = re.compile(r"\b\d+(?:\.\d+)?::")
+WEIGHT_BRACKET_PATTERN = re.compile(r"[\[\]{}]+")
 
 
 @dataclass(frozen=True)
@@ -66,17 +68,25 @@ def split_prompt_tags(prompt: str) -> list[str]:
     tags: list[str] = []
     seen: set[str] = set()
     for raw_tag in SPLIT_PATTERN.split(prompt):
-        tag = normalize_prompt_tag(raw_tag)
-        if not tag or tag in seen:
+        tag = clean_prompt_tag(raw_tag)
+        tag_norm = normalize_prompt_tag(tag)
+        if not tag_norm or tag_norm in seen:
             continue
-        seen.add(tag)
+        seen.add(tag_norm)
         tags.append(tag)
     return tags
 
 
+def clean_prompt_tag(tag: str) -> str:
+    tag = tag.replace("_", " ")
+    tag = WEIGHT_PREFIX_PATTERN.sub("", tag)
+    tag = tag.replace("::", "")
+    tag = WEIGHT_BRACKET_PATTERN.sub("", tag)
+    return SPACE_PATTERN.sub(" ", tag.strip())
+
+
 def normalize_prompt_tag(tag: str) -> str:
-    tag = SPACE_PATTERN.sub(" ", tag.strip())
-    return tag.casefold()
+    return clean_prompt_tag(tag).casefold()
 
 
 def bits_to_bytes(bits: list[int]) -> bytes:

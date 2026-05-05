@@ -98,6 +98,7 @@ def query_prompt_tags(
     match_mode: str = "all",
     limit: int = 100,
     offset: int = 0,
+    unique_prompts: bool = False,
 ) -> list[PromptSearchResult]:
     raw_tags = (
         split_prompt_tags(text_or_tags)
@@ -126,8 +127,7 @@ def query_prompt_tags(
         params.append(len(tag_norms))
     params.extend([max(1, limit), max(0, offset)])
 
-    rows = conn.execute(
-        f"""
+    base_ctes = f"""
         WITH matches AS (
             SELECT
                 image_id,
@@ -138,6 +138,38 @@ def query_prompt_tags(
             GROUP BY image_id
             {having}
         )
+    """
+    if unique_prompts:
+        sql = (
+            base_ctes
+            + """
+        , ranked AS (
+            SELECT
+                i.*,
+                ip.prompt,
+                matches.matched_count,
+                matches.matched_tags,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ip.prompt
+                    ORDER BY matches.matched_count DESC, i.indexed_at DESC, i.path
+                ) AS prompt_rank
+            FROM matches
+            JOIN images i ON i.id = matches.image_id
+            JOIN image_prompts ip ON ip.image_id = i.id
+            WHERE i.missing_at IS NULL
+              AND ip.prompt IS NOT NULL
+        )
+        SELECT *
+        FROM ranked
+        WHERE prompt_rank = 1
+        ORDER BY matched_count DESC, indexed_at DESC, path
+        LIMIT ? OFFSET ?
+        """
+        )
+    else:
+        sql = (
+            base_ctes
+            + """
         SELECT
             i.*,
             ip.prompt,
@@ -149,7 +181,11 @@ def query_prompt_tags(
         WHERE i.missing_at IS NULL
         ORDER BY matches.matched_count DESC, i.indexed_at DESC, i.path
         LIMIT ? OFFSET ?
-        """,
+        """
+        )
+
+    rows = conn.execute(
+        sql,
         params,
     ).fetchall()
 
