@@ -73,12 +73,29 @@ CREATE TABLE IF NOT EXISTS clusters (
     PRIMARY KEY (cluster_id, image_id)
 );
 
+CREATE TABLE IF NOT EXISTS image_prompts (
+    image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    prompt TEXT,
+    metadata_source TEXT,
+    prompt_indexed_at TEXT NOT NULL,
+    prompt_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS prompt_tags (
+    image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    tag_norm TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (image_id, tag_norm)
+);
+
 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
 CREATE INDEX IF NOT EXISTS idx_images_path ON images(path);
 CREATE INDEX IF NOT EXISTS idx_hash_bands_image_id ON hash_bands(image_id);
 CREATE INDEX IF NOT EXISTS idx_crop_hashes_image_id ON crop_hashes(image_id);
 CREATE INDEX IF NOT EXISTS idx_matches_score ON matches(score);
 CREATE INDEX IF NOT EXISTS idx_clusters_cluster ON clusters(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_tags_norm_image ON prompt_tags(tag_norm, image_id);
 """
 
 
@@ -86,6 +103,7 @@ MIGRATIONS = """
 DROP INDEX IF EXISTS idx_hash_bands_lookup;
 CREATE INDEX IF NOT EXISTS idx_hash_bands_image_id ON hash_bands(image_id);
 CREATE INDEX IF NOT EXISTS idx_crop_hashes_image_id ON crop_hashes(image_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_tags_norm_image ON prompt_tags(tag_norm, image_id);
 """
 
 
@@ -250,3 +268,52 @@ def fetch_crop_hashes(conn: sqlite3.Connection, image_id: int) -> dict[str, byte
         (image_id,),
     ).fetchall()
     return {f"crop:{row['region']}": row["phash256"] for row in rows}
+
+
+def has_prompt_status(conn: sqlite3.Connection, image_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM image_prompts WHERE image_id = ? LIMIT 1",
+        (image_id,),
+    ).fetchone()
+    return row is not None
+
+
+def replace_prompt(
+    conn: sqlite3.Connection,
+    image_id: int,
+    *,
+    prompt: str | None,
+    metadata_source: str | None,
+    prompt_error: str | None,
+    indexed_at: str,
+    tags: list[tuple[str, str]],
+) -> None:
+    conn.execute("DELETE FROM prompt_tags WHERE image_id = ?", (image_id,))
+    conn.execute(
+        """
+        INSERT INTO image_prompts (
+            image_id, prompt, metadata_source, prompt_indexed_at, prompt_error
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(image_id) DO UPDATE SET
+            prompt = excluded.prompt,
+            metadata_source = excluded.metadata_source,
+            prompt_indexed_at = excluded.prompt_indexed_at,
+            prompt_error = excluded.prompt_error
+        """,
+        (image_id, prompt, metadata_source, indexed_at, prompt_error),
+    )
+    if not tags:
+        return
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO prompt_tags (
+            image_id, tag, tag_norm, position
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (image_id, tag, tag_norm, position)
+            for position, (tag, tag_norm) in enumerate(tags)
+        ],
+    )

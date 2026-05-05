@@ -15,6 +15,7 @@ It does **not** delete files. It stores paths, metadata, and hashes in SQLite.
 - pHash, wHash, dHash, SHA-256, and regional grid hashes
 - Local web UI for image search
 - Upload or paste an image into the web UI
+- NovelAI prompt tag indexing and search
 - Search controls for strict/balanced/loose matching
 - Optional tryhard crop search
 - Optional similar-image grouping and static review pages
@@ -55,6 +56,21 @@ Index a folder recursively:
 imgdupe scan "E:\Images" --db images.sqlite --workers 16
 ```
 
+By default, scanning also attempts to index NovelAI prompt tags from image metadata.
+Images without prompt metadata are recorded as checked and remain searchable by image
+hash. For existing databases, backfill prompt metadata without rebuilding hashes:
+
+```powershell
+imgdupe scan "E:\Images" --db images.sqlite --workers 16 --reindex-prompts
+```
+
+NovelAI stealth metadata extraction is available, but off by default because it
+requires decoding PNG pixels and can be expensive on large collections:
+
+```powershell
+imgdupe scan "E:\Images" --db images.sqlite --workers 16 --stealth-prompt
+```
+
 Then start the web UI:
 
 ```powershell
@@ -91,6 +107,7 @@ The web UI supports:
 - maximum results
 - showing or hiding exact file matches
 - tryhard crop search
+- prompt tag search using commas, Chinese commas, or newlines
 
 Tryhard mode can run on a normal index by splitting the query image into many temporary crop and tile variants. It works best with the optional crop index described below.
 
@@ -124,6 +141,14 @@ Tryhard cropped search:
 
 ```powershell
 imgdupe query "E:\cropped.jpg" --db images.sqlite --tryhard --min-score 1
+```
+
+Search by NovelAI prompt tags:
+
+```powershell
+imgdupe tags "1girl, blue eyes" --db images.sqlite
+imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
+imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 ```
 
 ## Similar Image Groups

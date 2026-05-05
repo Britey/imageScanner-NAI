@@ -7,7 +7,7 @@ from .cluster import build_clusters
 from .config import ScanConfig
 from .db import connect, init_db
 from .failures import iter_failures
-from .query import query_image, write_query_html
+from .query import query_image, query_prompt_tags, write_query_html
 from .review import generate_review
 from .scan import scan_roots
 from .web import serve
@@ -23,6 +23,9 @@ def main(argv: list[str] | None = None) -> int:
     scan_parser.add_argument("--workers", type=int, default=None)
     scan_parser.add_argument("--batch-size", type=int, default=None)
     scan_parser.add_argument("--crop-index", action="store_true")
+    scan_parser.add_argument("--no-prompt-index", action="store_true")
+    scan_parser.add_argument("--stealth-prompt", action="store_true")
+    scan_parser.add_argument("--reindex-prompts", action="store_true")
 
     query_parser = subparsers.add_parser("query", help="Find visually similar images.")
     query_parser.add_argument("image", type=Path)
@@ -32,6 +35,13 @@ def main(argv: list[str] | None = None) -> int:
     query_parser.add_argument("--min-score", type=float, default=0.0)
     query_parser.add_argument("--hide-exact", action="store_true")
     query_parser.add_argument("--tryhard", action="store_true")
+
+    tags_parser = subparsers.add_parser("tags", help="Find images by NovelAI prompt tags.")
+    tags_parser.add_argument("tags", nargs="+", help="Prompt tag(s), comma/CJK-comma/newline separated.")
+    tags_parser.add_argument("--db", type=Path, required=True)
+    tags_parser.add_argument("--mode", choices=("all", "any"), default="all")
+    tags_parser.add_argument("--limit", type=int, default=100)
+    tags_parser.add_argument("--offset", type=int, default=0)
 
     cluster_parser = subparsers.add_parser("cluster", help="Build similar-image groups.")
     cluster_parser.add_argument("--db", type=Path, required=True)
@@ -65,6 +75,9 @@ def main(argv: list[str] | None = None) -> int:
             workers=args.workers if args.workers is not None else default_scan_config.workers,
             batch_size=args.batch_size if args.batch_size is not None else default_scan_config.batch_size,
             crop_index=args.crop_index,
+            prompt_index=not args.no_prompt_index,
+            stealth_prompt=args.stealth_prompt,
+            reindex_prompts=args.reindex_prompts,
         )
         stats = scan_roots(conn, args.roots, config=scan_config)
         print(
@@ -72,6 +85,24 @@ def main(argv: list[str] | None = None) -> int:
             f"seen={stats.seen} queued={stats.queued} indexed={stats.indexed} "
             f"skipped={stats.skipped} failed={stats.failed}"
         )
+        return 0
+
+    if args.command == "tags":
+        results = query_prompt_tags(
+            conn,
+            list(args.tags),
+            match_mode=args.mode,
+            limit=args.limit,
+            offset=args.offset,
+        )
+        for result in results:
+            image_row = result.image_row
+            print(
+                f"matches={result.matched_count:2d} "
+                f"{image_row['width']}x{image_row['height']} "
+                f"{image_row['path']}"
+            )
+        print(f"tag results: {len(results)}")
         return 0
 
     if args.command == "query":

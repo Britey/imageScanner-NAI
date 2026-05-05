@@ -9,6 +9,9 @@ class ScanConfig:
     batch_size: int = 500
     workers: int = max(1, min((os.cpu_count() or 2) - 1, 8))
     crop_index: bool = False
+    prompt_index: bool = True
+    stealth_prompt: bool = False
+    reindex_prompts: bool = False
     whole_band_size: int = 2
     grid_band_size: int = 2
 

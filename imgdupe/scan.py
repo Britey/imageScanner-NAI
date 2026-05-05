@@ -9,8 +9,17 @@ from tqdm import tqdm
 
 from .bands import insert_bands
 from .config import ScanConfig
-from .db import clear_hashes, get_existing_image, replace_crop_hashes, replace_hashes, upsert_image
+from .db import (
+    clear_hashes,
+    get_existing_image,
+    has_prompt_status,
+    replace_crop_hashes,
+    replace_hashes,
+    replace_prompt,
+    upsert_image,
+)
 from .hashing import compute_image_hashes, sha256_file
+from .nai_prompt import extract_nai_prompt, normalize_prompt_tag, split_prompt_tags
 from .utils import iter_image_paths, utc_now_sql
 
 
@@ -29,6 +38,8 @@ class ScanTask:
     size_bytes: int
     mtime_ns: int
     had_existing_hashes: bool
+    prompt_only: bool
+    existing_image_id: int | None
 
 
 @dataclass(frozen=True)
@@ -43,6 +54,11 @@ class ScanResult:
     hashes: dict[str, bytes]
     decode_error: str | None
     had_existing_hashes: bool
+    prompt_only: bool
+    existing_image_id: int | None
+    prompt: str | None
+    prompt_source: str | None
+    prompt_error: str | None
 
 
 def scan_roots(
@@ -66,14 +82,21 @@ def scan_roots(
             continue
 
         existing = get_existing_image(conn, path)
-        if (
+        existing_id = int(existing["id"]) if existing is not None else None
+        needs_prompt = (
+            config.prompt_index
+            and existing_id is not None
+            and (config.reindex_prompts or not has_prompt_status(conn, existing_id))
+        )
+        unchanged_hashes = (
             existing is not None
             and int(existing["size_bytes"]) == stat.st_size
             and int(existing["mtime_ns"]) == stat.st_mtime_ns
             and existing["decode_error"] is None
             and existing["missing_at"] is None
             and (not config.crop_index or _has_crop_hashes(conn, int(existing["id"])))
-        ):
+        )
+        if unchanged_hashes and not needs_prompt:
             stats.skipped += 1
             continue
 
@@ -83,6 +106,8 @@ def scan_roots(
                 size_bytes=stat.st_size,
                 mtime_ns=stat.st_mtime_ns,
                 had_existing_hashes=existing is not None,
+                prompt_only=unchanged_hashes and needs_prompt,
+                existing_image_id=existing_id,
             )
         )
         stats.queued += 1
@@ -93,7 +118,14 @@ def scan_roots(
 
     if workers <= 1:
         results = (
-            _hash_task(task, config.min_width, config.min_height, config.crop_index)
+            _hash_task(
+                task,
+                config.min_width,
+                config.min_height,
+                config.crop_index,
+                config.prompt_index,
+                config.stealth_prompt,
+            )
             for task in tasks
         )
         iterator = tqdm(results, total=len(tasks), desc="Hashing images", unit="image")
@@ -108,6 +140,8 @@ def scan_roots(
                     config.min_width,
                     config.min_height,
                     config.crop_index,
+                    config.prompt_index,
+                    config.stealth_prompt,
                 )
                 for task in tasks
             ]
@@ -125,6 +159,14 @@ def _store_result(
     stats: ScanStats,
 ) -> None:
     indexed_at = utc_now_sql()
+    if result.prompt_only:
+        if result.existing_image_id is None:
+            stats.failed += 1
+            return
+        _store_prompt(conn, result.existing_image_id, result, indexed_at)
+        stats.indexed += 1
+        return
+
     if result.decode_error is None:
         image_id = upsert_image(
             conn,
@@ -157,6 +199,8 @@ def _store_result(
             whole_band_size=config.whole_band_size,
             grid_band_size=config.grid_band_size,
         )
+        if config.prompt_index:
+            _store_prompt(conn, image_id, result, indexed_at)
         stats.indexed += 1
     else:
         image_id = upsert_image(
@@ -181,13 +225,44 @@ def _hash_task(
     min_width: int,
     min_height: int,
     crop_index: bool,
+    prompt_index: bool,
+    stealth_prompt: bool,
 ) -> ScanResult:
+    if task.prompt_only:
+        prompt, prompt_source, prompt_error = _extract_prompt_fields(
+            task.path,
+            prompt_index=prompt_index,
+            stealth_prompt=stealth_prompt,
+        )
+        return ScanResult(
+            path=task.path,
+            size_bytes=task.size_bytes,
+            mtime_ns=task.mtime_ns,
+            width=None,
+            height=None,
+            image_format=None,
+            sha256=None,
+            hashes={},
+            decode_error=None,
+            had_existing_hashes=task.had_existing_hashes,
+            prompt_only=True,
+            existing_image_id=task.existing_image_id,
+            prompt=prompt,
+            prompt_source=prompt_source,
+            prompt_error=prompt_error,
+        )
+
     try:
         hashes, metadata = compute_image_hashes(
             task.path,
             min_width=min_width,
             min_height=min_height,
             include_crop_regions=crop_index,
+        )
+        prompt, prompt_source, prompt_error = _extract_prompt_fields(
+            task.path,
+            prompt_index=prompt_index,
+            stealth_prompt=stealth_prompt,
         )
         return ScanResult(
             path=task.path,
@@ -200,8 +275,18 @@ def _hash_task(
             hashes=hashes,
             decode_error=None,
             had_existing_hashes=task.had_existing_hashes,
+            prompt_only=False,
+            existing_image_id=task.existing_image_id,
+            prompt=prompt,
+            prompt_source=prompt_source,
+            prompt_error=prompt_error,
         )
     except Exception as exc:
+        prompt, prompt_source, prompt_error = _extract_prompt_fields(
+            task.path,
+            prompt_index=prompt_index,
+            stealth_prompt=stealth_prompt,
+        )
         return ScanResult(
             path=task.path,
             size_bytes=task.size_bytes,
@@ -213,6 +298,11 @@ def _hash_task(
             hashes={},
             decode_error=f"{type(exc).__name__}: {exc}",
             had_existing_hashes=task.had_existing_hashes,
+            prompt_only=False,
+            existing_image_id=task.existing_image_id,
+            prompt=prompt,
+            prompt_source=prompt_source,
+            prompt_error=prompt_error,
         )
 
 
@@ -229,3 +319,36 @@ def _has_crop_hashes(conn: sqlite3.Connection, image_id: int) -> bool:
         (image_id,),
     ).fetchone()
     return row is not None
+
+
+def _extract_prompt_fields(
+    path: Path,
+    *,
+    prompt_index: bool,
+    stealth_prompt: bool,
+) -> tuple[str | None, str | None, str | None]:
+    if not prompt_index:
+        return None, None, None
+    result = extract_nai_prompt(path, stealth_fallback=stealth_prompt)
+    return result.prompt, result.metadata_source, result.error
+
+
+def _store_prompt(
+    conn: sqlite3.Connection,
+    image_id: int,
+    result: ScanResult,
+    indexed_at: str,
+) -> None:
+    tag_rows: list[tuple[str, str]] = []
+    if result.prompt:
+        for tag in split_prompt_tags(result.prompt):
+            tag_rows.append((tag, normalize_prompt_tag(tag)))
+    replace_prompt(
+        conn,
+        image_id,
+        prompt=result.prompt,
+        metadata_source=result.prompt_source,
+        prompt_error=result.prompt_error,
+        indexed_at=indexed_at,
+        tags=tag_rows,
+    )

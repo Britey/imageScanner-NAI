@@ -20,10 +20,14 @@ env/
 # Local databases and scan outputs
 *.sqlite
 *.sqlite-*
+*.sqlite3
+*.sqlite3-*
 *.db
 *.db-*
 review/
 review*/
+thumbs/
+uploads/
 *_query.html
 clusters.json
 delete_candidates.txt
@@ -32,9 +36,14 @@ dupes.json
 # Smoke-test fixtures generated during development
 sample_images/
 sample_images2/
+.codex-test-deps/
+.codex-smoke.sqlite
 
 # OS/editor noise
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
+# Sample Code
+NAI-extractor/

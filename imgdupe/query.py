@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from .bands import CROP_HASH_TYPES, Candidate, find_candidates
@@ -10,7 +11,16 @@ from .db import fetch_crop_hashes, fetch_hash_row, hash_row_to_dict
 from .hashing import compute_image_hashes
 from .hashing import load_normalized, tryhard_query_hashes
 from .match import PairScore, score_hashes
+from .nai_prompt import normalize_prompt_tag, split_prompt_tags
 from .utils import human_size
+
+
+@dataclass(frozen=True)
+class PromptSearchResult:
+    image_row: sqlite3.Row
+    prompt: str | None
+    matched_count: int
+    matched_tags: tuple[str, ...]
 
 
 def query_image(
@@ -79,6 +89,79 @@ def query_image(
 
     results.sort(key=lambda item: item[2].score, reverse=True)
     return results[:limit]
+
+
+def query_prompt_tags(
+    conn: sqlite3.Connection,
+    text_or_tags: str | list[str],
+    *,
+    match_mode: str = "all",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[PromptSearchResult]:
+    raw_tags = (
+        split_prompt_tags(text_or_tags)
+        if isinstance(text_or_tags, str)
+        else [tag for item in text_or_tags for tag in split_prompt_tags(item)]
+    )
+    tag_norms = []
+    seen = set()
+    for tag in raw_tags:
+        tag_norm = normalize_prompt_tag(tag)
+        if not tag_norm or tag_norm in seen:
+            continue
+        seen.add(tag_norm)
+        tag_norms.append(tag_norm)
+    if not tag_norms:
+        return []
+
+    mode = match_mode.lower()
+    if mode not in {"all", "any"}:
+        raise ValueError("match_mode must be 'all' or 'any'")
+
+    placeholders = ", ".join("?" for _ in tag_norms)
+    having = "HAVING matched_count = ?" if mode == "all" else ""
+    params: list[object] = [*tag_norms]
+    if mode == "all":
+        params.append(len(tag_norms))
+    params.extend([max(1, limit), max(0, offset)])
+
+    rows = conn.execute(
+        f"""
+        WITH matches AS (
+            SELECT
+                image_id,
+                COUNT(DISTINCT tag_norm) AS matched_count,
+                GROUP_CONCAT(DISTINCT tag) AS matched_tags
+            FROM prompt_tags
+            WHERE tag_norm IN ({placeholders})
+            GROUP BY image_id
+            {having}
+        )
+        SELECT
+            i.*,
+            ip.prompt,
+            matches.matched_count,
+            matches.matched_tags
+        FROM matches
+        JOIN images i ON i.id = matches.image_id
+        LEFT JOIN image_prompts ip ON ip.image_id = i.id
+        WHERE i.missing_at IS NULL
+        ORDER BY matches.matched_count DESC, i.indexed_at DESC, i.path
+        LIMIT ? OFFSET ?
+        """,
+        params,
+    ).fetchall()
+
+    return [
+        PromptSearchResult(
+            image_row=row,
+            prompt=row["prompt"],
+            matched_count=int(row["matched_count"]),
+            matched_tags=tuple((row["matched_tags"] or "").split(",")),
+        )
+        for row in rows
+    ]
 
 
 def _query_crop_hashes(image_path: Path, config: ScanConfig) -> dict[str, bytes]:

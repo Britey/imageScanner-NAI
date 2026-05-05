@@ -13,6 +13,7 @@
 - 使用 pHash、wHash、dHash、SHA-256 和区域网格哈希
 - 本地网页界面
 - 支持上传或粘贴图片进行搜索
+- 支持 NovelAI 提示词标签索引和搜索
 - 支持严格、平衡、宽松匹配模式
 - 可选的深度裁剪搜索
 - 可选的相似图片分组和静态审查页面
@@ -53,6 +54,21 @@ python -m imgdupe.cli --help
 imgdupe scan "E:\Images" --db images.sqlite --workers 16
 ```
 
+默认情况下，扫描也会尝试从图片元数据中索引 NovelAI 提示词标签。
+没有提示词元数据的图片会被记录为已检查，并仍然可以通过图片哈希搜索。
+如果已有数据库需要补建提示词索引，可以运行：
+
+```powershell
+imgdupe scan "E:\Images" --db images.sqlite --workers 16 --reindex-prompts
+```
+
+NovelAI stealth 元数据提取也可用，但默认关闭，因为它需要解码 PNG 像素，
+在大图库上成本较高：
+
+```powershell
+imgdupe scan "E:\Images" --db images.sqlite --workers 16 --stealth-prompt
+```
+
 然后启动网页界面：
 
 ```powershell
@@ -89,6 +105,7 @@ imgdupe scan "E:\Images" "F:\Downloads" --db images.sqlite --workers 16
 - 设置最多结果数量
 - 显示或隐藏完全相同的文件
 - 深度裁剪搜索
+- 使用英文逗号、中文逗号或换行分隔的提示词标签搜索
 
 深度模式可以在普通索引上运行：它会把查询图片临时切成许多裁剪和分块变体再搜索。如果建立了下面介绍的可选裁剪索引，效果会更好。
 
@@ -122,6 +139,14 @@ imgdupe query "E:\query.jpg" --db images.sqlite --html result.html --min-score 5
 
 ```powershell
 imgdupe query "E:\cropped.jpg" --db images.sqlite --tryhard --min-score 1
+```
+
+按 NovelAI 提示词标签搜索：
+
+```powershell
+imgdupe tags "1girl, blue eyes" --db images.sqlite
+imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
+imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 ```
 
 ## 相似图片分组
