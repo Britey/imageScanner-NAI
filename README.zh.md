@@ -76,6 +76,12 @@ NovelAI stealth 元数据提取也可用，但默认关闭，因为它需要解�
 imgdupe scan "E:\Images" --db images.sqlite --workers 16 --stealth-prompt
 ```
 
+常用提示词索引扫描选项：
+
+- `--reindex-prompts`：对未变化的文件重新读取提示词元数据。
+- `--stealth-prompt`：额外尝试读取 PNG 的 NovelAI alpha 通道 stealth 元数据。
+- `--no-prompt-index`：跳过提示词提取，只更新图片哈希索引。
+
 然后启动网页界面：
 
 ```powershell
@@ -113,6 +119,7 @@ imgdupe scan "E:\Images" "F:\Downloads" --db images.sqlite --workers 16
 - 显示或隐藏完全相同的文件
 - 深度裁剪搜索
 - 使用英文逗号、中文逗号或换行分隔的提示词标签搜索
+- 使用排除标签过滤结果，且不需要重新索引
 - 提示词标签自动补全，支持上下方向键和回车选择
 - 可选择只显示唯一提示词，重复提示词只展示一张图片
 - 结果卡片支持打开资源管理器并选中图片
@@ -157,9 +164,11 @@ imgdupe query "E:\cropped.jpg" --db images.sqlite --tryhard --min-score 1
 imgdupe tags "1girl, blue eyes" --db images.sqlite
 imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
+imgdupe tags "1girl" --not-tags "lowres, blurry" --db images.sqlite
 ```
 
 标签搜索使用与索引相同的清理规则，因此搜索 `sanoba witch` 可以匹配包含 `sanoba_witch::` 的提示词。
+排除标签直接使用已有的提示词标签索引，不需要重新扫描或重新索引数据库。
 
 ## 相似图片分组
 

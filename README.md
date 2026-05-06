@@ -79,6 +79,12 @@ requires decoding PNG pixels and can be expensive on large collections:
 imgdupe scan "E:\Images" --db images.sqlite --workers 16 --stealth-prompt
 ```
 
+Useful prompt-indexing scan options:
+
+- `--reindex-prompts`: re-read prompt metadata for unchanged files.
+- `--stealth-prompt`: also try NovelAI alpha-channel stealth metadata for PNGs.
+- `--no-prompt-index`: skip prompt extraction and only update the image hash index.
+
 Then start the web UI:
 
 ```powershell
@@ -116,6 +122,7 @@ The web UI supports:
 - showing or hiding exact file matches
 - tryhard crop search
 - prompt tag search using commas, Chinese commas, or newlines
+- negative prompt tags that exclude images without reindexing
 - prompt-tag autocomplete with up/down/enter keyboard selection
 - optional unique-prompt results, so duplicate prompts show only one image
 - show-in-folder buttons that open Explorer and select the image
@@ -160,10 +167,13 @@ Search by NovelAI prompt tags:
 imgdupe tags "1girl, blue eyes" --db images.sqlite
 imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
+imgdupe tags "1girl" --not-tags "lowres, blurry" --db images.sqlite
 ```
 
 Tag search uses the same cleaning rules as indexing, so searching for
 `sanoba witch` can match prompts containing `sanoba_witch::`.
+Negative tags use the existing prompt-tag index and do not require rescanning or
+reindexing the database.
 
 ## Similar Image Groups
 

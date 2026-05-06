@@ -37,9 +37,15 @@ def main(argv: list[str] | None = None) -> int:
     query_parser.add_argument("--tryhard", action="store_true")
 
     tags_parser = subparsers.add_parser("tags", help="Find images by NovelAI prompt tags.")
-    tags_parser.add_argument("tags", nargs="+", help="Prompt tag(s), comma/CJK-comma/newline separated.")
+    tags_parser.add_argument("tags", nargs="*", help="Prompt tag(s), comma/CJK-comma/newline separated.")
     tags_parser.add_argument("--db", type=Path, required=True)
     tags_parser.add_argument("--mode", choices=("all", "any"), default="all")
+    tags_parser.add_argument(
+        "--not-tags",
+        nargs="+",
+        default=[],
+        help="Prompt tag(s) to exclude, comma/CJK-comma/newline separated.",
+    )
     tags_parser.add_argument("--limit", type=int, default=100)
     tags_parser.add_argument("--offset", type=int, default=0)
 
@@ -88,9 +94,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "tags":
+        if not args.tags and not args.not_tags:
+            parser.error("tags requires at least one tag or --not-tags value")
         results = query_prompt_tags(
             conn,
             list(args.tags),
+            negative_text_or_tags=list(args.not_tags),
             match_mode=args.mode,
             limit=args.limit,
             offset=args.offset,

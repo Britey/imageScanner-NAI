@@ -95,54 +95,69 @@ def query_prompt_tags(
     conn: sqlite3.Connection,
     text_or_tags: str | list[str],
     *,
+    negative_text_or_tags: str | list[str] | None = None,
     match_mode: str = "all",
     limit: int = 100,
     offset: int = 0,
     unique_prompts: bool = False,
 ) -> list[PromptSearchResult]:
-    raw_tags = (
-        split_prompt_tags(text_or_tags)
-        if isinstance(text_or_tags, str)
-        else [tag for item in text_or_tags for tag in split_prompt_tags(item)]
-    )
-    tag_norms = []
-    seen = set()
-    for tag in raw_tags:
-        tag_norm = normalize_prompt_tag(tag)
-        if not tag_norm or tag_norm in seen:
-            continue
-        seen.add(tag_norm)
-        tag_norms.append(tag_norm)
-    if not tag_norms:
+    tag_norms = _prompt_tag_norms(text_or_tags)
+    negative_tag_norms = _prompt_tag_norms(negative_text_or_tags)
+    if not tag_norms and not negative_tag_norms:
         return []
 
     mode = match_mode.lower()
     if mode not in {"all", "any"}:
         raise ValueError("match_mode must be 'all' or 'any'")
 
-    placeholders = ", ".join("?" for _ in tag_norms)
-    having = "HAVING matched_count = ?" if mode == "all" else ""
-    params: list[object] = [*tag_norms]
-    if mode == "all":
-        params.append(len(tag_norms))
-    params.extend([max(1, limit), max(0, offset)])
+    params: list[object] = []
+    if tag_norms:
+        placeholders = ", ".join("?" for _ in tag_norms)
+        having = "HAVING matched_count = ?" if mode == "all" else ""
+        params.extend(tag_norms)
+        if mode == "all":
+            params.append(len(tag_norms))
+        base_ctes = f"""
+            WITH matches AS (
+                SELECT
+                    image_id,
+                    COUNT(DISTINCT tag_norm) AS matched_count,
+                    GROUP_CONCAT(DISTINCT tag) AS matched_tags
+                FROM prompt_tags
+                WHERE tag_norm IN ({placeholders})
+                GROUP BY image_id
+                {having}
+            )
+        """
+    else:
+        base_ctes = """
+            WITH matches AS (
+                SELECT
+                    image_id,
+                    0 AS matched_count,
+                    '' AS matched_tags
+                FROM image_prompts
+                WHERE prompt IS NOT NULL
+            )
+        """
 
-    base_ctes = f"""
-        WITH matches AS (
-            SELECT
-                image_id,
-                COUNT(DISTINCT tag_norm) AS matched_count,
-                GROUP_CONCAT(DISTINCT tag) AS matched_tags
-            FROM prompt_tags
-            WHERE tag_norm IN ({placeholders})
-            GROUP BY image_id
-            {having}
-        )
-    """
+    exclude_clause = ""
+    if negative_tag_norms:
+        negative_placeholders = ", ".join("?" for _ in negative_tag_norms)
+        exclude_clause = f"""
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM prompt_tags excluded_tags
+                  WHERE excluded_tags.image_id = i.id
+                    AND excluded_tags.tag_norm IN ({negative_placeholders})
+              )
+        """
+        params.extend(negative_tag_norms)
+    params.extend([max(1, limit), max(0, offset)])
     if unique_prompts:
         sql = (
             base_ctes
-            + """
+            + f"""
         , ranked AS (
             SELECT
                 i.*,
@@ -158,6 +173,7 @@ def query_prompt_tags(
             JOIN image_prompts ip ON ip.image_id = i.id
             WHERE i.missing_at IS NULL
               AND ip.prompt IS NOT NULL
+              {exclude_clause}
         )
         SELECT *
         FROM ranked
@@ -169,7 +185,7 @@ def query_prompt_tags(
     else:
         sql = (
             base_ctes
-            + """
+            + f"""
         SELECT
             i.*,
             ip.prompt,
@@ -179,6 +195,7 @@ def query_prompt_tags(
         JOIN images i ON i.id = matches.image_id
         LEFT JOIN image_prompts ip ON ip.image_id = i.id
         WHERE i.missing_at IS NULL
+          {exclude_clause}
         ORDER BY matches.matched_count DESC, i.indexed_at DESC, i.path
         LIMIT ? OFFSET ?
         """
@@ -198,6 +215,25 @@ def query_prompt_tags(
         )
         for row in rows
     ]
+
+
+def _prompt_tag_norms(text_or_tags: str | list[str] | None) -> list[str]:
+    if text_or_tags is None:
+        return []
+    raw_tags = (
+        split_prompt_tags(text_or_tags)
+        if isinstance(text_or_tags, str)
+        else [tag for item in text_or_tags for tag in split_prompt_tags(item)]
+    )
+    tag_norms = []
+    seen = set()
+    for tag in raw_tags:
+        tag_norm = normalize_prompt_tag(tag)
+        if not tag_norm or tag_norm in seen:
+            continue
+        seen.add(tag_norm)
+        tag_norms.append(tag_norm)
+    return tag_norms
 
 
 def _query_crop_hashes(image_path: Path, config: ScanConfig) -> dict[str, bytes]:

@@ -10,6 +10,8 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.parse
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -19,7 +21,10 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from .config import ScanConfig
+from .db import connect, init_db
 from .query import PromptSearchResult, query_image, query_prompt_tags
+from .scan import ScanStats, scan_roots
 from .utils import human_size
 
 
@@ -36,11 +41,33 @@ class SearchOptions:
 @dataclass(frozen=True)
 class PromptSearchOptions:
     tags: str
+    negative_tags: str
     match_mode: str
     limit: int
     offset: int
     lang: str
     unique_prompts: bool
+
+
+@dataclass(frozen=True)
+class ScanRequest:
+    roots: tuple[Path, ...]
+    workers: int
+    crop_index: bool
+    prompt_index: bool
+    stealth_prompt: bool
+    reindex_prompts: bool
+    lang: str
+
+
+@dataclass(frozen=True)
+class WebScanStatus:
+    state: str = "idle"
+    roots: tuple[str, ...] = ()
+    started_at: str | None = None
+    finished_at: str | None = None
+    stats: ScanStats | None = None
+    error: str | None = None
 
 
 TRANSLATIONS = {
@@ -56,11 +83,14 @@ TRANSLATIONS = {
         "image": "Image",
         "prompt_tags": "Prompt Tags",
         "prompt_placeholder": "1girl, blue eyes, smile",
+        "negative_prompt_tags": "Negative Tags",
+        "negative_prompt_placeholder": "lowres, blurry, text",
         "match_mode": "Match mode",
         "all_tags": "All tags",
         "any_tag": "Any tag",
         "autocomplete": "Autocomplete",
         "unique_prompts": "Unique prompts only",
+        "excluding_tags": "excluding {tags}",
         "show_in_folder": "Show in folder",
         "folder_opened": "Folder Opened",
         "expand_prompt": "Expand prompt",
@@ -104,6 +134,19 @@ TRANSLATIONS = {
         "strong_match": "Strong visual match",
         "probable_match": "Probable visual match",
         "possible_match": "Possible visual match",
+        "scan_index": "Index / Update index",
+        "scan_roots": "Folders or images to index",
+        "scan_placeholder": "E:\\Images\nF:\\Downloads",
+        "scan_idle": "Index updates only run after you confirm them here. Starting the web UI does not scan folders automatically.",
+        "scan_running": "Index update running since {started_at}. This page will refresh automatically.",
+        "scan_complete": "Last update finished at {finished_at}: seen {seen}, queued {queued}, indexed {indexed}, skipped {skipped}, failed {failed}.",
+        "scan_failed": "Last update failed at {finished_at}: {error}",
+        "workers": "Workers",
+        "index_prompt_tags": "Index prompt tags",
+        "build_crop_index": "Build crop index",
+        "reindex_prompts": "Reindex prompts",
+        "read_stealth_prompts": "Read stealth prompts",
+        "confirm_update_index": "Confirm update index",
     },
     "zh": {
         "app_title": "图片搜索",
@@ -117,11 +160,14 @@ TRANSLATIONS = {
         "image": "图片",
         "prompt_tags": "提示词标签",
         "prompt_placeholder": "1girl, blue eyes, smile",
+        "negative_prompt_tags": "排除标签",
+        "negative_prompt_placeholder": "lowres, blurry, text",
         "match_mode": "匹配模式",
         "all_tags": "全部标签",
         "any_tag": "任一标签",
         "autocomplete": "自动补全",
         "unique_prompts": "仅显示唯一提示词",
+        "excluding_tags": "排除 {tags}",
         "show_in_folder": "在文件夹中显示",
         "folder_opened": "已打开文件夹",
         "expand_prompt": "展开提示词",
@@ -165,6 +211,19 @@ TRANSLATIONS = {
         "strong_match": "强视觉匹配",
         "probable_match": "可能视觉匹配",
         "possible_match": "疑似视觉匹配",
+        "scan_index": "索引 / 更新索引",
+        "scan_roots": "要索引的文件夹或图片",
+        "scan_placeholder": "E:\\图片\nF:\\下载",
+        "scan_idle": "索引更新只会在你手动确认后运行。启动网页界面不会自动扫描文件夹。",
+        "scan_running": "正在更新索引，开始时间：{started_at}。页面会自动刷新。",
+        "scan_complete": "上次更新完成于 {finished_at}：发现 {seen}，待处理 {queued}，已索引 {indexed}，已跳过 {skipped}，失败 {failed}。",
+        "scan_failed": "上次更新失败于 {finished_at}：{error}",
+        "workers": "并行数",
+        "index_prompt_tags": "索引提示词标签",
+        "build_crop_index": "建立裁剪索引",
+        "reindex_prompts": "重新索引提示词",
+        "read_stealth_prompts": "读取隐写提示词",
+        "confirm_update_index": "确认更新索引",
     },
 }
 
@@ -219,6 +278,78 @@ class WebState:
         self.thumbs_dir = work_dir / "thumbs"
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.thumbs_dir.mkdir(parents=True, exist_ok=True)
+        self.scan_lock = threading.Lock()
+        self.scan_status = WebScanStatus()
+
+    def start_scan(self, request: ScanRequest) -> bool:
+        with self.scan_lock:
+            if self.scan_status.state == "running":
+                return False
+            self.scan_status = WebScanStatus(
+                state="running",
+                roots=tuple(str(root) for root in request.roots),
+                started_at=_local_timestamp(),
+            )
+        thread = threading.Thread(
+            target=_run_scan_job,
+            args=(self, request),
+            name="imgdupe-web-scan",
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def get_scan_status(self) -> WebScanStatus:
+        with self.scan_lock:
+            return self.scan_status
+
+    def finish_scan(self, status: WebScanStatus) -> None:
+        with self.scan_lock:
+            self.scan_status = status
+
+
+def _run_scan_job(state: WebState, request: ScanRequest) -> None:
+    started_at = state.get_scan_status().started_at or _local_timestamp()
+    try:
+        conn = connect(state.db_path)
+        try:
+            init_db(conn)
+            stats = scan_roots(
+                conn,
+                list(request.roots),
+                config=ScanConfig(
+                    workers=request.workers,
+                    crop_index=request.crop_index,
+                    prompt_index=request.prompt_index,
+                    stealth_prompt=request.stealth_prompt,
+                    reindex_prompts=request.reindex_prompts,
+                ),
+            )
+        finally:
+            conn.close()
+        state.finish_scan(
+            WebScanStatus(
+                state="completed",
+                roots=tuple(str(root) for root in request.roots),
+                started_at=started_at,
+                finished_at=_local_timestamp(),
+                stats=stats,
+            )
+        )
+    except Exception as exc:
+        state.finish_scan(
+            WebScanStatus(
+                state="failed",
+                roots=tuple(str(root) for root in request.roots),
+                started_at=started_at,
+                finished_at=_local_timestamp(),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
+
+
+def _local_timestamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _make_handler(state: WebState):
@@ -245,12 +376,21 @@ def _make_handler(state: WebState):
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/scan":
+                try:
+                    request = self._save_scan_request()
+                    state.start_scan(request)
+                    self._redirect(f"/?lang={request.lang}#scan-index")
+                except Exception as exc:
+                    self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
+                return
             if parsed.path == "/prompt-search":
                 try:
                     options = self._save_prompt_search()
                     results = query_prompt_tags(
                         state.conn,
                         options.tags,
+                        negative_text_or_tags=options.negative_tags,
                         match_mode=options.match_mode,
                         limit=options.limit,
                         offset=options.offset,
@@ -275,7 +415,39 @@ def _make_handler(state: WebState):
                 )
                 self._send_html(_results_page(results, options))
             except Exception as exc:
-                self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
+                    self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
+
+        def _save_scan_request(self) -> ScanRequest:
+            content_type = self.headers.get("Content-Type", "")
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            if not content_type.startswith("application/x-www-form-urlencoded"):
+                raise ValueError("expected form-urlencoded scan request")
+            fields = {
+                key: values[-1]
+                for key, values in urllib.parse.parse_qs(body, keep_blank_values=True).items()
+            }
+            roots = tuple(
+                Path(line.strip()).expanduser()
+                for line in fields.get("roots", "").splitlines()
+                if line.strip()
+            )
+            if not roots:
+                raise ValueError("enter at least one folder or image path to index")
+            missing_roots = [str(root) for root in roots if not root.exists()]
+            if missing_roots:
+                raise ValueError(f"path does not exist: {missing_roots[0]}")
+            default_config = ScanConfig()
+            workers = max(1, min(_int_field(fields, "workers", default_config.workers), 64))
+            return ScanRequest(
+                roots=roots,
+                workers=workers,
+                crop_index=fields.get("crop_index") == "1",
+                prompt_index=fields.get("prompt_index") == "1",
+                stealth_prompt=fields.get("stealth_prompt") == "1",
+                reindex_prompts=fields.get("reindex_prompts") == "1",
+                lang=_normalize_lang(fields.get("lang")),
+            )
 
         def _save_prompt_search(self) -> PromptSearchOptions:
             content_type = self.headers.get("Content-Type", "")
@@ -288,10 +460,12 @@ def _make_handler(state: WebState):
                 for key, values in urllib.parse.parse_qs(body, keep_blank_values=True).items()
             }
             tags = fields.get("tags", "").strip()
-            if not tags:
-                raise ValueError("enter at least one prompt tag")
+            negative_tags = fields.get("negative_tags", "").strip()
+            if not tags and not negative_tags:
+                raise ValueError("enter at least one prompt tag or negative tag")
             return PromptSearchOptions(
                 tags=tags,
+                negative_tags=negative_tags,
                 match_mode=fields.get("match_mode") if fields.get("match_mode") in {"all", "any"} else "all",
                 limit=max(1, min(_int_field(fields, "limit", state.limit), 500)),
                 offset=max(0, _int_field(fields, "offset", 0)),
@@ -396,10 +570,98 @@ def _make_handler(state: WebState):
             self.end_headers()
             self.wfile.write(data)
 
+        def _redirect(self, location: str) -> None:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def log_message(self, format: str, *args) -> None:
             print(f"{self.address_string()} - {format % args}")
 
     return Handler
+
+
+def _scan_panel(state: WebState, lang: str) -> str:
+    text = _text(lang)
+    status = state.get_scan_status()
+    default_config = ScanConfig()
+    roots_value = "\n".join(status.roots)
+    disabled = "disabled" if status.state == "running" else ""
+    status_html = ""
+    refresh_script = ""
+    if status.state == "running":
+        status_html = f"""
+        <p class="scan-status is-running">
+          {text["scan_running"].format(started_at=html.escape(status.started_at or ""))}
+        </p>
+        """
+        refresh_script = "<script>setTimeout(() => window.location.reload(), 3000);</script>"
+    elif status.state == "completed" and status.stats is not None:
+        stats = status.stats
+        status_html = f"""
+        <p class="scan-status is-complete">
+          {text["scan_complete"].format(
+              finished_at=html.escape(status.finished_at or ""),
+              seen=stats.seen,
+              queued=stats.queued,
+              indexed=stats.indexed,
+              skipped=stats.skipped,
+              failed=stats.failed,
+          )}
+        </p>
+        """
+    elif status.state == "failed":
+        status_html = f"""
+        <p class="scan-status is-failed">
+          {text["scan_failed"].format(
+              finished_at=html.escape(status.finished_at or ""),
+              error=html.escape(status.error or "unknown error"),
+          )}
+        </p>
+        """
+    else:
+        status_html = f"""
+        <p class="scan-status">
+          {text["scan_idle"]}
+        </p>
+        """
+
+    return f"""
+    <section id="scan-index" class="scan-panel">
+      <form method="post" action="/scan">
+        <input type="hidden" name="lang" value="{html.escape(lang)}">
+        <h2>{text["scan_index"]}</h2>
+        {status_html}
+        <label class="prompt-input-label" for="scan-roots">{text["scan_roots"]}</label>
+        <textarea id="scan-roots" name="roots" rows="4" placeholder="{html.escape(text["scan_placeholder"])}" required {disabled}>{html.escape(roots_value)}</textarea>
+        <div class="controls scan-controls">
+          <label>
+            {text["workers"]}
+            <input type="number" name="workers" min="1" max="64" step="1" value="{default_config.workers}" {disabled}>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="prompt_index" value="1" checked {disabled}>
+            {text["index_prompt_tags"]}
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="crop_index" value="1" {disabled}>
+            {text["build_crop_index"]}
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="reindex_prompts" value="1" {disabled}>
+            {text["reindex_prompts"]}
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="stealth_prompt" value="1" {disabled}>
+            {text["read_stealth_prompts"]}
+          </label>
+        </div>
+        <button type="submit" {disabled}>{text["confirm_update_index"]}</button>
+      </form>
+    </section>
+    {refresh_script}
+    """
 
 
 def _index_page(state: WebState, lang: str) -> str:
@@ -474,8 +736,13 @@ def _index_page(state: WebState, lang: str) -> str:
         <h2>{text['prompt_search']}</h2>
         <label class="prompt-input-label" for="prompt-tags-input">{text['prompt_tags']}</label>
         <div class="prompt-input-wrap">
-          <textarea id="prompt-tags-input" name="tags" rows="5" placeholder="{text['prompt_placeholder']}" autocomplete="off" spellcheck="false" required></textarea>
+          <textarea id="prompt-tags-input" name="tags" rows="5" placeholder="{text['prompt_placeholder']}" autocomplete="off" spellcheck="false"></textarea>
           <div id="tag-suggestions" class="suggestions" hidden></div>
+        </div>
+        <label class="prompt-input-label" for="negative-prompt-tags-input">{text['negative_prompt_tags']}</label>
+        <div class="prompt-input-wrap">
+          <textarea id="negative-prompt-tags-input" name="negative_tags" rows="3" placeholder="{text['negative_prompt_placeholder']}" autocomplete="off" spellcheck="false"></textarea>
+          <div id="negative-tag-suggestions" class="suggestions" hidden></div>
         </div>
         <label class="autocomplete-toggle">
           <input id="autocomplete-enabled" type="checkbox" checked>
@@ -506,6 +773,7 @@ def _index_page(state: WebState, lang: str) -> str:
         <button type="submit">{text['search']}</button>
       </form>
     </section>
+    {_scan_panel(state, lang)}
     <script>
       const input = document.querySelector("#image-input");
       const language = document.querySelector("select[name='lang']");
@@ -513,10 +781,13 @@ def _index_page(state: WebState, lang: str) -> str:
       const minScore = document.querySelector("input[name='min_score']");
       const tryhard = document.querySelector("input[name='tryhard']");
       const promptInput = document.querySelector("#prompt-tags-input");
+      const negativePromptInput = document.querySelector("#negative-prompt-tags-input");
       const suggestions = document.querySelector("#tag-suggestions");
+      const negativeSuggestions = document.querySelector("#negative-tag-suggestions");
       const autocomplete = document.querySelector("#autocomplete-enabled");
       const scores = {{ strict: "75", balanced: "{state.min_score:.0f}", loose: "40" }};
       let activeSuggestion = -1;
+      let activePromptInput = promptInput;
       language.addEventListener("change", () => {{
         window.location.href = "/?lang=" + encodeURIComponent(language.value);
       }});
@@ -534,21 +805,28 @@ def _index_page(state: WebState, lang: str) -> str:
         dt.items.add(file);
         input.files = dt.files;
       }});
-      const tokenInfo = () => {{
-        const value = promptInput.value;
-        const caret = promptInput.selectionStart ?? value.length;
+      const suggestionsForInput = inputElement => (
+        inputElement === negativePromptInput ? negativeSuggestions : suggestions
+      );
+      const tokenInfo = inputElement => {{
+        const value = inputElement.value;
+        const caret = inputElement.selectionStart ?? value.length;
         const left = value.slice(0, caret);
         const start = Math.max(left.lastIndexOf(","), left.lastIndexOf("，"), left.lastIndexOf("\\n")) + 1;
         return {{ start, end: caret, token: value.slice(start, caret).trimStart() }};
       }};
-      const hideSuggestions = () => {{
-        suggestions.hidden = true;
-        suggestions.innerHTML = "";
+      const hideSuggestions = suggestionsElement => {{
+        suggestionsElement.hidden = true;
+        suggestionsElement.innerHTML = "";
         activeSuggestion = -1;
       }};
-      const suggestionButtons = () => [...suggestions.querySelectorAll("button[data-tag]")];
-      const setActiveSuggestion = index => {{
-        const buttons = suggestionButtons();
+      const hideAllSuggestions = () => {{
+        hideSuggestions(suggestions);
+        hideSuggestions(negativeSuggestions);
+      }};
+      const suggestionButtons = suggestionsElement => [...suggestionsElement.querySelectorAll("button[data-tag]")];
+      const setActiveSuggestion = (suggestionsElement, index) => {{
+        const buttons = suggestionButtons(suggestionsElement);
         if (!buttons.length) {{
           activeSuggestion = -1;
           return;
@@ -558,64 +836,79 @@ def _index_page(state: WebState, lang: str) -> str:
           button.classList.toggle("is-active", buttonIndex === activeSuggestion);
         }});
       }};
-      const applySuggestion = tag => {{
-        const info = tokenInfo();
-        const value = promptInput.value;
+      const applySuggestion = (inputElement, suggestionsElement, tag) => {{
+        const info = tokenInfo(inputElement);
+        const value = inputElement.value;
         const leading = value.slice(info.start, info.end).match(/^\\s*/)?.[0] || "";
         const after = value.slice(info.end);
         const separator = after.startsWith(",") || after.startsWith("，") ? "" : ", ";
         const insert = leading + tag + separator;
-        promptInput.value = value.slice(0, info.start) + insert + value.slice(info.end);
+        inputElement.value = value.slice(0, info.start) + insert + value.slice(info.end);
         const caret = info.start + insert.length;
-        promptInput.focus();
-        promptInput.setSelectionRange(caret, caret);
-        hideSuggestions();
+        inputElement.focus();
+        inputElement.setSelectionRange(caret, caret);
+        hideSuggestions(suggestionsElement);
       }};
-      const refreshSuggestions = async () => {{
-        if (!autocomplete.checked) return hideSuggestions();
-        const info = tokenInfo();
+      const refreshSuggestions = async inputElement => {{
+        const suggestionsElement = suggestionsForInput(inputElement);
+        activePromptInput = inputElement;
+        const otherSuggestions = suggestionsElement === suggestions ? negativeSuggestions : suggestions;
+        hideSuggestions(otherSuggestions);
+        if (!autocomplete.checked) return hideSuggestions(suggestionsElement);
+        const info = tokenInfo(inputElement);
         const query = info.token.trim();
-        if (query.length < 1) return hideSuggestions();
+        if (query.length < 1) return hideSuggestions(suggestionsElement);
         const response = await fetch("/suggest-tags?q=" + encodeURIComponent(query));
-        if (!response.ok) return hideSuggestions();
+        if (!response.ok) return hideSuggestions(suggestionsElement);
         const tags = await response.json();
-        if (!tags.length) return hideSuggestions();
-        suggestions.innerHTML = tags.map(item => (
+        if (!tags.length) return hideSuggestions(suggestionsElement);
+        suggestionsElement.innerHTML = tags.map(item => (
           `<button type="button" data-tag="${{item.tag.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}}">
              <span>${{item.tag.replaceAll("&", "&amp;").replaceAll("<", "&lt;")}}</span>
              <small>${{item.count}}</small>
            </button>`
         )).join("");
-        suggestions.hidden = false;
-        setActiveSuggestion(0);
+        suggestionsElement.hidden = false;
+        setActiveSuggestion(suggestionsElement, 0);
       }};
-      promptInput.addEventListener("input", refreshSuggestions);
-      promptInput.addEventListener("click", refreshSuggestions);
-      promptInput.addEventListener("keydown", event => {{
-        if (suggestions.hidden) return;
-        const buttons = suggestionButtons();
-        if (!buttons.length) return;
-        if (event.key === "ArrowDown") {{
-          event.preventDefault();
-          setActiveSuggestion(activeSuggestion + 1);
-        }} else if (event.key === "ArrowUp") {{
-          event.preventDefault();
-          setActiveSuggestion(activeSuggestion - 1);
-        }} else if (event.key === "Enter") {{
-          event.preventDefault();
-          const button = buttons[activeSuggestion >= 0 ? activeSuggestion : 0];
-          if (button) applySuggestion(button.dataset.tag);
-        }} else if (event.key === "Escape") {{
-          hideSuggestions();
-        }}
-      }});
-      autocomplete.addEventListener("change", refreshSuggestions);
-      suggestions.addEventListener("click", event => {{
-        const button = event.target.closest("button[data-tag]");
-        if (button) applySuggestion(button.dataset.tag);
+      const bindPromptAutocomplete = inputElement => {{
+        const suggestionsElement = suggestionsForInput(inputElement);
+        inputElement.addEventListener("input", () => refreshSuggestions(inputElement));
+        inputElement.addEventListener("click", () => refreshSuggestions(inputElement));
+        inputElement.addEventListener("focus", () => refreshSuggestions(inputElement));
+        inputElement.addEventListener("keydown", event => {{
+          if (suggestionsElement.hidden) return;
+          const buttons = suggestionButtons(suggestionsElement);
+          if (!buttons.length) return;
+          if (event.key === "ArrowDown") {{
+            event.preventDefault();
+            setActiveSuggestion(suggestionsElement, activeSuggestion + 1);
+          }} else if (event.key === "ArrowUp") {{
+            event.preventDefault();
+            setActiveSuggestion(suggestionsElement, activeSuggestion - 1);
+          }} else if (event.key === "Enter") {{
+            event.preventDefault();
+            const button = buttons[activeSuggestion >= 0 ? activeSuggestion : 0];
+            if (button) applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
+          }} else if (event.key === "Escape") {{
+            hideSuggestions(suggestionsElement);
+          }}
+        }});
+      }};
+      bindPromptAutocomplete(promptInput);
+      bindPromptAutocomplete(negativePromptInput);
+      autocomplete.addEventListener("change", () => refreshSuggestions(activePromptInput));
+      [suggestions, negativeSuggestions].forEach(suggestionsElement => {{
+        suggestionsElement.addEventListener("click", event => {{
+          const button = event.target.closest("button[data-tag]");
+          if (button) {{
+            const inputElement = suggestionsElement === negativeSuggestions ? negativePromptInput : promptInput;
+            applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
+          }}
+        }});
       }});
       document.addEventListener("click", event => {{
-        if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) hideSuggestions();
+        if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) hideAllSuggestions();
       }});
     </script>
     """
@@ -703,13 +996,19 @@ def _prompt_results_page(
     )
     if options.unique_prompts:
         summary = f"{summary} · {text['unique_prompts']}"
+    if options.negative_tags:
+        summary = f"{summary} · {text['excluding_tags'].format(tags=html.escape(options.negative_tags))}"
     empty = f"<p>{text['no_prompt_results']}</p>" if not cards else ""
+    query_lines = [html.escape(options.tags)] if options.tags else []
+    if options.negative_tags:
+        query_lines.append(text["excluding_tags"].format(tags=html.escape(options.negative_tags)))
+    query_summary = "<br>".join(query_lines)
     body = f"""
     <nav><a href="/?lang={options.lang}">{text['new_search']}</a></nav>
     <header>
       <h1>{text['prompt_results']}</h1>
       <p>{summary}</p>
-      <p class="muted">{html.escape(options.tags)}</p>
+      <p class="muted">{query_summary}</p>
     </header>
     <section class="grid">{''.join(cards)}</section>
     {empty}
@@ -823,7 +1122,7 @@ def _error_page(exc: Exception) -> str:
     )
 
 
-def _page(title: str, body: str, *, lang: str = "en") -> str:
+def _page(title: str, body: str, *, lang: str = "zh") -> str:
     return f"""<!doctype html>
 <html lang="{html.escape(lang)}">
 <head>
@@ -842,6 +1141,13 @@ def _page(title: str, body: str, *, lang: str = "en") -> str:
     .stats div {{ background: #fff; border: 1px solid #d9e1e8; border-radius: 6px; padding: 12px; }}
     .stats strong {{ display: block; font-size: 24px; }}
     .stats span {{ color: #52606d; }}
+    .scan-panel {{ margin: 0 0 24px; padding: 16px 0 24px; border-top: 1px solid #d9e1e8; border-bottom: 1px solid #d9e1e8; }}
+    .scan-panel h2 {{ margin: 0; font-size: 20px; }}
+    .scan-status {{ color: #52606d; margin: 0; }}
+    .scan-status.is-running {{ color: #245b9f; font-weight: 700; }}
+    .scan-status.is-complete {{ color: #236c3b; font-weight: 700; }}
+    .scan-status.is-failed {{ color: #9b1c1c; font-weight: 700; }}
+    .scan-controls {{ grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }}
     .search {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 24px; align-items: start; }}
     form {{ display: grid; gap: 16px; width: 100%; }}
     form h2 {{ margin: 0; font-size: 20px; }}
@@ -865,6 +1171,7 @@ def _page(title: str, body: str, *, lang: str = "en") -> str:
     .controls input, .controls select {{ min-width: 0; padding: 8px; border: 1px solid #bcccdc; border-radius: 6px; background: #fff; }}
     .controls .checkbox {{ display: flex; align-items: center; gap: 8px; }}
     .controls .checkbox input {{ width: auto; }}
+    button:disabled, input:disabled, textarea:disabled {{ opacity: 0.65; cursor: not-allowed; }}
     .hint {{ color: #9b4d18; font-size: 13px; margin: 0; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }}
     .result {{ border: 1px solid #d9e1e8; border-radius: 6px; background: #fff; padding: 12px; }}
@@ -1090,11 +1397,11 @@ def _stats(conn: sqlite3.Connection) -> dict[str, int]:
 
 def _lang_from_query(query: str) -> str:
     values = urllib.parse.parse_qs(query)
-    return _normalize_lang(values.get("lang", ["en"])[0])
+    return _normalize_lang(values.get("lang", ["zh"])[0])
 
 
 def _normalize_lang(lang: str | None) -> str:
-    return lang if lang in TRANSLATIONS else "en"
+    return lang if lang in TRANSLATIONS else "zh"
 
 
 def _text(lang: str) -> dict[str, str]:
