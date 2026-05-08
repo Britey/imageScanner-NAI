@@ -16,6 +16,7 @@ from .db import (
     replace_crop_hashes,
     replace_hashes,
     replace_prompt,
+    update_image_dates,
     upsert_image,
 )
 from .hashing import compute_image_hashes, sha256_file
@@ -37,8 +38,11 @@ class ScanTask:
     path: Path
     size_bytes: int
     mtime_ns: int
+    created_ns: int | None
+    modified_ns: int | None
     had_existing_hashes: bool
     prompt_only: bool
+    date_only: bool
     existing_image_id: int | None
 
 
@@ -47,6 +51,8 @@ class ScanResult:
     path: Path
     size_bytes: int
     mtime_ns: int
+    created_ns: int | None
+    modified_ns: int | None
     width: int | None
     height: int | None
     image_format: str | None
@@ -55,6 +61,7 @@ class ScanResult:
     decode_error: str | None
     had_existing_hashes: bool
     prompt_only: bool
+    date_only: bool
     existing_image_id: int | None
     prompt: str | None
     prompt_source: str | None
@@ -80,6 +87,8 @@ def scan_roots(
         except OSError:
             stats.failed += 1
             continue
+        created_ns = _created_ns_from_stat(stat)
+        modified_ns = stat.st_mtime_ns
 
         existing = get_existing_image(conn, path)
         existing_id = int(existing["id"]) if existing is not None else None
@@ -96,7 +105,17 @@ def scan_roots(
             and existing["missing_at"] is None
             and (not config.crop_index or _has_crop_hashes(conn, int(existing["id"])))
         )
-        if unchanged_hashes and not needs_prompt:
+        needs_date_update = (
+            unchanged_hashes
+            and existing_id is not None
+            and (
+                existing["created_ns"] is None
+                or existing["modified_ns"] is None
+                or _optional_int(existing["created_ns"]) != created_ns
+                or _optional_int(existing["modified_ns"]) != modified_ns
+            )
+        )
+        if unchanged_hashes and not needs_prompt and not needs_date_update:
             stats.skipped += 1
             continue
 
@@ -105,8 +124,11 @@ def scan_roots(
                 path=path,
                 size_bytes=stat.st_size,
                 mtime_ns=stat.st_mtime_ns,
+                created_ns=created_ns,
+                modified_ns=modified_ns,
                 had_existing_hashes=existing is not None,
                 prompt_only=unchanged_hashes and needs_prompt,
+                date_only=unchanged_hashes and needs_date_update and not needs_prompt,
                 existing_image_id=existing_id,
             )
         )
@@ -159,10 +181,29 @@ def _store_result(
     stats: ScanStats,
 ) -> None:
     indexed_at = utc_now_sql()
+    if result.date_only:
+        if result.existing_image_id is None:
+            stats.failed += 1
+            return
+        update_image_dates(
+            conn,
+            result.existing_image_id,
+            created_ns=result.created_ns,
+            modified_ns=result.modified_ns,
+        )
+        stats.indexed += 1
+        return
+
     if result.prompt_only:
         if result.existing_image_id is None:
             stats.failed += 1
             return
+        update_image_dates(
+            conn,
+            result.existing_image_id,
+            created_ns=result.created_ns,
+            modified_ns=result.modified_ns,
+        )
         _store_prompt(conn, result.existing_image_id, result, indexed_at)
         stats.indexed += 1
         return
@@ -173,6 +214,8 @@ def _store_result(
             path=result.path,
             size_bytes=result.size_bytes,
             mtime_ns=result.mtime_ns,
+            created_ns=result.created_ns,
+            modified_ns=result.modified_ns,
             indexed_at=indexed_at,
             width=result.width,
             height=result.height,
@@ -208,6 +251,8 @@ def _store_result(
             path=result.path,
             size_bytes=result.size_bytes,
             mtime_ns=result.mtime_ns,
+            created_ns=result.created_ns,
+            modified_ns=result.modified_ns,
             indexed_at=indexed_at,
             sha256=result.sha256,
             decode_error=result.decode_error,
@@ -228,6 +273,28 @@ def _hash_task(
     prompt_index: bool,
     stealth_prompt: bool,
 ) -> ScanResult:
+    if task.date_only:
+        return ScanResult(
+            path=task.path,
+            size_bytes=task.size_bytes,
+            mtime_ns=task.mtime_ns,
+            created_ns=task.created_ns,
+            modified_ns=task.modified_ns,
+            width=None,
+            height=None,
+            image_format=None,
+            sha256=None,
+            hashes={},
+            decode_error=None,
+            had_existing_hashes=task.had_existing_hashes,
+            prompt_only=False,
+            date_only=True,
+            existing_image_id=task.existing_image_id,
+            prompt=None,
+            prompt_source=None,
+            prompt_error=None,
+        )
+
     if task.prompt_only:
         prompt, prompt_source, prompt_error = _extract_prompt_fields(
             task.path,
@@ -238,6 +305,8 @@ def _hash_task(
             path=task.path,
             size_bytes=task.size_bytes,
             mtime_ns=task.mtime_ns,
+            created_ns=task.created_ns,
+            modified_ns=task.modified_ns,
             width=None,
             height=None,
             image_format=None,
@@ -246,6 +315,7 @@ def _hash_task(
             decode_error=None,
             had_existing_hashes=task.had_existing_hashes,
             prompt_only=True,
+            date_only=False,
             existing_image_id=task.existing_image_id,
             prompt=prompt,
             prompt_source=prompt_source,
@@ -268,6 +338,8 @@ def _hash_task(
             path=task.path,
             size_bytes=task.size_bytes,
             mtime_ns=task.mtime_ns,
+            created_ns=task.created_ns,
+            modified_ns=task.modified_ns,
             width=int(metadata["width"]),
             height=int(metadata["height"]),
             image_format=str(metadata["format"]),
@@ -276,6 +348,7 @@ def _hash_task(
             decode_error=None,
             had_existing_hashes=task.had_existing_hashes,
             prompt_only=False,
+            date_only=False,
             existing_image_id=task.existing_image_id,
             prompt=prompt,
             prompt_source=prompt_source,
@@ -291,6 +364,8 @@ def _hash_task(
             path=task.path,
             size_bytes=task.size_bytes,
             mtime_ns=task.mtime_ns,
+            created_ns=task.created_ns,
+            modified_ns=task.modified_ns,
             width=None,
             height=None,
             image_format=None,
@@ -299,6 +374,7 @@ def _hash_task(
             decode_error=f"{type(exc).__name__}: {exc}",
             had_existing_hashes=task.had_existing_hashes,
             prompt_only=False,
+            date_only=False,
             existing_image_id=task.existing_image_id,
             prompt=prompt,
             prompt_source=prompt_source,
@@ -311,6 +387,18 @@ def _sha256_or_none(path: Path) -> bytes | None:
         return sha256_file(path)
     except OSError:
         return None
+
+
+def _created_ns_from_stat(stat) -> int | None:
+    birthtime_ns = getattr(stat, "st_birthtime_ns", None)
+    if birthtime_ns is not None:
+        return int(birthtime_ns)
+    ctime_ns = getattr(stat, "st_ctime_ns", None)
+    return int(ctime_ns) if ctime_ns is not None else None
+
+
+def _optional_int(value) -> int | None:
+    return int(value) if value is not None else None
 
 
 def _has_crop_hashes(conn: sqlite3.Connection, image_id: int) -> bool:

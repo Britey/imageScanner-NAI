@@ -100,6 +100,9 @@ http://127.0.0.1:8765
 imgdupe scan "E:\Images" --db images.sqlite --workers 16
 ```
 
+对于在日期排序功能加入前创建的旧数据库，同一次扫描会为未变化的文件补写
+创建时间和修改时间，不会重新生成图片哈希或重新读取提示词元数据。
+
 也可以把多个根目录索引进同一个数据库：
 
 ```powershell
@@ -120,6 +123,7 @@ imgdupe scan "E:\Images" "F:\Downloads" --db images.sqlite --workers 16
 - 深度裁剪搜索
 - 使用英文逗号、中文逗号或换行分隔的提示词标签搜索
 - 使用排除标签过滤结果，且不需要重新索引
+- 提示词结果始终先按匹配标签数排序，再按创建时间、修改时间或名称排序
 - 提示词标签自动补全，支持上下方向键和回车选择
 - 可选择只显示唯一提示词，重复提示词只展示一张图片
 - 结果卡片支持打开资源管理器并选中图片
@@ -165,6 +169,7 @@ imgdupe tags "1girl, blue eyes" --db images.sqlite
 imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 imgdupe tags "1girl" --not-tags "lowres, blurry" --db images.sqlite
+imgdupe tags "1girl" --sort created-desc --db images.sqlite
 ```
 
 标签搜索使用与索引相同的清理规则，因此搜索 `sanoba witch` 可以匹配包含 `sanoba_witch::` 的提示词。

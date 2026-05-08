@@ -103,6 +103,10 @@ The scan command is incremental. Running it again skips unchanged files:
 imgdupe scan "E:\Images" --db images.sqlite --workers 16
 ```
 
+On existing databases created before date sorting was added, the same scan
+backfills file creation and modification timestamps for unchanged files without
+rebuilding image hashes or prompt metadata.
+
 You can index multiple roots into the same database:
 
 ```powershell
@@ -123,6 +127,7 @@ The web UI supports:
 - tryhard crop search
 - prompt tag search using commas, Chinese commas, or newlines
 - negative prompt tags that exclude images without reindexing
+- prompt result sorting by matching-tag count first, then creation date, modified date, or name
 - prompt-tag autocomplete with up/down/enter keyboard selection
 - optional unique-prompt results, so duplicate prompts show only one image
 - show-in-folder buttons that open Explorer and select the image
@@ -168,6 +173,7 @@ imgdupe tags "1girl, blue eyes" --db images.sqlite
 imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 imgdupe tags "1girl" --not-tags "lowres, blurry" --db images.sqlite
+imgdupe tags "1girl" --sort created-desc --db images.sqlite
 ```
 
 Tag search uses the same cleaning rules as indexing, so searching for

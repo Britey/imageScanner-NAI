@@ -41,6 +41,19 @@ def main(argv: list[str] | None = None) -> int:
     tags_parser.add_argument("--db", type=Path, required=True)
     tags_parser.add_argument("--mode", choices=("all", "any"), default="all")
     tags_parser.add_argument(
+        "--sort",
+        choices=(
+            "created-desc",
+            "created-asc",
+            "modified-desc",
+            "modified-asc",
+            "name-asc",
+            "name-desc",
+        ),
+        default="created-desc",
+        help="Secondary sort for prompt tag results after matching-tag count.",
+    )
+    tags_parser.add_argument(
         "--not-tags",
         nargs="+",
         default=[],
@@ -103,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             match_mode=args.mode,
             limit=args.limit,
             offset=args.offset,
+            sort_by=args.sort.replace("-", "_"),
         )
         for result in results:
             image_row = result.image_row

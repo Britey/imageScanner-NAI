@@ -43,6 +43,7 @@ class PromptSearchOptions:
     tags: str
     negative_tags: str
     match_mode: str
+    sort_by: str
     limit: int
     offset: int
     lang: str
@@ -86,6 +87,13 @@ TRANSLATIONS = {
         "negative_prompt_tags": "Negative Tags",
         "negative_prompt_placeholder": "lowres, blurry, text",
         "match_mode": "Match mode",
+        "sort_by": "Sort by",
+        "sort_created_desc": "Creation date, newest first",
+        "sort_created_asc": "Creation date, oldest first",
+        "sort_modified_desc": "Modified date, newest first",
+        "sort_modified_asc": "Modified date, oldest first",
+        "sort_name_asc": "Name, A to Z",
+        "sort_name_desc": "Name, Z to A",
         "all_tags": "All tags",
         "any_tag": "Any tag",
         "autocomplete": "Autocomplete",
@@ -116,6 +124,7 @@ TRANSLATIONS = {
         "results": "Results",
         "prompt_results": "Prompt Results",
         "prompt_showing": "Tags {mode} · max {limit} results · offset {offset}",
+        "prompt_sorted": "sorted by {sort}",
         "showing": "Quality {quality} · score at least {score:.1f} · max {limit} results · exact matches {exact} · tryhard {tryhard}",
         "shown": "shown",
         "hidden": "hidden",
@@ -163,6 +172,13 @@ TRANSLATIONS = {
         "negative_prompt_tags": "排除标签",
         "negative_prompt_placeholder": "lowres, blurry, text",
         "match_mode": "匹配模式",
+        "sort_by": "排序",
+        "sort_created_desc": "创建时间，新到旧",
+        "sort_created_asc": "创建时间，旧到新",
+        "sort_modified_desc": "修改时间，新到旧",
+        "sort_modified_asc": "修改时间，旧到新",
+        "sort_name_asc": "名称，A 到 Z",
+        "sort_name_desc": "名称，Z 到 A",
         "all_tags": "全部标签",
         "any_tag": "任一标签",
         "autocomplete": "自动补全",
@@ -193,6 +209,7 @@ TRANSLATIONS = {
         "results": "搜索结果",
         "prompt_results": "提示词搜索结果",
         "prompt_showing": "标签{mode} · 最多 {limit} 个结果 · 偏移 {offset}",
+        "prompt_sorted": "按{sort}排序",
         "showing": "匹配强度 {quality} · 最低分数 {score:.1f} · 最多 {limit} 个结果 · 完全匹配{exact} · 深度搜索{tryhard}",
         "shown": "显示",
         "hidden": "隐藏",
@@ -395,6 +412,7 @@ def _make_handler(state: WebState):
                         limit=options.limit,
                         offset=options.offset,
                         unique_prompts=options.unique_prompts,
+                        sort_by=options.sort_by,
                     )
                     self._send_html(_prompt_results_page(results, options))
                 except Exception as exc:
@@ -467,6 +485,7 @@ def _make_handler(state: WebState):
                 tags=tags,
                 negative_tags=negative_tags,
                 match_mode=fields.get("match_mode") if fields.get("match_mode") in {"all", "any"} else "all",
+                sort_by=_normalize_prompt_sort(fields.get("sort_by")),
                 limit=max(1, min(_int_field(fields, "limit", state.limit), 500)),
                 offset=max(0, _int_field(fields, "offset", 0)),
                 lang=_normalize_lang(fields.get("lang")),
@@ -762,6 +781,17 @@ def _index_page(state: WebState, lang: str) -> str:
             </select>
           </label>
           <label>
+            {text['sort_by']}
+            <select name="sort_by">
+              <option value="created_desc" selected>{text['sort_created_desc']}</option>
+              <option value="created_asc">{text['sort_created_asc']}</option>
+              <option value="modified_desc">{text['sort_modified_desc']}</option>
+              <option value="modified_asc">{text['sort_modified_asc']}</option>
+              <option value="name_asc">{text['sort_name_asc']}</option>
+              <option value="name_desc">{text['sort_name_desc']}</option>
+            </select>
+          </label>
+          <label>
             {text['max_results']}
             <input type="number" name="limit" min="1" max="500" step="1" value="{state.limit}">
           </label>
@@ -994,6 +1024,7 @@ def _prompt_results_page(
         limit=options.limit,
         offset=options.offset,
     )
+    summary = f"{summary} · {text['prompt_sorted'].format(sort=html.escape(_prompt_sort_label(options.sort_by, options.lang)))}"
     if options.unique_prompts:
         summary = f"{summary} · {text['unique_prompts']}"
     if options.negative_tags:
@@ -1402,6 +1433,25 @@ def _lang_from_query(query: str) -> str:
 
 def _normalize_lang(lang: str | None) -> str:
     return lang if lang in TRANSLATIONS else "zh"
+
+
+def _normalize_prompt_sort(sort_by: str | None) -> str:
+    return sort_by if sort_by in _PROMPT_SORT_LABEL_KEYS else "created_desc"
+
+
+_PROMPT_SORT_LABEL_KEYS = {
+    "created_desc": "sort_created_desc",
+    "created_asc": "sort_created_asc",
+    "modified_desc": "sort_modified_desc",
+    "modified_asc": "sort_modified_asc",
+    "name_asc": "sort_name_asc",
+    "name_desc": "sort_name_desc",
+}
+
+
+def _prompt_sort_label(sort_by: str, lang: str) -> str:
+    text = _text(lang)
+    return text[_PROMPT_SORT_LABEL_KEYS[_normalize_prompt_sort(sort_by)]]
 
 
 def _text(lang: str) -> dict[str, str]:

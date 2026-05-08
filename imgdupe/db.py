@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS images (
     path TEXT NOT NULL UNIQUE,
     size_bytes INTEGER NOT NULL,
     mtime_ns INTEGER NOT NULL,
+    created_ns INTEGER,
+    modified_ns INTEGER,
     width INTEGER,
     height INTEGER,
     format TEXT,
@@ -104,6 +106,8 @@ DROP INDEX IF EXISTS idx_hash_bands_lookup;
 CREATE INDEX IF NOT EXISTS idx_hash_bands_image_id ON hash_bands(image_id);
 CREATE INDEX IF NOT EXISTS idx_crop_hashes_image_id ON crop_hashes(image_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_tags_norm_image ON prompt_tags(tag_norm, image_id);
+CREATE INDEX IF NOT EXISTS idx_images_created_ns ON images(created_ns);
+CREATE INDEX IF NOT EXISTS idx_images_modified_ns ON images(modified_ns);
 """
 
 
@@ -119,8 +123,19 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _ensure_column(conn, "images", "created_ns", "INTEGER")
+    _ensure_column(conn, "images", "modified_ns", "INTEGER")
     conn.executescript(MIGRATIONS)
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    columns = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def get_existing_image(conn: sqlite3.Connection, path: Path) -> sqlite3.Row | None:
@@ -136,6 +151,8 @@ def upsert_image(
     path: Path,
     size_bytes: int,
     mtime_ns: int,
+    created_ns: int | None = None,
+    modified_ns: int | None = None,
     indexed_at: str,
     width: int | None = None,
     height: int | None = None,
@@ -146,13 +163,15 @@ def upsert_image(
     conn.execute(
         """
         INSERT INTO images (
-            path, size_bytes, mtime_ns, width, height, format, sha256,
+            path, size_bytes, mtime_ns, created_ns, modified_ns, width, height, format, sha256,
             indexed_at, missing_at, decode_error
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(path) DO UPDATE SET
             size_bytes = excluded.size_bytes,
             mtime_ns = excluded.mtime_ns,
+            created_ns = excluded.created_ns,
+            modified_ns = excluded.modified_ns,
             width = excluded.width,
             height = excluded.height,
             format = excluded.format,
@@ -165,6 +184,8 @@ def upsert_image(
             str(path),
             size_bytes,
             mtime_ns,
+            created_ns,
+            modified_ns,
             width,
             height,
             image_format,
@@ -177,6 +198,23 @@ def upsert_image(
     if row is None:
         raise RuntimeError(f"Failed to upsert image row for {path}")
     return int(row["id"])
+
+
+def update_image_dates(
+    conn: sqlite3.Connection,
+    image_id: int,
+    *,
+    created_ns: int | None,
+    modified_ns: int | None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE images
+        SET created_ns = ?, modified_ns = ?
+        WHERE id = ?
+        """,
+        (created_ns, modified_ns, image_id),
+    )
 
 
 def replace_hashes(

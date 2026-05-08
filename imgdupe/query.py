@@ -100,6 +100,7 @@ def query_prompt_tags(
     limit: int = 100,
     offset: int = 0,
     unique_prompts: bool = False,
+    sort_by: str = "created_desc",
 ) -> list[PromptSearchResult]:
     tag_norms = _prompt_tag_norms(text_or_tags)
     negative_tag_norms = _prompt_tag_norms(negative_text_or_tags)
@@ -109,6 +110,8 @@ def query_prompt_tags(
     mode = match_mode.lower()
     if mode not in {"all", "any"}:
         raise ValueError("match_mode must be 'all' or 'any'")
+    ranked_order = _prompt_sort_order(sort_by, table_alias="i")
+    final_order = _prompt_sort_order(sort_by, table_alias="")
 
     params: list[object] = []
     if tag_norms:
@@ -166,7 +169,7 @@ def query_prompt_tags(
                 matches.matched_tags,
                 ROW_NUMBER() OVER (
                     PARTITION BY ip.prompt
-                    ORDER BY matches.matched_count DESC, i.indexed_at DESC, i.path
+                    ORDER BY {ranked_order}
                 ) AS prompt_rank
             FROM matches
             JOIN images i ON i.id = matches.image_id
@@ -178,7 +181,7 @@ def query_prompt_tags(
         SELECT *
         FROM ranked
         WHERE prompt_rank = 1
-        ORDER BY matched_count DESC, indexed_at DESC, path
+        ORDER BY {final_order}
         LIMIT ? OFFSET ?
         """
         )
@@ -196,7 +199,7 @@ def query_prompt_tags(
         LEFT JOIN image_prompts ip ON ip.image_id = i.id
         WHERE i.missing_at IS NULL
           {exclude_clause}
-        ORDER BY matches.matched_count DESC, i.indexed_at DESC, i.path
+        ORDER BY {ranked_order}
         LIMIT ? OFFSET ?
         """
         )
@@ -234,6 +237,22 @@ def _prompt_tag_norms(text_or_tags: str | list[str] | None) -> list[str]:
         seen.add(tag_norm)
         tag_norms.append(tag_norm)
     return tag_norms
+
+
+def _prompt_sort_order(sort_by: str, *, table_alias: str) -> str:
+    prefix = f"{table_alias}." if table_alias else ""
+    created = f"COALESCE({prefix}created_ns, {prefix}mtime_ns)"
+    modified = f"COALESCE({prefix}modified_ns, {prefix}mtime_ns)"
+    path = f"LOWER({prefix}path)"
+    sort_orders = {
+        "created_desc": f"matched_count DESC, {created} DESC, {path} ASC",
+        "created_asc": f"matched_count DESC, {created} ASC, {path} ASC",
+        "modified_desc": f"matched_count DESC, {modified} DESC, {path} ASC",
+        "modified_asc": f"matched_count DESC, {modified} ASC, {path} ASC",
+        "name_asc": f"matched_count DESC, {path} ASC",
+        "name_desc": f"matched_count DESC, {path} DESC",
+    }
+    return sort_orders.get(sort_by, sort_orders["created_desc"])
 
 
 def _query_crop_hashes(image_path: Path, config: ScanConfig) -> dict[str, bytes]:
