@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     scan_parser.add_argument("--no-prompt-index", action="store_true")
     scan_parser.add_argument("--stealth-prompt", action="store_true")
     scan_parser.add_argument("--reindex-prompts", action="store_true")
+    scan_parser.add_argument("--delete-missing", action="store_true")
 
     query_parser = subparsers.add_parser("query", help="Find visually similar images.")
     query_parser.add_argument("image", type=Path)
@@ -97,12 +98,13 @@ def main(argv: list[str] | None = None) -> int:
             prompt_index=not args.no_prompt_index,
             stealth_prompt=args.stealth_prompt,
             reindex_prompts=args.reindex_prompts,
+            delete_missing=args.delete_missing,
         )
         stats = scan_roots(conn, args.roots, config=scan_config)
         print(
             "scan complete: "
             f"seen={stats.seen} queued={stats.queued} indexed={stats.indexed} "
-            f"skipped={stats.skipped} failed={stats.failed}"
+            f"moved={stats.moved} deleted={stats.deleted} skipped={stats.skipped} failed={stats.failed}"
         )
         return 0
 

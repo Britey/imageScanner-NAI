@@ -4,6 +4,9 @@ import sqlite3
 from pathlib import Path
 
 
+DELETE_BATCH_SIZE = 400
+
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
@@ -215,6 +218,122 @@ def update_image_dates(
         """,
         (created_ns, modified_ns, image_id),
     )
+
+
+def update_image_record(
+    conn: sqlite3.Connection,
+    image_id: int,
+    *,
+    path: Path,
+    size_bytes: int,
+    mtime_ns: int,
+    created_ns: int | None = None,
+    modified_ns: int | None = None,
+    indexed_at: str,
+    width: int | None = None,
+    height: int | None = None,
+    image_format: str | None = None,
+    sha256: bytes | None = None,
+    decode_error: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE images
+        SET path = ?,
+            size_bytes = ?,
+            mtime_ns = ?,
+            created_ns = ?,
+            modified_ns = ?,
+            width = ?,
+            height = ?,
+            format = ?,
+            sha256 = ?,
+            indexed_at = ?,
+            missing_at = NULL,
+            decode_error = ?
+        WHERE id = ?
+        """,
+        (
+            str(path),
+            size_bytes,
+            mtime_ns,
+            created_ns,
+            modified_ns,
+            width,
+            height,
+            image_format,
+            sha256,
+            indexed_at,
+            decode_error,
+            image_id,
+        ),
+    )
+
+
+def update_image_path(
+    conn: sqlite3.Connection,
+    image_id: int,
+    *,
+    path: Path,
+    size_bytes: int,
+    mtime_ns: int,
+    created_ns: int | None = None,
+    modified_ns: int | None = None,
+    indexed_at: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE images
+        SET path = ?,
+            size_bytes = ?,
+            mtime_ns = ?,
+            created_ns = ?,
+            modified_ns = ?,
+            indexed_at = ?,
+            missing_at = NULL
+        WHERE id = ?
+        """,
+        (str(path), size_bytes, mtime_ns, created_ns, modified_ns, indexed_at, image_id),
+    )
+
+
+def delete_images(conn: sqlite3.Connection, image_ids: list[int]) -> int:
+    unique_ids = list(dict.fromkeys(image_ids))
+    if not unique_ids:
+        return 0
+
+    affected_cluster_ids: set[int] = set()
+    for batch in _batches(unique_ids):
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT DISTINCT cluster_id FROM clusters WHERE image_id IN ({placeholders})",
+            batch,
+        ).fetchall()
+        affected_cluster_ids.update(int(row["cluster_id"]) for row in rows)
+
+    for batch in _batches(unique_ids):
+        placeholders = ", ".join("?" for _ in batch)
+        conn.execute(
+            f"DELETE FROM matches WHERE image_id_a IN ({placeholders}) OR image_id_b IN ({placeholders})",
+            (*batch, *batch),
+        )
+
+    # Cluster membership is derived from the complete match graph. Removing even
+    # one member can split a cluster or remove its representative, so invalidate
+    # every affected cluster rather than leaving stale membership behind.
+    for batch in _batches(sorted(affected_cluster_ids)):
+        placeholders = ", ".join("?" for _ in batch)
+        conn.execute(f"DELETE FROM clusters WHERE cluster_id IN ({placeholders})", batch)
+
+    for batch in _batches(unique_ids):
+        placeholders = ", ".join("?" for _ in batch)
+        conn.execute(f"DELETE FROM images WHERE id IN ({placeholders})", batch)
+    return len(unique_ids)
+
+
+def _batches(values: list[int], size: int = DELETE_BATCH_SIZE):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
 
 
 def replace_hashes(

@@ -7,6 +7,8 @@ Local image and NovelAI prompt-tag search for large personal image collections.
 `imgdupe` indexes image files with perceptual hashes, then lets you search by uploading or selecting an example image. It can also extract NovelAI prompts into searchable tags while keeping the original prompt text in SQLite.
 
 It does **not** delete files. It stores paths, metadata, and hashes in SQLite.
+If you enable missing-record cleanup, only SQLite records are removed; image
+files on disk are never deleted.
 
 ## Features
 
@@ -18,6 +20,7 @@ It does **not** delete files. It stores paths, metadata, and hashes in SQLite.
 - NovelAI prompt tag indexing and search
 - Prompt-tag autocomplete ranked by database frequency
 - Unique-prompt filtering for prompt search results
+- Moved-file detection by SHA-256 before optional missing-record cleanup
 - Show-in-folder buttons for local result files
 - Search controls for strict/balanced/loose matching
 - Optional tryhard crop search
@@ -107,6 +110,24 @@ On existing databases created before date sorting was added, the same scan
 backfills file creation and modification timestamps for unchanged files without
 rebuilding image hashes or prompt metadata.
 
+If files have been moved or a folder was renamed, scanning the new location can
+claim the old database row before creating a duplicate. When a new path is not
+already in the database, `imgdupe` checks missing old paths for a unique
+`SHA-256 + file size` match. A match keeps the original image id, hashes,
+prompts, matches, and clusters, then updates only the stored path and file
+metadata.
+
+To remove database rows for files that still do not exist after move detection,
+use:
+
+```powershell
+imgdupe scan "E:\Images" --db images.sqlite --workers 16 --delete-missing
+```
+
+`--delete-missing` deletes only SQLite records and their related match/cluster
+rows. It does not delete image files from disk. Use it only when all indexed
+drives and folders are connected.
+
 You can index multiple roots into the same database:
 
 ```powershell
@@ -130,6 +151,7 @@ The web UI supports:
 - prompt result sorting by matching-tag count first, then creation date, modified date, or name
 - prompt-tag autocomplete with up/down/enter keyboard selection
 - optional unique-prompt results, so duplicate prompts show only one image
+- optional deletion of database records for files missing after moved-file detection
 - show-in-folder buttons that open Explorer and select the image
 
 Tryhard mode can run on a normal index by splitting the query image into many temporary crop and tile variants. It works best with the optional crop index described below.

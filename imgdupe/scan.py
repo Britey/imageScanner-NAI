@@ -11,12 +11,15 @@ from .bands import insert_bands
 from .config import ScanConfig
 from .db import (
     clear_hashes,
+    delete_images,
     get_existing_image,
     has_prompt_status,
     replace_crop_hashes,
     replace_hashes,
     replace_prompt,
     update_image_dates,
+    update_image_path,
+    update_image_record,
     upsert_image,
 )
 from .hashing import compute_image_hashes, sha256_file
@@ -31,6 +34,8 @@ class ScanStats:
     indexed: int = 0
     skipped: int = 0
     failed: int = 0
+    moved: int = 0
+    deleted: int = 0
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,7 @@ class ScanTask:
     prompt_only: bool
     date_only: bool
     existing_image_id: int | None
+    moved: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,7 @@ class ScanResult:
     prompt_only: bool
     date_only: bool
     existing_image_id: int | None
+    moved: bool
     prompt: str | None
     prompt_source: str | None
     prompt_error: str | None
@@ -79,6 +86,7 @@ def scan_roots(
     stats = ScanStats()
     paths = list(iter_image_paths(roots))
     tasks: list[ScanTask] = []
+    moved_candidates = _missing_hash_candidates(conn)
 
     for path in tqdm(paths, desc="Checking images", unit="image"):
         stats.seen += 1
@@ -91,6 +99,15 @@ def scan_roots(
         modified_ns = stat.st_mtime_ns
 
         existing = get_existing_image(conn, path)
+        moved_id = None
+        if existing is None and moved_candidates:
+            try:
+                moved_id = _claim_moved_image(path, stat.st_size, moved_candidates)
+            except OSError:
+                stats.failed += 1
+                continue
+            if moved_id is not None:
+                existing = conn.execute("SELECT * FROM images WHERE id = ?", (moved_id,)).fetchone()
         existing_id = int(existing["id"]) if existing is not None else None
         needs_prompt = (
             config.prompt_index
@@ -99,8 +116,8 @@ def scan_roots(
         )
         unchanged_hashes = (
             existing is not None
-            and int(existing["size_bytes"]) == stat.st_size
-            and int(existing["mtime_ns"]) == stat.st_mtime_ns
+            and (moved_id is not None or int(existing["size_bytes"]) == stat.st_size)
+            and (moved_id is not None or int(existing["mtime_ns"]) == stat.st_mtime_ns)
             and existing["decode_error"] is None
             and existing["missing_at"] is None
             and (not config.crop_index or _has_crop_hashes(conn, int(existing["id"])))
@@ -115,7 +132,7 @@ def scan_roots(
                 or _optional_int(existing["modified_ns"]) != modified_ns
             )
         )
-        if unchanged_hashes and not needs_prompt and not needs_date_update:
+        if unchanged_hashes and moved_id is None and not needs_prompt and not needs_date_update:
             stats.skipped += 1
             continue
 
@@ -128,13 +145,16 @@ def scan_roots(
                 modified_ns=modified_ns,
                 had_existing_hashes=existing is not None,
                 prompt_only=unchanged_hashes and needs_prompt,
-                date_only=unchanged_hashes and needs_date_update and not needs_prompt,
+                date_only=unchanged_hashes and (needs_date_update or moved_id is not None) and not needs_prompt,
                 existing_image_id=existing_id,
+                moved=moved_id is not None,
             )
         )
         stats.queued += 1
 
     if not tasks:
+        if config.delete_missing:
+            stats.deleted = _delete_missing_images(conn)
         conn.commit()
         return stats
 
@@ -171,6 +191,9 @@ def scan_roots(
                 _store_result(conn, future.result(), config, stats)
 
     conn.commit()
+    if config.delete_missing:
+        stats.deleted = _delete_missing_images(conn)
+        conn.commit()
     return stats
 
 
@@ -185,12 +208,25 @@ def _store_result(
         if result.existing_image_id is None:
             stats.failed += 1
             return
-        update_image_dates(
-            conn,
-            result.existing_image_id,
-            created_ns=result.created_ns,
-            modified_ns=result.modified_ns,
-        )
+        if result.moved:
+            update_image_path(
+                conn,
+                result.existing_image_id,
+                path=result.path,
+                size_bytes=result.size_bytes,
+                mtime_ns=result.mtime_ns,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+                indexed_at=indexed_at,
+            )
+            stats.moved += 1
+        else:
+            update_image_dates(
+                conn,
+                result.existing_image_id,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+            )
         stats.indexed += 1
         return
 
@@ -198,31 +234,63 @@ def _store_result(
         if result.existing_image_id is None:
             stats.failed += 1
             return
-        update_image_dates(
-            conn,
-            result.existing_image_id,
-            created_ns=result.created_ns,
-            modified_ns=result.modified_ns,
-        )
+        if result.moved:
+            update_image_path(
+                conn,
+                result.existing_image_id,
+                path=result.path,
+                size_bytes=result.size_bytes,
+                mtime_ns=result.mtime_ns,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+                indexed_at=indexed_at,
+            )
+            stats.moved += 1
+        else:
+            update_image_dates(
+                conn,
+                result.existing_image_id,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+            )
         _store_prompt(conn, result.existing_image_id, result, indexed_at)
         stats.indexed += 1
         return
 
     if result.decode_error is None:
-        image_id = upsert_image(
-            conn,
-            path=result.path,
-            size_bytes=result.size_bytes,
-            mtime_ns=result.mtime_ns,
-            created_ns=result.created_ns,
-            modified_ns=result.modified_ns,
-            indexed_at=indexed_at,
-            width=result.width,
-            height=result.height,
-            image_format=result.image_format,
-            sha256=result.sha256,
-            decode_error=None,
-        )
+        if result.moved and result.existing_image_id is not None:
+            image_id = result.existing_image_id
+            update_image_record(
+                conn,
+                image_id,
+                path=result.path,
+                size_bytes=result.size_bytes,
+                mtime_ns=result.mtime_ns,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+                indexed_at=indexed_at,
+                width=result.width,
+                height=result.height,
+                image_format=result.image_format,
+                sha256=result.sha256,
+                decode_error=None,
+            )
+            stats.moved += 1
+        else:
+            image_id = upsert_image(
+                conn,
+                path=result.path,
+                size_bytes=result.size_bytes,
+                mtime_ns=result.mtime_ns,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+                indexed_at=indexed_at,
+                width=result.width,
+                height=result.height,
+                image_format=result.image_format,
+                sha256=result.sha256,
+                decode_error=None,
+            )
         replace_hashes(
             conn,
             image_id,
@@ -246,17 +314,33 @@ def _store_result(
             _store_prompt(conn, image_id, result, indexed_at)
         stats.indexed += 1
     else:
-        image_id = upsert_image(
-            conn,
-            path=result.path,
-            size_bytes=result.size_bytes,
-            mtime_ns=result.mtime_ns,
-            created_ns=result.created_ns,
-            modified_ns=result.modified_ns,
-            indexed_at=indexed_at,
-            sha256=result.sha256,
-            decode_error=result.decode_error,
-        )
+        if result.moved and result.existing_image_id is not None:
+            image_id = result.existing_image_id
+            update_image_record(
+                conn,
+                image_id,
+                path=result.path,
+                size_bytes=result.size_bytes,
+                mtime_ns=result.mtime_ns,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+                indexed_at=indexed_at,
+                sha256=result.sha256,
+                decode_error=result.decode_error,
+            )
+            stats.moved += 1
+        else:
+            image_id = upsert_image(
+                conn,
+                path=result.path,
+                size_bytes=result.size_bytes,
+                mtime_ns=result.mtime_ns,
+                created_ns=result.created_ns,
+                modified_ns=result.modified_ns,
+                indexed_at=indexed_at,
+                sha256=result.sha256,
+                decode_error=result.decode_error,
+            )
         if result.had_existing_hashes:
             clear_hashes(conn, image_id)
         stats.failed += 1
@@ -290,6 +374,7 @@ def _hash_task(
             prompt_only=False,
             date_only=True,
             existing_image_id=task.existing_image_id,
+            moved=task.moved,
             prompt=None,
             prompt_source=None,
             prompt_error=None,
@@ -317,6 +402,7 @@ def _hash_task(
             prompt_only=True,
             date_only=False,
             existing_image_id=task.existing_image_id,
+            moved=task.moved,
             prompt=prompt,
             prompt_source=prompt_source,
             prompt_error=prompt_error,
@@ -350,6 +436,7 @@ def _hash_task(
             prompt_only=False,
             date_only=False,
             existing_image_id=task.existing_image_id,
+            moved=task.moved,
             prompt=prompt,
             prompt_source=prompt_source,
             prompt_error=prompt_error,
@@ -376,6 +463,7 @@ def _hash_task(
             prompt_only=False,
             date_only=False,
             existing_image_id=task.existing_image_id,
+            moved=task.moved,
             prompt=prompt,
             prompt_source=prompt_source,
             prompt_error=prompt_error,
@@ -399,6 +487,48 @@ def _created_ns_from_stat(stat) -> int | None:
 
 def _optional_int(value) -> int | None:
     return int(value) if value is not None else None
+
+
+def _missing_hash_candidates(conn: sqlite3.Connection) -> dict[int, dict[bytes, list[int]]]:
+    rows = conn.execute(
+        """
+        SELECT id, path, size_bytes, sha256
+        FROM images
+        WHERE sha256 IS NOT NULL
+        """
+    ).fetchall()
+    candidates: dict[int, dict[bytes, list[int]]] = {}
+    for row in rows:
+        if Path(row["path"]).exists():
+            continue
+        hashes_by_size = candidates.setdefault(int(row["size_bytes"]), {})
+        hashes_by_size.setdefault(row["sha256"], []).append(int(row["id"]))
+    return candidates
+
+
+def _claim_moved_image(
+    path: Path,
+    size_bytes: int,
+    candidates: dict[int, dict[bytes, list[int]]],
+) -> int | None:
+    hashes_by_size = candidates.get(size_bytes)
+    if not hashes_by_size:
+        return None
+    sha256 = sha256_file(path)
+    image_ids = hashes_by_size.get(sha256, [])
+    if len(image_ids) != 1:
+        return None
+    image_id = image_ids[0]
+    del hashes_by_size[sha256]
+    if not hashes_by_size:
+        del candidates[size_bytes]
+    return image_id
+
+
+def _delete_missing_images(conn: sqlite3.Connection) -> int:
+    rows = conn.execute("SELECT id, path FROM images").fetchall()
+    image_ids = [int(row["id"]) for row in rows if not Path(row["path"]).exists()]
+    return delete_images(conn, image_ids)
 
 
 def _has_crop_hashes(conn: sqlite3.Connection, image_id: int) -> bool:

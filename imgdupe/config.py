@@ -12,6 +12,7 @@ class ScanConfig:
     prompt_index: bool = True
     stealth_prompt: bool = False
     reindex_prompts: bool = False
+    delete_missing: bool = False
     whole_band_size: int = 2
     grid_band_size: int = 2
 

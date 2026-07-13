@@ -58,6 +58,7 @@ class ScanRequest:
     prompt_index: bool
     stealth_prompt: bool
     reindex_prompts: bool
+    delete_missing: bool
     lang: str
 
 
@@ -69,6 +70,10 @@ class WebScanStatus:
     finished_at: str | None = None
     stats: ScanStats | None = None
     error: str | None = None
+
+
+PROMPT_SEARCH_DEFAULT_LIMIT = 500
+PROMPT_SEARCH_MAX_LIMIT = 1000
 
 
 TRANSLATIONS = {
@@ -148,13 +153,14 @@ TRANSLATIONS = {
         "scan_placeholder": "E:\\Images\nF:\\Downloads",
         "scan_idle": "Index updates only run after you confirm them here. Starting the web UI does not scan folders automatically.",
         "scan_running": "Index update running since {started_at}. This page will refresh automatically.",
-        "scan_complete": "Last update finished at {finished_at}: seen {seen}, queued {queued}, indexed {indexed}, skipped {skipped}, failed {failed}.",
+        "scan_complete": "Last update finished at {finished_at}: seen {seen}, queued {queued}, indexed {indexed}, moved {moved}, deleted {deleted}, skipped {skipped}, failed {failed}.",
         "scan_failed": "Last update failed at {finished_at}: {error}",
         "workers": "Workers",
         "index_prompt_tags": "Index prompt tags",
         "build_crop_index": "Build crop index",
         "reindex_prompts": "Reindex prompts",
         "read_stealth_prompts": "Read stealth prompts",
+        "delete_missing": "Delete records for missing files",
         "confirm_update_index": "Confirm update index",
     },
     "zh": {
@@ -233,13 +239,14 @@ TRANSLATIONS = {
         "scan_placeholder": "E:\\图片\nF:\\下载",
         "scan_idle": "索引更新只会在你手动确认后运行。启动网页界面不会自动扫描文件夹。",
         "scan_running": "正在更新索引，开始时间：{started_at}。页面会自动刷新。",
-        "scan_complete": "上次更新完成于 {finished_at}：发现 {seen}，待处理 {queued}，已索引 {indexed}，已跳过 {skipped}，失败 {failed}。",
+        "scan_complete": "上次更新完成于 {finished_at}：发现 {seen}，待处理 {queued}，已索引 {indexed}，已移动 {moved}，已删除 {deleted}，已跳过 {skipped}，失败 {failed}。",
         "scan_failed": "上次更新失败于 {finished_at}：{error}",
         "workers": "并行数",
         "index_prompt_tags": "索引提示词标签",
         "build_crop_index": "建立裁剪索引",
         "reindex_prompts": "重新索引提示词",
         "read_stealth_prompts": "读取隐写提示词",
+        "delete_missing": "删除已不存在的记录",
         "confirm_update_index": "确认更新索引",
     },
 }
@@ -340,6 +347,7 @@ def _run_scan_job(state: WebState, request: ScanRequest) -> None:
                     prompt_index=request.prompt_index,
                     stealth_prompt=request.stealth_prompt,
                     reindex_prompts=request.reindex_prompts,
+                    delete_missing=request.delete_missing,
                 ),
             )
         finally:
@@ -464,6 +472,7 @@ def _make_handler(state: WebState):
                 prompt_index=fields.get("prompt_index") == "1",
                 stealth_prompt=fields.get("stealth_prompt") == "1",
                 reindex_prompts=fields.get("reindex_prompts") == "1",
+                delete_missing=fields.get("delete_missing") == "1",
                 lang=_normalize_lang(fields.get("lang")),
             )
 
@@ -486,7 +495,7 @@ def _make_handler(state: WebState):
                 negative_tags=negative_tags,
                 match_mode=fields.get("match_mode") if fields.get("match_mode") in {"all", "any"} else "all",
                 sort_by=_normalize_prompt_sort(fields.get("sort_by")),
-                limit=max(1, min(_int_field(fields, "limit", state.limit), 500)),
+                limit=max(1, min(_int_field(fields, "limit", PROMPT_SEARCH_DEFAULT_LIMIT), PROMPT_SEARCH_MAX_LIMIT)),
                 offset=max(0, _int_field(fields, "offset", 0)),
                 lang=_normalize_lang(fields.get("lang")),
                 unique_prompts=fields.get("unique_prompts") == "1",
@@ -625,6 +634,8 @@ def _scan_panel(state: WebState, lang: str) -> str:
               seen=stats.seen,
               queued=stats.queued,
               indexed=stats.indexed,
+              moved=stats.moved,
+              deleted=stats.deleted,
               skipped=stats.skipped,
               failed=stats.failed,
           )}
@@ -674,6 +685,10 @@ def _scan_panel(state: WebState, lang: str) -> str:
           <label class="checkbox">
             <input type="checkbox" name="stealth_prompt" value="1" {disabled}>
             {text["read_stealth_prompts"]}
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="delete_missing" value="1" {disabled}>
+            {text["delete_missing"]}
           </label>
         </div>
         <button type="submit" {disabled}>{text["confirm_update_index"]}</button>
@@ -768,7 +783,7 @@ def _index_page(state: WebState, lang: str) -> str:
           {text['autocomplete']}
         </label>
         <label class="autocomplete-toggle">
-          <input name="unique_prompts" type="checkbox" value="1">
+          <input name="unique_prompts" type="checkbox" value="1" checked>
           {text['unique_prompts']}
         </label>
         <div class="controls prompt-controls">
@@ -793,7 +808,7 @@ def _index_page(state: WebState, lang: str) -> str:
           </label>
           <label>
             {text['max_results']}
-            <input type="number" name="limit" min="1" max="500" step="1" value="{state.limit}">
+            <input type="number" name="limit" min="1" max="{PROMPT_SEARCH_MAX_LIMIT}" step="1" value="{PROMPT_SEARCH_DEFAULT_LIMIT}">
           </label>
           <label>
             Offset
