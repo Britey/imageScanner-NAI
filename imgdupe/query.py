@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .bands import CROP_HASH_TYPES, Candidate, find_candidates
 from .config import ScanConfig
-from .db import fetch_crop_hashes, fetch_hash_row, hash_row_to_dict
+from .db import fetch_crop_hashes, fetch_hash_row, hash_row_to_dict, is_crop_index_ready
 from .hashing import compute_image_hashes
 from .hashing import load_normalized, tryhard_query_hashes
 from .match import PairScore, score_hashes
@@ -34,6 +34,7 @@ def query_image(
     tryhard: bool = False,
 ) -> list[tuple[sqlite3.Row, Candidate, PairScore]]:
     config = config or ScanConfig()
+    crop_index_ready = is_crop_index_ready(conn)
     hashes, _ = compute_image_hashes(
         image_path,
         min_width=config.min_width,
@@ -46,8 +47,9 @@ def query_image(
     ).fetchone()
     lookup_hashes = dict(hashes)
     query_crop_hashes = _query_crop_hashes(image_path, config) if tryhard else {}
-    lookup_hashes.update(query_crop_hashes)
-    if tryhard and hashes.get("phash256"):
+    if crop_index_ready:
+        lookup_hashes.update(query_crop_hashes)
+    if tryhard and crop_index_ready and hashes.get("phash256"):
         for crop_hash_type in CROP_HASH_TYPES:
             lookup_hashes[crop_hash_type] = hashes["phash256"]
     if tryhard:
@@ -73,7 +75,9 @@ def query_image(
         if image_row is None:
             continue
         candidate_hashes = hash_row_to_dict(hash_row)
-        candidate_crop_hashes = fetch_crop_hashes(conn, candidate.image_id)
+        candidate_crop_hashes = (
+            fetch_crop_hashes(conn, candidate.image_id) if crop_index_ready else {}
+        )
         sha_equal = hashes.get("sha256") == image_row["sha256"]
         if sha_equal and not include_exact:
             continue
@@ -245,12 +249,12 @@ def _prompt_sort_order(sort_by: str, *, table_alias: str) -> str:
     modified = f"COALESCE({prefix}modified_ns, {prefix}mtime_ns)"
     path = f"LOWER({prefix}path)"
     sort_orders = {
-        "created_desc": f"matched_count DESC, {created} DESC, {path} ASC",
-        "created_asc": f"matched_count DESC, {created} ASC, {path} ASC",
-        "modified_desc": f"matched_count DESC, {modified} DESC, {path} ASC",
-        "modified_asc": f"matched_count DESC, {modified} ASC, {path} ASC",
-        "name_asc": f"matched_count DESC, {path} ASC",
-        "name_desc": f"matched_count DESC, {path} DESC",
+        "created_desc": f"matched_count DESC, {created} DESC, {path} ASC, {prefix}id ASC",
+        "created_asc": f"matched_count DESC, {created} ASC, {path} ASC, {prefix}id ASC",
+        "modified_desc": f"matched_count DESC, {modified} DESC, {path} ASC, {prefix}id ASC",
+        "modified_asc": f"matched_count DESC, {modified} ASC, {path} ASC, {prefix}id ASC",
+        "name_asc": f"matched_count DESC, {path} ASC, {prefix}id ASC",
+        "name_desc": f"matched_count DESC, {path} DESC, {prefix}id ASC",
     }
     return sort_orders.get(sort_by, sort_orders["created_desc"])
 

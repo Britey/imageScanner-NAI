@@ -51,6 +51,13 @@ python -m imgdupe.cli --help
 
 这两种方式都需要先安装依赖。直接在刚克隆下来的仓库里运行 `python -m imgdupe.cli`，但没有创建并安装虚拟环境，是无法工作的。
 
+在 Windows 上，`run.bat` 只会在首次运行时安装环境，后续会直接启动。依赖发生
+变化后可运行 `run.bat setup`。网页界面的设置保存在项目根目录的 `settings.ini`，
+其中包括缩略图缓存数量，以及是否显示高级裁剪功能。
+
+网页界面一次只允许启动一个实例，即使另一个副本位于不同文件夹。重复启动时会显示
+提示，并在打开数据库前退出。
+
 ## 基本用法
 
 递归索引一个文件夹：
@@ -87,7 +94,7 @@ imgdupe scan "E:\Images" --db images.sqlite --workers 16 --stealth-prompt
 然后启动网页界面：
 
 ```powershell
-imgdupe serve --db images.sqlite
+imgdupe serve --db images.sqlite --open-browser
 ```
 
 打开：

@@ -5,11 +5,12 @@ from pathlib import Path
 
 from .cluster import build_clusters
 from .config import ScanConfig
-from .db import connect, init_db
+from .db import checkpoint_database, connect, init_db
 from .failures import iter_failures
 from .query import query_image, query_prompt_tags, write_query_html
 from .review import generate_review
 from .scan import scan_roots
+from .single_instance import SingleInstanceLock, notify_already_running
 from .web import serve
 
 
@@ -79,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument("--limit", type=int, default=100)
     serve_parser.add_argument("--min-score", type=float, default=55.0)
     serve_parser.add_argument("--thumbnail-size", type=int, default=256)
+    serve_parser.add_argument("--open-browser", action="store_true")
 
     failures_parser = subparsers.add_parser("failures", help="Show image indexing failures.")
     failures_parser.add_argument("--db", type=Path, required=True)
@@ -86,8 +88,26 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    conn = connect(args.db)
-    init_db(conn)
+    instance_lock = SingleInstanceLock() if args.command == "serve" else None
+    if instance_lock is not None and not instance_lock.acquire():
+        notify_already_running()
+        return 1
+    try:
+        conn = connect(args.db)
+        try:
+            init_db(conn)
+            return _run_command(args, parser, conn)
+        finally:
+            checkpoint = checkpoint_database(conn, "TRUNCATE")
+            if checkpoint and checkpoint[0]:
+                print(f"WAL checkpoint remained busy: {checkpoint}")
+            conn.close()
+    finally:
+        if instance_lock is not None:
+            instance_lock.release()
+
+
+def _run_command(args, parser: argparse.ArgumentParser, conn) -> int:
 
     if args.command == "scan":
         default_scan_config = ScanConfig()
@@ -186,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             min_score=args.min_score,
             thumbnail_size=args.thumbnail_size,
+            open_browser=args.open_browser,
         )
         return 0
 

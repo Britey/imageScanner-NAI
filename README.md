@@ -54,6 +54,14 @@ python -m imgdupe.cli --help
 
 Both forms require the package dependencies to be installed. Running `python -m imgdupe.cli` from a fresh clone without creating/installing the environment will not work.
 
+On Windows, `run.bat` performs setup once and then starts directly from the existing
+environment on later launches. Run `run.bat setup` after dependency changes. Web UI
+settings are stored in the root-level `settings.ini`, including the thumbnail cache
+limit and whether advanced crop controls are shown.
+
+Only one web UI instance can run at a time, including copies launched from another
+folder. A second launch shows a warning and exits before opening the database.
+
 ## Basic Usage
 
 Index a folder recursively:
@@ -91,7 +99,7 @@ Useful prompt-indexing scan options:
 Then start the web UI:
 
 ```powershell
-imgdupe serve --db images.sqlite
+imgdupe serve --db images.sqlite --open-browser
 ```
 
 Open:

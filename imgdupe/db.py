@@ -5,6 +5,9 @@ from pathlib import Path
 
 
 DELETE_BATCH_SIZE = 400
+CROP_INDEX_STATE_KEY = "crop_index_state"
+CROP_INDEX_VERSION_KEY = "crop_index_version"
+CROP_INDEX_VERSION = "1"
 
 
 SCHEMA = """
@@ -94,6 +97,11 @@ CREATE TABLE IF NOT EXISTS prompt_tags (
     PRIMARY KEY (image_id, tag_norm)
 );
 
+CREATE TABLE IF NOT EXISTS app_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
 CREATE INDEX IF NOT EXISTS idx_images_path ON images(path);
 CREATE INDEX IF NOT EXISTS idx_hash_bands_image_id ON hash_bands(image_id);
@@ -139,6 +147,76 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_typ
     }
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def get_metadata(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM app_metadata WHERE key = ?", (key,)).fetchone()
+    return str(row["value"] if isinstance(row, sqlite3.Row) else row[0]) if row else default
+
+
+def set_metadata(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO app_metadata (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def get_crop_index_state(conn: sqlite3.Connection) -> str:
+    return get_metadata(conn, CROP_INDEX_STATE_KEY, "disabled") or "disabled"
+
+
+def set_crop_index_state(conn: sqlite3.Connection, state: str) -> None:
+    if state not in {"disabled", "building", "incomplete", "ready"}:
+        raise ValueError(f"invalid crop index state: {state}")
+    set_metadata(conn, CROP_INDEX_STATE_KEY, state)
+    set_metadata(conn, CROP_INDEX_VERSION_KEY, CROP_INDEX_VERSION)
+
+
+def is_crop_index_ready(conn: sqlite3.Connection) -> bool:
+    return (
+        get_crop_index_state(conn) == "ready"
+        and get_metadata(conn, CROP_INDEX_VERSION_KEY) == CROP_INDEX_VERSION
+    )
+
+
+def crop_index_is_complete(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM hashes h
+            JOIN images i ON i.id = h.image_id
+            WHERE i.missing_at IS NULL
+              AND i.decode_error IS NULL
+              AND i.width >= 64
+              AND i.height >= 64
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM crop_hashes ch
+                  WHERE ch.image_id = h.image_id
+                    AND ch.region = 'center_50'
+              )
+        )
+        """
+    ).fetchone()
+    return bool(row[0])
+
+
+def checkpoint_database(conn: sqlite3.Connection, mode: str = "PASSIVE") -> tuple[int, int, int] | None:
+    normalized = mode.upper()
+    if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+        raise ValueError(f"invalid WAL checkpoint mode: {mode}")
+    try:
+        row = conn.execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return int(row[0]), int(row[1]), int(row[2])
 
 
 def get_existing_image(conn: sqlite3.Connection, path: Path) -> sqlite3.Row | None:

@@ -11,12 +11,15 @@ from .bands import insert_bands
 from .config import ScanConfig
 from .db import (
     clear_hashes,
+    crop_index_is_complete,
     delete_images,
+    get_crop_index_state,
     get_existing_image,
     has_prompt_status,
     replace_crop_hashes,
     replace_hashes,
     replace_prompt,
+    set_crop_index_state,
     update_image_dates,
     update_image_path,
     update_image_record,
@@ -82,6 +85,9 @@ def scan_roots(
     config: ScanConfig | None = None,
 ) -> ScanStats:
     config = config or ScanConfig()
+    if config.crop_index:
+        set_crop_index_state(conn, "building")
+        conn.commit()
     workers = max(1, config.workers)
     stats = ScanStats()
     paths = list(iter_image_paths(roots))
@@ -155,6 +161,7 @@ def scan_roots(
     if not tasks:
         if config.delete_missing:
             stats.deleted = _delete_missing_images(conn)
+        _finish_crop_index_state(conn, config.crop_index)
         conn.commit()
         return stats
 
@@ -193,8 +200,20 @@ def scan_roots(
     conn.commit()
     if config.delete_missing:
         stats.deleted = _delete_missing_images(conn)
-        conn.commit()
+    _finish_crop_index_state(conn, config.crop_index)
+    conn.commit()
     return stats
+
+
+def _finish_crop_index_state(conn: sqlite3.Connection, crop_index_requested: bool) -> None:
+    if crop_index_requested:
+        set_crop_index_state(conn, "ready" if crop_index_is_complete(conn) else "incomplete")
+        return
+    state = get_crop_index_state(conn)
+    if state == "building":
+        set_crop_index_state(conn, "incomplete")
+    elif state == "ready" and not crop_index_is_complete(conn):
+        set_crop_index_state(conn, "incomplete")
 
 
 def _store_result(
@@ -533,7 +552,22 @@ def _delete_missing_images(conn: sqlite3.Connection) -> int:
 
 def _has_crop_hashes(conn: sqlite3.Connection, image_id: int) -> bool:
     row = conn.execute(
-        "SELECT 1 FROM crop_hashes WHERE image_id = ? AND region = 'center_50' LIMIT 1",
+        """
+        SELECT 1
+        FROM images i
+        WHERE i.id = ?
+          AND (
+              i.width < 64
+              OR i.height < 64
+              OR EXISTS (
+                  SELECT 1
+                  FROM crop_hashes ch
+                  WHERE ch.image_id = i.id
+                    AND ch.region = 'center_50'
+              )
+          )
+        LIMIT 1
+        """,
         (image_id,),
     ).fetchone()
     return row is not None

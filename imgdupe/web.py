@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import webbrowser
 from ctypes import wintypes
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -22,9 +23,10 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from .config import ScanConfig
-from .db import connect, init_db
+from .db import checkpoint_database, connect, init_db, is_crop_index_ready
 from .query import PromptSearchResult, query_image, query_prompt_tags
 from .scan import ScanStats, scan_roots
+from .settings import AppSettings, load_settings
 from .utils import human_size
 
 
@@ -72,10 +74,8 @@ class WebScanStatus:
     error: str | None = None
 
 
-PROMPT_SEARCH_DEFAULT_LIMIT = 500
-PROMPT_SEARCH_MAX_LIMIT = 1000
-
-
+PROMPT_SEARCH_DEFAULT_LIMIT = 100
+PROMPT_SEARCH_MAX_LIMIT = 500
 TRANSLATIONS = {
     "en": {
         "app_title": "Image Search",
@@ -122,8 +122,12 @@ TRANSLATIONS = {
         "crop_index": "Crop index",
         "crop_ready": "ready",
         "crop_missing": "not built",
-        "tryhard_hint": "Requires scanning with --crop-index.",
-        "tryhard_limited": "No crop index found. Tryhard will split the query image into many temporary crop/tile variants and compare them against the normal index.",
+        "advanced_features": "Advanced features",
+        "previous_page": "Previous",
+        "next_page": "Next",
+        "page_number": "Page {page}",
+        "clear_thumbnail_cache": "Clear thumbnail cache",
+        "thumbnail_cache_cleared": "Cleared {count} cached thumbnails.",
         "search": "Search",
         "new_search": "New search",
         "results": "Results",
@@ -208,8 +212,12 @@ TRANSLATIONS = {
         "crop_index": "裁剪索引",
         "crop_ready": "已建立",
         "crop_missing": "未建立",
-        "tryhard_hint": "需要使用 --crop-index 扫描。",
-        "tryhard_limited": "未找到裁剪索引。深度搜索会把查询图片临时切成许多裁剪/分块变体，并与普通索引匹配。",
+        "advanced_features": "高级功能",
+        "previous_page": "上一页",
+        "next_page": "下一页",
+        "page_number": "第 {page} 页",
+        "clear_thumbnail_cache": "清除缩略图缓存",
+        "thumbnail_cache_cleared": "已清除 {count} 张缓存缩略图。",
         "search": "搜索",
         "new_search": "重新搜索",
         "results": "搜索结果",
@@ -261,22 +269,37 @@ def serve(
     limit: int = 100,
     min_score: float = 55.0,
     thumbnail_size: int = 256,
+    open_browser: bool = False,
+    settings: AppSettings | None = None,
 ) -> str:
+    settings = settings or load_settings()
+    work_dir = Path(tempfile.mkdtemp(prefix="imgdupe-web-"))
+    thumbs_dir = db_path.resolve().with_suffix(db_path.suffix + ".thumb-cache")
     state = WebState(
         conn=conn,
         db_path=db_path,
         limit=limit,
         min_score=min_score,
         thumbnail_size=thumbnail_size,
-        work_dir=Path(tempfile.mkdtemp(prefix="imgdupe-web-")),
+        work_dir=work_dir,
+        thumbs_dir=thumbs_dir,
+        thumbnail_cache_limit=settings.thumbnail_cache_limit,
+        disable_advanced_options=settings.disable_advanced_options,
     )
     handler = _make_handler(state)
     server = HTTPServer((host, port), handler)
     url = f"http://{host}:{server.server_port}"
     try:
         print(f"Serving imgdupe web UI at {url}")
+        if open_browser:
+            webbrowser.open(url)
         server.serve_forever()
     finally:
+        server.server_close()
+        state.wait_for_scan()
+        checkpoint = checkpoint_database(state.conn, "TRUNCATE")
+        if checkpoint and checkpoint[0]:
+            print(f"WAL checkpoint remained busy: {checkpoint}")
         shutil.rmtree(state.work_dir, ignore_errors=True)
     return url
 
@@ -291,6 +314,9 @@ class WebState:
         min_score: float,
         thumbnail_size: int,
         work_dir: Path,
+        thumbs_dir: Path,
+        thumbnail_cache_limit: int,
+        disable_advanced_options: bool,
     ) -> None:
         self.conn = conn
         self.db_path = db_path
@@ -299,11 +325,16 @@ class WebState:
         self.thumbnail_size = thumbnail_size
         self.work_dir = work_dir
         self.uploads_dir = work_dir / "uploads"
-        self.thumbs_dir = work_dir / "thumbs"
+        self.thumbs_dir = thumbs_dir
+        self.thumbnail_cache_limit = thumbnail_cache_limit
+        self.disable_advanced_options = disable_advanced_options
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.thumbs_dir.mkdir(parents=True, exist_ok=True)
         self.scan_lock = threading.Lock()
         self.scan_status = WebScanStatus()
+        self.scan_thread: threading.Thread | None = None
+        _prune_thumbnail_cache(self.thumbs_dir, self.thumbnail_cache_limit)
+        self.thumbnail_cache_count = sum(1 for _ in self.thumbs_dir.glob("*.jpg"))
 
     def start_scan(self, request: ScanRequest) -> bool:
         with self.scan_lock:
@@ -318,10 +349,40 @@ class WebState:
             target=_run_scan_job,
             args=(self, request),
             name="imgdupe-web-scan",
-            daemon=True,
+            daemon=False,
         )
+        with self.scan_lock:
+            self.scan_thread = thread
         thread.start()
         return True
+
+    def wait_for_scan(self) -> None:
+        with self.scan_lock:
+            thread = self.scan_thread
+        if thread is not None and thread.is_alive():
+            print("Waiting for the active index update to finish...")
+            thread.join()
+
+    def clear_thumbnail_cache(self) -> int:
+        removed = 0
+        for path in self.thumbs_dir.glob("*.jpg"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+        self.thumbnail_cache_count = sum(1 for _ in self.thumbs_dir.glob("*.jpg"))
+        return removed
+
+    def thumbnail_removed(self) -> None:
+        self.thumbnail_cache_count = max(0, self.thumbnail_cache_count - 1)
+
+    def thumbnail_created(self) -> None:
+        self.thumbnail_cache_count += 1
+        if self.thumbnail_cache_count <= self.thumbnail_cache_limit:
+            return
+        _prune_thumbnail_cache(self.thumbs_dir, self.thumbnail_cache_limit)
+        self.thumbnail_cache_count = sum(1 for _ in self.thumbs_dir.glob("*.jpg"))
 
     def get_scan_status(self) -> WebScanStatus:
         with self.scan_lock:
@@ -383,7 +444,7 @@ def _make_handler(state: WebState):
             parsed = urllib.parse.urlparse(self.path)
             lang = _lang_from_query(parsed.query)
             if parsed.path == "/":
-                self._send_html(_index_page(state, lang))
+                self._send_html(_index_page(state, lang, parsed.query))
                 return
             if parsed.path == "/failures":
                 self._send_html(_failures_page(state, lang))
@@ -401,6 +462,16 @@ def _make_handler(state: WebState):
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/clear-thumbnail-cache":
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8", errors="replace")
+                fields = urllib.parse.parse_qs(body, keep_blank_values=True)
+                lang = _normalize_lang(fields.get("lang", ["zh"])[-1])
+                removed = state.clear_thumbnail_cache()
+                self._redirect(
+                    f"/?lang={urllib.parse.quote(lang)}&thumbnail_cache_cleared={removed}"
+                )
+                return
             if parsed.path == "/scan":
                 try:
                     request = self._save_scan_request()
@@ -417,12 +488,13 @@ def _make_handler(state: WebState):
                         options.tags,
                         negative_text_or_tags=options.negative_tags,
                         match_mode=options.match_mode,
-                        limit=options.limit,
+                        limit=options.limit + 1,
                         offset=options.offset,
                         unique_prompts=options.unique_prompts,
                         sort_by=options.sort_by,
                     )
-                    self._send_html(_prompt_results_page(results, options))
+                    has_next = len(results) > options.limit
+                    self._send_html(_prompt_results_page(results[: options.limit], options, has_next))
                 except Exception as exc:
                     self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
                 return
@@ -559,19 +631,32 @@ def _make_handler(state: WebState):
             except ValueError:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            thumb_path = state.thumbs_dir / f"{image_id}.jpg"
+            row = state.conn.execute(
+                "SELECT path, size_bytes, mtime_ns FROM images WHERE id = ?",
+                (image_id,),
+            ).fetchone()
+            if row is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            thumb_path = state.thumbs_dir / (
+                f"{image_id}-{int(row['mtime_ns'])}-{int(row['size_bytes'])}-{state.thumbnail_size}.jpg"
+            )
             if not thumb_path.exists():
-                row = state.conn.execute(
-                    "SELECT path FROM images WHERE id = ?",
-                    (image_id,),
-                ).fetchone()
-                if row is None or not _write_thumbnail(
-                    Path(row["path"]),
-                    thumb_path,
-                    state.thumbnail_size,
-                ):
+                for stale_path in state.thumbs_dir.glob(f"{image_id}-*.jpg"):
+                    try:
+                        stale_path.unlink()
+                        state.thumbnail_removed()
+                    except OSError:
+                        pass
+                if not _write_thumbnail(Path(row["path"]), thumb_path, state.thumbnail_size):
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
+                state.thumbnail_created()
+            else:
+                try:
+                    os.utime(thumb_path, None)
+                except OSError:
+                    pass
             self._send_file(thumb_path, "image/jpeg")
 
         def _send_html(self, document: str, *, status: HTTPStatus = HTTPStatus.OK) -> None:
@@ -618,6 +703,15 @@ def _scan_panel(state: WebState, lang: str) -> str:
     disabled = "disabled" if status.state == "running" else ""
     status_html = ""
     refresh_script = ""
+    advanced_options = "" if state.disable_advanced_options else f"""
+        <details class="advanced">
+          <summary>{text["advanced_features"]}</summary>
+          <label class="checkbox">
+            <input type="checkbox" name="crop_index" value="1" {disabled}>
+            {text["build_crop_index"]}
+          </label>
+        </details>
+    """
     if status.state == "running":
         status_html = f"""
         <p class="scan-status is-running">
@@ -675,10 +769,6 @@ def _scan_panel(state: WebState, lang: str) -> str:
             {text["index_prompt_tags"]}
           </label>
           <label class="checkbox">
-            <input type="checkbox" name="crop_index" value="1" {disabled}>
-            {text["build_crop_index"]}
-          </label>
-          <label class="checkbox">
             <input type="checkbox" name="reindex_prompts" value="1" {disabled}>
             {text["reindex_prompts"]}
           </label>
@@ -691,6 +781,7 @@ def _scan_panel(state: WebState, lang: str) -> str:
             {text["delete_missing"]}
           </label>
         </div>
+        {advanced_options}
         <button type="submit" {disabled}>{text["confirm_update_index"]}</button>
       </form>
     </section>
@@ -698,9 +789,29 @@ def _scan_panel(state: WebState, lang: str) -> str:
     """
 
 
-def _index_page(state: WebState, lang: str) -> str:
+def _index_page(state: WebState, lang: str, query: str = "") -> str:
     text = _text(lang)
     stats = _stats(state.conn)
+    query_values = urllib.parse.parse_qs(query)
+    cache_notice = ""
+    if "thumbnail_cache_cleared" in query_values:
+        try:
+            removed = max(0, int(query_values["thumbnail_cache_cleared"][-1]))
+        except ValueError:
+            removed = 0
+        cache_notice = (
+            f'<p class="notice">{text["thumbnail_cache_cleared"].format(count=removed)}</p>'
+        )
+    image_advanced_options = "" if state.disable_advanced_options else f"""
+        <details class="advanced">
+          <summary>{text['advanced_features']}</summary>
+          <label class="checkbox">
+            <input type="checkbox" name="tryhard" value="1">
+            {text['tryhard']}
+          </label>
+          <span class="muted">{text['crop_index']}: {text['crop_ready'] if stats['crop_ready'] else text['crop_missing']}</span>
+        </details>
+    """
     body = f"""
     <header class="topbar">
       <div>
@@ -711,15 +822,19 @@ def _index_page(state: WebState, lang: str) -> str:
         <a href="#image-search">{text['image_search']}</a>
         <a href="#prompt-search">{text['prompt_search']}</a>
         <a href="/failures?lang={lang}">{text['failures']}</a>
+        <form method="post" action="/clear-thumbnail-cache" class="inline-form">
+          <input type="hidden" name="lang" value="{html.escape(lang, quote=True)}">
+          <button type="submit" class="link-button">{text['clear_thumbnail_cache']}</button>
+        </form>
       </nav>
     </header>
+    {cache_notice}
     <section class="stats">
       <div><strong>{stats['indexed']}</strong><span>{text['indexed']}</span></div>
       <div><strong>{stats['hashed']}</strong><span>{text['searchable']}</span></div>
       <div><strong>{stats['failed']}</strong><span>{text['failures']}</span></div>
       <div><strong>{stats['groups']}</strong><span>{text['groups']}</span></div>
       <div><strong>{stats['matches']}</strong><span>{text['matches']}</span></div>
-      <div><strong>{text['crop_ready'] if stats['crop_images'] else text['crop_missing']}</strong><span>{text['crop_index']}</span></div>
       <div><strong>{stats['prompts']}</strong><span>{text['prompts']}</span></div>
       <div><strong>{stats['unique_tags']}</strong><span>{text['unique_tags']}</span></div>
     </section>
@@ -758,12 +873,8 @@ def _index_page(state: WebState, lang: str) -> str:
             <input type="checkbox" name="include_exact" value="1" checked>
             {text['include_exact']}
           </label>
-          <label class="checkbox">
-            <input type="checkbox" name="tryhard" value="1">
-            {text['tryhard']}
-          </label>
-          {f"<p class='hint'>{text['tryhard_limited']}</p>" if not stats['crop_images'] else ""}
         </div>
+        {image_advanced_options}
         <button type="submit">{text['search']}</button>
       </form>
       <form id="prompt-search" method="post" action="/prompt-search" class="prompt-form">
@@ -810,10 +921,7 @@ def _index_page(state: WebState, lang: str) -> str:
             {text['max_results']}
             <input type="number" name="limit" min="1" max="{PROMPT_SEARCH_MAX_LIMIT}" step="1" value="{PROMPT_SEARCH_DEFAULT_LIMIT}">
           </label>
-          <label>
-            Offset
-            <input type="number" name="offset" min="0" step="1" value="0">
-          </label>
+          <input type="hidden" name="offset" value="0">
         </div>
         <button type="submit">{text['search']}</button>
       </form>
@@ -839,9 +947,11 @@ def _index_page(state: WebState, lang: str) -> str:
       quality.addEventListener("change", () => {{
         minScore.value = scores[quality.value] || scores.balanced;
       }});
-      tryhard.addEventListener("change", () => {{
-        if (tryhard.checked && Number(minScore.value) > 1) minScore.value = "1";
-      }});
+      if (tryhard) {{
+        tryhard.addEventListener("change", () => {{
+          if (tryhard.checked && Number(minScore.value) > 1) minScore.value = "1";
+        }});
+      }}
       window.addEventListener("paste", event => {{
         const item = [...event.clipboardData.items].find(i => i.type.startsWith("image/"));
         if (!item) return;
@@ -968,7 +1078,7 @@ def _results_page(results, options: SearchOptions) -> str:
             f"""
             <article class="result">
               <a href="{html.escape(Path(image_row['path']).as_uri())}">
-                <img src="/thumb/{int(image_row['id'])}.jpg" alt="">
+                <img src="/thumb/{int(image_row['id'])}.jpg?v={int(image_row['mtime_ns'])}-{int(image_row['size_bytes'])}" alt="" loading="lazy">
               </a>
               <div class="score">{score.score:.2f}</div>
               <div>{html.escape(_label(score.decision, options.lang))}</div>
@@ -1002,6 +1112,7 @@ def _results_page(results, options: SearchOptions) -> str:
 def _prompt_results_page(
     results: list[PromptSearchResult],
     options: PromptSearchOptions,
+    has_next: bool,
 ) -> str:
     text = _text(options.lang)
     cards = []
@@ -1021,7 +1132,7 @@ def _prompt_results_page(
             f"""
             <article class="result">
               <a href="{html.escape(Path(image_row['path']).as_uri())}">
-                <img src="/thumb/{int(image_row['id'])}.jpg" alt="">
+                <img src="/thumb/{int(image_row['id'])}.jpg?v={int(image_row['mtime_ns'])}-{int(image_row['size_bytes'])}" alt="" loading="lazy">
               </a>
               <div class="score">{result.matched_count}</div>
               <div>{html.escape(', '.join(result.matched_tags))}</div>
@@ -1049,6 +1160,7 @@ def _prompt_results_page(
     if options.negative_tags:
         query_lines.append(text["excluding_tags"].format(tags=html.escape(options.negative_tags)))
     query_summary = "<br>".join(query_lines)
+    pager = _prompt_pager(options, has_next)
     body = f"""
     <nav><a href="/?lang={options.lang}">{text['new_search']}</a></nav>
     <header>
@@ -1056,8 +1168,10 @@ def _prompt_results_page(
       <p>{summary}</p>
       <p class="muted">{query_summary}</p>
     </header>
+    {pager}
     <section class="grid">{''.join(cards)}</section>
     {empty}
+    {pager}
     <script>
       const expandLabel = {json.dumps(text['expand_prompt'])};
       const collapseLabel = {json.dumps(text['collapse_prompt'])};
@@ -1073,6 +1187,53 @@ def _prompt_results_page(
     </script>
     """
     return _page(text["prompt_results"], body, lang=options.lang)
+
+
+def _prompt_pager(options: PromptSearchOptions, has_next: bool) -> str:
+    text = _text(options.lang)
+    previous = (
+        _prompt_page_form(
+            options,
+            max(0, options.offset - options.limit),
+            text["previous_page"],
+        )
+        if options.offset > 0
+        else ""
+    )
+    following = (
+        _prompt_page_form(
+            options,
+            options.offset + options.limit,
+            text["next_page"],
+        )
+        if has_next
+        else ""
+    )
+    page = options.offset // options.limit + 1
+    return f"""
+    <nav class="pager">
+      {previous}
+      <span>{text['page_number'].format(page=page)}</span>
+      {following}
+    </nav>
+    """
+
+
+def _prompt_page_form(options: PromptSearchOptions, offset: int, label: str) -> str:
+    unique_field = '<input type="hidden" name="unique_prompts" value="1">' if options.unique_prompts else ""
+    return f"""
+    <form method="post" action="/prompt-search" class="pager-form">
+      <input type="hidden" name="tags" value="{html.escape(options.tags, quote=True)}">
+      <input type="hidden" name="negative_tags" value="{html.escape(options.negative_tags, quote=True)}">
+      <input type="hidden" name="match_mode" value="{html.escape(options.match_mode, quote=True)}">
+      <input type="hidden" name="sort_by" value="{html.escape(options.sort_by, quote=True)}">
+      <input type="hidden" name="limit" value="{options.limit}">
+      <input type="hidden" name="offset" value="{offset}">
+      <input type="hidden" name="lang" value="{html.escape(options.lang, quote=True)}">
+      {unique_field}
+      <button type="submit">{html.escape(label)}</button>
+    </form>
+    """
 
 
 def _highlight_prompt(prompt: str, matched_tags: tuple[str, ...]) -> str:
@@ -1182,6 +1343,9 @@ def _page(title: str, body: str, *, lang: str = "zh") -> str:
     button {{ border: 0; border-radius: 6px; background: #245b9f; color: #fff; padding: 10px 16px; font-weight: 700; }}
     .topbar {{ display: flex; justify-content: space-between; gap: 16px; align-items: start; margin-bottom: 16px; }}
     .toplinks {{ display: flex; flex-wrap: wrap; gap: 12px; justify-content: flex-end; }}
+    .inline-form {{ display: inline; width: auto; }}
+    .link-button {{ background: transparent; color: #245b9f; padding: 0; text-decoration: underline; cursor: pointer; }}
+    .notice {{ border: 1px solid #b7dfc2; border-radius: 6px; background: #effaf2; color: #236c3b; padding: 10px 12px; }}
     .muted {{ color: #52606d; word-break: break-all; }}
     .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 24px; }}
     .stats div {{ background: #fff; border: 1px solid #d9e1e8; border-radius: 6px; padding: 12px; }}
@@ -1217,8 +1381,13 @@ def _page(title: str, body: str, *, lang: str = "zh") -> str:
     .controls input, .controls select {{ min-width: 0; padding: 8px; border: 1px solid #bcccdc; border-radius: 6px; background: #fff; }}
     .controls .checkbox {{ display: flex; align-items: center; gap: 8px; }}
     .controls .checkbox input {{ width: auto; }}
+    .advanced {{ border: 1px solid #d9e1e8; border-radius: 6px; background: #fff; padding: 10px 12px; }}
+    .advanced summary {{ cursor: pointer; color: #3e4c59; font-weight: 700; }}
+    .advanced[open] {{ display: grid; gap: 12px; }}
+    .advanced .checkbox {{ display: flex; align-items: center; gap: 8px; color: #52606d; font-size: 13px; }}
+    .pager {{ display: flex; align-items: center; justify-content: center; gap: 12px; margin: 16px 0; }}
+    .pager-form {{ display: block; width: auto; }}
     button:disabled, input:disabled, textarea:disabled {{ opacity: 0.65; cursor: not-allowed; }}
-    .hint {{ color: #9b4d18; font-size: 13px; margin: 0; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }}
     .result {{ border: 1px solid #d9e1e8; border-radius: 6px; background: #fff; padding: 12px; }}
     img {{ width: 100%; aspect-ratio: 1; object-fit: contain; background: #eef2f6; }}
@@ -1257,6 +1426,23 @@ def _write_thumbnail(source: Path, target: Path, thumbnail_size: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def _prune_thumbnail_cache(cache_dir: Path, limit: int) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        thumbnails = sorted(
+            cache_dir.glob("*.jpg"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for path in thumbnails[max(1, limit) :]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _show_path_in_folder(path: Path) -> None:
@@ -1421,7 +1607,6 @@ def _stats(conn: sqlite3.Connection) -> dict[str, int]:
     hashed = conn.execute("SELECT COUNT(*) AS count FROM hashes").fetchone()["count"]
     groups = conn.execute("SELECT COUNT(DISTINCT cluster_id) AS count FROM clusters").fetchone()["count"]
     matches = conn.execute("SELECT COUNT(*) AS count FROM matches").fetchone()["count"]
-    crop_images = conn.execute("SELECT COUNT(DISTINCT image_id) AS count FROM crop_hashes").fetchone()["count"]
     prompts = conn.execute(
         "SELECT COUNT(*) AS count FROM image_prompts WHERE prompt IS NOT NULL"
     ).fetchone()["count"]
@@ -1435,7 +1620,7 @@ def _stats(conn: sqlite3.Connection) -> dict[str, int]:
         "hashed": int(hashed or 0),
         "groups": int(groups or 0),
         "matches": int(matches or 0),
-        "crop_images": int(crop_images or 0),
+        "crop_ready": int(is_crop_index_ready(conn)),
         "prompts": int(prompts or 0),
         "unique_tags": int(unique_tags or 0),
     }
