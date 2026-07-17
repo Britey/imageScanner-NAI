@@ -50,6 +50,7 @@ class PromptSearchOptions:
     offset: int
     lang: str
     unique_prompts: bool
+    model_type: str = "all"
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ TRANSLATIONS = {
         "image": "Image",
         "prompt_tags": "Prompt Tags",
         "prompt_placeholder": "1girl, blue eyes, smile",
+        "model_type": "Model category",
+        "model_all": "All models",
         "negative_prompt_tags": "Negative Tags",
         "negative_prompt_placeholder": "lowres, blurry, text",
         "match_mode": "Match mode",
@@ -179,6 +182,8 @@ TRANSLATIONS = {
         "image": "图片",
         "prompt_tags": "提示词标签",
         "prompt_placeholder": "1girl, blue eyes, smile",
+        "model_type": "模型分类",
+        "model_all": "所有模型",
         "negative_prompt_tags": "排除标签",
         "negative_prompt_placeholder": "lowres, blurry, text",
         "match_mode": "匹配模式",
@@ -492,6 +497,7 @@ def _make_handler(state: WebState):
                         offset=options.offset,
                         unique_prompts=options.unique_prompts,
                         sort_by=options.sort_by,
+                        model_type=options.model_type,
                     )
                     has_next = len(results) > options.limit
                     self._send_html(_prompt_results_page(results[: options.limit], options, has_next))
@@ -571,6 +577,11 @@ def _make_handler(state: WebState):
                 offset=max(0, _int_field(fields, "offset", 0)),
                 lang=_normalize_lang(fields.get("lang")),
                 unique_prompts=fields.get("unique_prompts") == "1",
+                model_type=(
+                    fields.get("model_type", "all")
+                    if fields.get("model_type", "all") in {"all", "sd", "noob", "nai3", "nai4"}
+                    else "all"
+                ),
             )
 
         def _show_in_folder(self, query: str, lang: str) -> None:
@@ -907,6 +918,16 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
             </select>
           </label>
           <label>
+            {text['model_type']}
+            <select name="model_type">
+              <option value="all" selected>{text['model_all']}</option>
+              <option value="sd">SD</option>
+              <option value="noob">Noob</option>
+              <option value="nai3">NAI3</option>
+              <option value="nai4">NAI4</option>
+            </select>
+          </label>
+          <label>
             {text['sort_by']}
             <select name="sort_by">
               <option value="created_desc" selected>{text['sort_created_desc']}</option>
@@ -940,6 +961,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
       const autocomplete = document.querySelector("#autocomplete-enabled");
       const scores = {{ strict: "75", balanced: "{state.min_score:.0f}", loose: "40" }};
       let activeSuggestion = -1;
+      let suggestionRequest = 0;
       let activePromptInput = promptInput;
       language.addEventListener("change", () => {{
         window.location.href = "/?lang=" + encodeURIComponent(language.value);
@@ -1006,6 +1028,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
       }};
       const refreshSuggestions = async inputElement => {{
         const suggestionsElement = suggestionsForInput(inputElement);
+        const request = ++suggestionRequest;
         activePromptInput = inputElement;
         const otherSuggestions = suggestionsElement === suggestions ? negativeSuggestions : suggestions;
         hideSuggestions(otherSuggestions);
@@ -1014,8 +1037,10 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         const query = info.token.trim();
         if (query.length < 1) return hideSuggestions(suggestionsElement);
         const response = await fetch("/suggest-tags?q=" + encodeURIComponent(query));
+        if (request !== suggestionRequest || activePromptInput !== inputElement) return false;
         if (!response.ok) return hideSuggestions(suggestionsElement);
         const tags = await response.json();
+        if (request !== suggestionRequest || activePromptInput !== inputElement) return false;
         if (!tags.length) return hideSuggestions(suggestionsElement);
         suggestionsElement.innerHTML = tags.map(item => (
           `<button type="button" data-tag="${{item.tag.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}}">
@@ -1024,24 +1049,39 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
            </button>`
         )).join("");
         suggestionsElement.hidden = false;
-        setActiveSuggestion(suggestionsElement, 0);
+        activeSuggestion = -1;
+        return true;
       }};
       const bindPromptAutocomplete = inputElement => {{
         const suggestionsElement = suggestionsForInput(inputElement);
         inputElement.addEventListener("input", () => refreshSuggestions(inputElement));
         inputElement.addEventListener("click", () => refreshSuggestions(inputElement));
         inputElement.addEventListener("focus", () => refreshSuggestions(inputElement));
-        inputElement.addEventListener("keydown", event => {{
-          if (suggestionsElement.hidden) return;
-          const buttons = suggestionButtons(suggestionsElement);
-          if (!buttons.length) return;
+        inputElement.addEventListener("keydown", async event => {{
           if (event.key === "ArrowDown") {{
             event.preventDefault();
-            setActiveSuggestion(suggestionsElement, activeSuggestion + 1);
+            if (suggestionsElement.hidden || !suggestionButtons(suggestionsElement).length) {{
+              await refreshSuggestions(inputElement);
+            }}
+            if (suggestionButtons(suggestionsElement).length) {{
+              setActiveSuggestion(suggestionsElement, activeSuggestion + 1);
+            }}
           }} else if (event.key === "ArrowUp") {{
             event.preventDefault();
-            setActiveSuggestion(suggestionsElement, activeSuggestion - 1);
+            if (suggestionsElement.hidden || !suggestionButtons(suggestionsElement).length) {{
+              await refreshSuggestions(inputElement);
+            }}
+            const buttons = suggestionButtons(suggestionsElement);
+            if (buttons.length) {{
+              setActiveSuggestion(
+                suggestionsElement,
+                activeSuggestion < 0 ? buttons.length - 1 : activeSuggestion - 1
+              );
+            }}
           }} else if (event.key === "Enter") {{
+            if (suggestionsElement.hidden) return;
+            const buttons = suggestionButtons(suggestionsElement);
+            if (!buttons.length) return;
             event.preventDefault();
             const button = buttons[activeSuggestion >= 0 ? activeSuggestion : 0];
             if (button) applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
@@ -1137,6 +1177,7 @@ def _prompt_results_page(
               <div class="score">{result.matched_count}</div>
               <div>{html.escape(', '.join(result.matched_tags))}</div>
               <div>{image_row['width']}x{image_row['height']} &middot; {human_size(image_row['size_bytes'])}</div>
+              <div>{html.escape(_prompt_model_label(image_row))}</div>
               <a class="folder-link" href="/show-in-folder?id={int(image_row['id'])}&lang={options.lang}">{text['show_in_folder']}</a>
               <p class="prompt is-collapsed">{prompt_html}</p>
               {prompt_button}
@@ -1153,6 +1194,8 @@ def _prompt_results_page(
     summary = f"{summary} · {text['prompt_sorted'].format(sort=html.escape(_prompt_sort_label(options.sort_by, options.lang)))}"
     if options.unique_prompts:
         summary = f"{summary} · {text['unique_prompts']}"
+    if options.model_type != "all":
+        summary = f"{summary} · {text['model_type']}: {html.escape(options.model_type.upper())}"
     if options.negative_tags:
         summary = f"{summary} · {text['excluding_tags'].format(tags=html.escape(options.negative_tags))}"
     empty = f"<p>{text['no_prompt_results']}</p>" if not cards else ""
@@ -1219,6 +1262,17 @@ def _prompt_pager(options: PromptSearchOptions, has_next: bool) -> str:
     """
 
 
+def _prompt_model_label(image_row: sqlite3.Row) -> str:
+    model_type = str(image_row["model_type"] or "sd").upper()
+    details: list[str] = []
+    if model_type == "NAI4" and image_row["model_version"] == "4.5":
+        details.append("4.5")
+    model_hash = str(image_row["model_hash"] or "").strip()
+    if model_hash:
+        details.append(model_hash)
+    return f"{model_type} ({', '.join(details)})" if details else model_type
+
+
 def _prompt_page_form(options: PromptSearchOptions, offset: int, label: str) -> str:
     unique_field = '<input type="hidden" name="unique_prompts" value="1">' if options.unique_prompts else ""
     return f"""
@@ -1227,6 +1281,7 @@ def _prompt_page_form(options: PromptSearchOptions, offset: int, label: str) -> 
       <input type="hidden" name="negative_tags" value="{html.escape(options.negative_tags, quote=True)}">
       <input type="hidden" name="match_mode" value="{html.escape(options.match_mode, quote=True)}">
       <input type="hidden" name="sort_by" value="{html.escape(options.sort_by, quote=True)}">
+      <input type="hidden" name="model_type" value="{html.escape(options.model_type, quote=True)}">
       <input type="hidden" name="limit" value="{options.limit}">
       <input type="hidden" name="offset" value="{offset}">
       <input type="hidden" name="lang" value="{html.escape(options.lang, quote=True)}">

@@ -1,10 +1,10 @@
 # imgdupe
 
-Local image and NovelAI prompt-tag search for large personal image collections.
+Local image and AI prompt-tag search for large personal image collections.
 
 [中文说明](README.zh.md)
 
-`imgdupe` indexes image files with perceptual hashes, then lets you search by uploading or selecting an example image. It can also extract NovelAI prompts into searchable tags while keeping the original prompt text in SQLite.
+`imgdupe` indexes image files with perceptual hashes, then lets you search by uploading or selecting an example image. It can also extract Stable Diffusion and NovelAI prompts into searchable positive tags while keeping bounded source metadata in SQLite.
 
 It does **not** delete files. It stores paths, metadata, and hashes in SQLite.
 If you enable missing-record cleanup, only SQLite records are removed; image
@@ -70,7 +70,8 @@ Index a folder recursively:
 imgdupe scan "E:\Images" --db images.sqlite --workers 16
 ```
 
-By default, scanning also attempts to index NovelAI prompt tags from image metadata.
+By default, scanning indexes positive prompt tags from NovelAI metadata and
+A1111/Forge-style Stable Diffusion `parameters` metadata.
 Images without prompt metadata are recorded as checked and remain searchable by image
 hash. For existing databases, backfill prompt metadata without rebuilding hashes:
 
@@ -78,10 +79,19 @@ hash. For existing databases, backfill prompt metadata without rebuilding hashes
 imgdupe scan "E:\Images" --db images.sqlite --workers 16 --reindex-prompts
 ```
 
-Prompt text is stored as-is, but searchable tags are cleaned during indexing:
-NovelAI weight markers such as `1.2::tag::`, bare `::`, `{}`, `[]`, and
-underscores are ignored for search. For example, `sanoba_witch::` is indexed as
-`sanoba witch`.
+Only positive tags are indexed. A1111 negative prompts, NovelAI Undesired
+Content, and negative/zero-weight NovelAI spans are excluded. Emphasis weights,
+LoRA directives, generation settings, and common CJK/IME punctuation are cleaned
+during indexing. Display tags preserve underscores, while search treats
+`sanoba_witch` and `sanoba witch` as equivalent.
+
+Model categories default to `sd`. NovelAI images are detected from
+`Software = NovelAI`; place a `.model_type` file containing `sd`, `noob`,
+`nai3`, or `nai4` in a folder to override that folder and its descendants. The
+closest marker wins. Available generation model hashes are searchable as
+`@model:<hash>` tags. Prompt-search results display the category and hash; when
+NovelAI metadata identifies V4.5, it is shown as `NAI4 (4.5, <hash>)` without
+creating a separate filtering category.
 
 NovelAI stealth metadata extraction is available, but off by default because it
 requires decoding PNG pixels and can be expensive on large collections:
@@ -204,6 +214,8 @@ imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 imgdupe tags "1girl" --not-tags "lowres, blurry" --db images.sqlite
 imgdupe tags "1girl" --sort created-desc --db images.sqlite
+imgdupe tags "1girl" --model-type nai4 --db images.sqlite
+imgdupe tags "@model:4bde2a90" --db images.sqlite
 ```
 
 Tag search uses the same cleaning rules as indexing, so searching for

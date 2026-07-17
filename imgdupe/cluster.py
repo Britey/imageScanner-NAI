@@ -3,7 +3,11 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:  # Progress output is optional for library/test environments.
+    def tqdm(iterable=None, **_kwargs):
+        return iterable if iterable is not None else ()
 
 from .bands import find_candidates
 from .config import ScanConfig, Thresholds

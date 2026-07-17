@@ -1,8 +1,8 @@
 # imgdupe
 
-面向大型个人图片收藏的本地以图搜图和 NovelAI 提示词标签搜索工具。
+面向大型个人图片收藏的本地以图搜图和 AI 提示词标签搜索工具。
 
-`imgdupe` 会使用感知哈希为图片建立索引，然后你可以上传、选择或粘贴一张示例图片来搜索相似图片。它也可以提取 NovelAI 提示词并建立可搜索的标签索引，同时在 SQLite 中保留原始提示词文本。
+`imgdupe` 会使用感知哈希为图片建立索引，然后你可以上传、选择或粘贴一张示例图片来搜索相似图片。它也可以提取 Stable Diffusion 和 NovelAI 提示词，为正向标签建立搜索索引，并在 SQLite 中保留有大小限制的源元数据。
 
 它**不会删除文件**。它只会把文件路径、元数据和哈希存入 SQLite 数据库。
 如果启用缺失记录清理，删除的也只是 SQLite 里的记录，不会删除磁盘上的图片文件。
@@ -66,7 +66,8 @@ python -m imgdupe.cli --help
 imgdupe scan "E:\Images" --db images.sqlite --workers 16
 ```
 
-默认情况下，扫描也会尝试从图片元数据中索引 NovelAI 提示词标签。
+默认情况下，扫描会从 NovelAI 元数据以及 A1111/Forge 风格的 Stable Diffusion
+`parameters` 元数据中索引正面提示词标签。
 没有提示词元数据的图片会被记录为已检查，并仍然可以通过图片哈希搜索。
 如果已有数据库需要补建提示词索引，可以运行：
 
@@ -74,9 +75,17 @@ imgdupe scan "E:\Images" --db images.sqlite --workers 16
 imgdupe scan "E:\Images" --db images.sqlite --workers 16 --reindex-prompts
 ```
 
-原始提示词会照原样保存，但用于搜索的标签会在索引时清理：
-NovelAI 权重标记（例如 `1.2::tag::`）、单独的 `::`、`{}`、`[]` 以及下划线都会在搜索标签中被忽略。
-例如 `sanoba_witch::` 会作为 `sanoba witch` 建立索引。
+数据库只索引正面标签；A1111 负面提示词、NovelAI Undesired Content，以及
+NovelAI 中负权重或零权重的片段都不会进入搜索索引。索引时会清理强调权重、
+LoRA 指令、生成参数和常见的中日韩输入法标点。显示文本会保留下划线，但搜索时
+`sanoba_witch` 与 `sanoba witch` 等价。
+
+模型分类默认是 `sd`，并通过 `Software = NovelAI` 自动识别 NovelAI 图片。
+如需覆盖分类，可在文件夹中放置 `.model_type`，内容为 `sd`、`noob`、`nai3`
+或 `nai4`；它会应用于所有子目录，且更近的标记优先。可用的生成模型哈希会以
+`@model:<hash>` 标签建立搜索索引。提示词搜索结果会显示分类和模型哈希；如果
+NovelAI 元数据表明图片由 V4.5 生成，则显示为 `NAI4 (4.5, <hash>)`，但筛选分类仍为
+`nai4`。
 
 NovelAI stealth 元数据提取也可用，但默认关闭，因为它需要解码 PNG 像素，
 在大图库上成本较高：
@@ -194,6 +203,8 @@ imgdupe tags "1girl" "blue eyes" --db images.sqlite --mode all
 imgdupe tags "cat ears，smile" --db images.sqlite --mode any --limit 200
 imgdupe tags "1girl" --not-tags "lowres, blurry" --db images.sqlite
 imgdupe tags "1girl" --sort created-desc --db images.sqlite
+imgdupe tags "1girl" --model-type nai4 --db images.sqlite
+imgdupe tags "@model:4bde2a90" --db images.sqlite
 ```
 
 标签搜索使用与索引相同的清理规则，因此搜索 `sanoba witch` 可以匹配包含 `sanoba_witch::` 的提示词。

@@ -22,6 +22,7 @@ from imgdupe.web import (
     WebState,
     _index_page,
     _prompt_results_page,
+    _prompt_model_label,
     _prune_thumbnail_cache,
 )
 from imgdupe.settings import load_settings
@@ -167,6 +168,32 @@ class SettingsTests(unittest.TestCase):
             self.assertNotIn('name="crop_index"', page)
             conn.close()
 
+    def test_autocomplete_keyboard_navigation_waits_for_suggestions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            state = WebState(
+                conn=conn,
+                db_path=root / "images.sqlite",
+                limit=100,
+                min_score=55,
+                thumbnail_size=256,
+                work_dir=root / "work",
+                thumbs_dir=root / "thumbs",
+                thumbnail_cache_limit=1000,
+                disable_advanced_options=False,
+            )
+
+            page = _index_page(state, "en")
+
+            self.assertIn('inputElement.addEventListener("keydown", async event', page)
+            self.assertIn("await refreshSuggestions(inputElement);", page)
+            self.assertIn("activeSuggestion = -1;", page)
+            self.assertIn("activeSuggestion + 1", page)
+            conn.close()
+
 
 class SingleInstanceTests(unittest.TestCase):
     def test_second_lock_is_refused_until_first_releases(self) -> None:
@@ -205,6 +232,20 @@ class SingleInstanceTests(unittest.TestCase):
 
 
 class PromptPaginationTests(unittest.TestCase):
+    def test_prompt_model_label_includes_hash_and_nai45_variant(self) -> None:
+        self.assertEqual(
+            _prompt_model_label(
+                {"model_type": "nai4", "model_version": "4.5", "model_hash": "4bde2a90"}
+            ),
+            "NAI4 (4.5, 4bde2a90)",
+        )
+        self.assertEqual(
+            _prompt_model_label(
+                {"model_type": "sd", "model_version": None, "model_hash": "516047db97"}
+            ),
+            "SD (516047db97)",
+        )
+
     def test_pager_preserves_search_state(self) -> None:
         options = PromptSearchOptions(
             tags="blue eyes",

@@ -63,6 +63,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     tags_parser.add_argument("--limit", type=int, default=100)
     tags_parser.add_argument("--offset", type=int, default=0)
+    tags_parser.add_argument(
+        "--model-type",
+        choices=("all", "sd", "noob", "nai3", "nai4"),
+        default="all",
+    )
 
     cluster_parser = subparsers.add_parser("cluster", help="Build similar-image groups.")
     cluster_parser.add_argument("--db", type=Path, required=True)
@@ -139,6 +144,7 @@ def _run_command(args, parser: argparse.ArgumentParser, conn) -> int:
             limit=args.limit,
             offset=args.offset,
             sort_by=args.sort.replace("-", "_"),
+            model_type=args.model_type,
         )
         for result in results:
             image_row = result.image_row

@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image, ImageOps
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:  # Progress output is optional for library/test environments.
+    def tqdm(iterable=None, **_kwargs):
+        return iterable if iterable is not None else ()
 
 from .utils import human_size
 

@@ -5,7 +5,11 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:  # Progress output is optional for library/test environments.
+    def tqdm(iterable=None, **_kwargs):
+        return iterable if iterable is not None else ()
 
 from .bands import insert_bands
 from .config import ScanConfig
@@ -13,6 +17,7 @@ from .db import (
     clear_hashes,
     crop_index_is_complete,
     delete_images,
+    encode_prompt_metadata,
     get_crop_index_state,
     get_existing_image,
     has_prompt_status,
@@ -26,7 +31,13 @@ from .db import (
     upsert_image,
 )
 from .hashing import compute_image_hashes, sha256_file
-from .nai_prompt import extract_nai_prompt, normalize_prompt_tag, split_prompt_tags
+from .model_type import ModelTypeResolution, ModelTypeResolver
+from .nai_prompt import (
+    PROMPT_PARSER_VERSION,
+    PromptResult,
+    extract_nai_prompt,
+    normalize_prompt_tag,
+)
 from .utils import iter_image_paths, utc_now_sql
 
 
@@ -52,6 +63,11 @@ class ScanTask:
     prompt_only: bool
     date_only: bool
     existing_image_id: int | None
+    classification_root: str
+    marker_model_type: str | None
+    model_marker_path: str | None
+    classification_status: str
+    classification_error: str | None
     moved: bool = False
 
 
@@ -73,9 +89,12 @@ class ScanResult:
     date_only: bool
     existing_image_id: int | None
     moved: bool
-    prompt: str | None
-    prompt_source: str | None
-    prompt_error: str | None
+    prompt_result: PromptResult | None
+    classification_root: str
+    marker_model_type: str | None
+    model_marker_path: str | None
+    classification_status: str
+    classification_error: str | None
 
 
 def scan_roots(
@@ -91,6 +110,7 @@ def scan_roots(
     workers = max(1, config.workers)
     stats = ScanStats()
     paths = list(iter_image_paths(roots))
+    model_resolvers = _build_model_resolvers(roots)
     tasks: list[ScanTask] = []
     moved_candidates = _missing_hash_candidates(conn)
 
@@ -115,10 +135,40 @@ def scan_roots(
             if moved_id is not None:
                 existing = conn.execute("SELECT * FROM images WHERE id = ?", (moved_id,)).fetchone()
         existing_id = int(existing["id"]) if existing is not None else None
+        classification_root, marker = _resolve_model_marker(path, model_resolvers)
+        classification_status = _classification_status(marker)
+        marker_path = str(marker.marker_path) if marker.marker_path else None
+        prompt_row = (
+            conn.execute(
+                """
+                SELECT model_type, parser_version, classification_root,
+                       model_marker_path, classification_status
+                FROM image_prompts
+                WHERE image_id = ?
+                """,
+                (existing_id,),
+            ).fetchone()
+            if existing_id is not None
+            else None
+        )
+        classification_changed = prompt_row is None or any(
+            (
+                prompt_row["classification_root"] != str(classification_root),
+                prompt_row["model_marker_path"] != marker_path,
+                prompt_row["classification_status"] != classification_status,
+                marker.model_type is not None and prompt_row["model_type"] != marker.model_type,
+            )
+        )
         needs_prompt = (
             config.prompt_index
             and existing_id is not None
-            and (config.reindex_prompts or not has_prompt_status(conn, existing_id))
+            and (
+                config.reindex_prompts
+                or not has_prompt_status(conn, existing_id)
+                or prompt_row is None
+                or prompt_row["parser_version"] != PROMPT_PARSER_VERSION
+                or classification_changed
+            )
         )
         unchanged_hashes = (
             existing is not None
@@ -153,6 +203,11 @@ def scan_roots(
                 prompt_only=unchanged_hashes and needs_prompt,
                 date_only=unchanged_hashes and (needs_date_update or moved_id is not None) and not needs_prompt,
                 existing_image_id=existing_id,
+                classification_root=str(classification_root),
+                marker_model_type=marker.model_type,
+                model_marker_path=marker_path,
+                classification_status=classification_status,
+                classification_error=marker.error,
                 moved=moved_id is not None,
             )
         )
@@ -205,6 +260,40 @@ def scan_roots(
     return stats
 
 
+def _build_model_resolvers(roots: list[Path]) -> list[tuple[Path, ModelTypeResolver]]:
+    resolved: dict[str, tuple[Path, ModelTypeResolver]] = {}
+    for root in roots:
+        canonical = root.resolve(strict=False)
+        scan_root = canonical if canonical.is_dir() else canonical.parent
+        key = str(scan_root).casefold()
+        resolved.setdefault(key, (scan_root, ModelTypeResolver(scan_root)))
+    return sorted(resolved.values(), key=lambda item: len(item[0].parts), reverse=True)
+
+
+def _resolve_model_marker(
+    path: Path,
+    resolvers: list[tuple[Path, ModelTypeResolver]],
+) -> tuple[Path, ModelTypeResolution]:
+    canonical = path.resolve(strict=False)
+    for scan_root, resolver in resolvers:
+        try:
+            canonical.relative_to(scan_root)
+        except ValueError:
+            continue
+        return scan_root, resolver.resolve_for_image(canonical)
+    # iter_image_paths only yields files below a requested root. This fallback
+    # keeps direct/internal callers deterministic if that invariant changes.
+    scan_root = canonical.parent
+    return scan_root, ModelTypeResolver(scan_root).resolve_for_image(canonical)
+
+
+def _classification_status(resolution: ModelTypeResolution) -> str:
+    if resolution.status != "invalid_model_marker":
+        return resolution.status
+    signature = resolution.marker_signature or "unknown"
+    return f"invalid_model_marker:{signature}"
+
+
 def _finish_crop_index_state(conn: sqlite3.Connection, crop_index_requested: bool) -> None:
     if crop_index_requested:
         set_crop_index_state(conn, "ready" if crop_index_is_complete(conn) else "incomplete")
@@ -226,6 +315,7 @@ def _store_result(
     if result.date_only:
         if result.existing_image_id is None:
             stats.failed += 1
+            _commit_batch_if_needed(conn, config, stats)
             return
         if result.moved:
             update_image_path(
@@ -247,11 +337,13 @@ def _store_result(
                 modified_ns=result.modified_ns,
             )
         stats.indexed += 1
+        _commit_batch_if_needed(conn, config, stats)
         return
 
     if result.prompt_only:
         if result.existing_image_id is None:
             stats.failed += 1
+            _commit_batch_if_needed(conn, config, stats)
             return
         if result.moved:
             update_image_path(
@@ -274,6 +366,7 @@ def _store_result(
             )
         _store_prompt(conn, result.existing_image_id, result, indexed_at)
         stats.indexed += 1
+        _commit_batch_if_needed(conn, config, stats)
         return
 
     if result.decode_error is None:
@@ -362,8 +455,16 @@ def _store_result(
             )
         if result.had_existing_hashes:
             clear_hashes(conn, image_id)
+        if config.prompt_index:
+            _store_prompt(conn, image_id, result, indexed_at)
         stats.failed += 1
 
+    _commit_batch_if_needed(conn, config, stats)
+
+
+def _commit_batch_if_needed(
+    conn: sqlite3.Connection, config: ScanConfig, stats: ScanStats
+) -> None:
     if config.batch_size > 0 and (stats.indexed + stats.failed) % config.batch_size == 0:
         conn.commit()
 
@@ -394,16 +495,21 @@ def _hash_task(
             date_only=True,
             existing_image_id=task.existing_image_id,
             moved=task.moved,
-            prompt=None,
-            prompt_source=None,
-            prompt_error=None,
+            prompt_result=None,
+            classification_root=task.classification_root,
+            marker_model_type=task.marker_model_type,
+            model_marker_path=task.model_marker_path,
+            classification_status=task.classification_status,
+            classification_error=task.classification_error,
         )
 
     if task.prompt_only:
-        prompt, prompt_source, prompt_error = _extract_prompt_fields(
+        prompt_result = _extract_prompt_fields(
             task.path,
             prompt_index=prompt_index,
             stealth_prompt=stealth_prompt,
+            classification_status=task.classification_status,
+            classification_error=task.classification_error,
         )
         return ScanResult(
             path=task.path,
@@ -422,9 +528,12 @@ def _hash_task(
             date_only=False,
             existing_image_id=task.existing_image_id,
             moved=task.moved,
-            prompt=prompt,
-            prompt_source=prompt_source,
-            prompt_error=prompt_error,
+            prompt_result=prompt_result,
+            classification_root=task.classification_root,
+            marker_model_type=task.marker_model_type,
+            model_marker_path=task.model_marker_path,
+            classification_status=task.classification_status,
+            classification_error=task.classification_error,
         )
 
     try:
@@ -434,10 +543,12 @@ def _hash_task(
             min_height=min_height,
             include_crop_regions=crop_index,
         )
-        prompt, prompt_source, prompt_error = _extract_prompt_fields(
+        prompt_result = _extract_prompt_fields(
             task.path,
             prompt_index=prompt_index,
             stealth_prompt=stealth_prompt,
+            classification_status=task.classification_status,
+            classification_error=task.classification_error,
         )
         return ScanResult(
             path=task.path,
@@ -456,15 +567,20 @@ def _hash_task(
             date_only=False,
             existing_image_id=task.existing_image_id,
             moved=task.moved,
-            prompt=prompt,
-            prompt_source=prompt_source,
-            prompt_error=prompt_error,
+            prompt_result=prompt_result,
+            classification_root=task.classification_root,
+            marker_model_type=task.marker_model_type,
+            model_marker_path=task.model_marker_path,
+            classification_status=task.classification_status,
+            classification_error=task.classification_error,
         )
     except Exception as exc:
-        prompt, prompt_source, prompt_error = _extract_prompt_fields(
+        prompt_result = _extract_prompt_fields(
             task.path,
             prompt_index=prompt_index,
             stealth_prompt=stealth_prompt,
+            classification_status=task.classification_status,
+            classification_error=task.classification_error,
         )
         return ScanResult(
             path=task.path,
@@ -483,9 +599,12 @@ def _hash_task(
             date_only=False,
             existing_image_id=task.existing_image_id,
             moved=task.moved,
-            prompt=prompt,
-            prompt_source=prompt_source,
-            prompt_error=prompt_error,
+            prompt_result=prompt_result,
+            classification_root=task.classification_root,
+            marker_model_type=task.marker_model_type,
+            model_marker_path=task.model_marker_path,
+            classification_status=task.classification_status,
+            classification_error=task.classification_error,
         )
 
 
@@ -578,11 +697,19 @@ def _extract_prompt_fields(
     *,
     prompt_index: bool,
     stealth_prompt: bool,
-) -> tuple[str | None, str | None, str | None]:
+    classification_status: str,
+    classification_error: str | None,
+) -> PromptResult | None:
     if not prompt_index:
-        return None, None, None
-    result = extract_nai_prompt(path, stealth_fallback=stealth_prompt)
-    return result.prompt, result.metadata_source, result.error
+        return None
+    if classification_status.startswith("invalid_model_marker"):
+        return PromptResult(
+            prompt=None,
+            metadata_source=None,
+            error=classification_error or "invalid_model_marker",
+            model_type="sd",
+        )
+    return extract_nai_prompt(path, stealth_fallback=stealth_prompt)
 
 
 def _store_prompt(
@@ -591,16 +718,42 @@ def _store_prompt(
     result: ScanResult,
     indexed_at: str,
 ) -> None:
-    tag_rows: list[tuple[str, str]] = []
-    if result.prompt:
-        for tag in split_prompt_tags(result.prompt):
-            tag_rows.append((tag, normalize_prompt_tag(tag)))
+    prompt_result = result.prompt_result or PromptResult(None, None, "no_metadata")
+    model_type = result.marker_model_type or prompt_result.model_type or "sd"
+    tag_rows: list[tuple[str, str, str]] = [
+        (tag, normalize_prompt_tag(tag), "prompt")
+        for tag in prompt_result.tags
+        if normalize_prompt_tag(tag)
+    ]
+    if prompt_result.model_hash:
+        model_tag = f"@model:{prompt_result.model_hash.casefold()}"
+        tag_rows.append((model_tag, normalize_prompt_tag(model_tag), "model_hash"))
+    prompt_error = prompt_result.error
+    prompt_status = "ok" if prompt_error is None else prompt_error.split(":", 1)[0]
+    try:
+        raw_metadata, raw_metadata_codec = encode_prompt_metadata(prompt_result.raw_metadata)
+    except ValueError:
+        raw_metadata = None
+        raw_metadata_codec = None
+        prompt_status = "prompt_metadata_too_large"
+        prompt_error = "prompt_metadata_too_large"
     replace_prompt(
         conn,
         image_id,
-        prompt=result.prompt,
-        metadata_source=result.prompt_source,
-        prompt_error=result.prompt_error,
+        prompt=prompt_result.prompt,
+        metadata_source=prompt_result.metadata_source,
+        prompt_error=prompt_error,
         indexed_at=indexed_at,
         tags=tag_rows,
+        model_type=model_type if not result.classification_status.startswith("invalid_model_marker") else None,
+        model_hash=prompt_result.model_hash,
+        model_version=prompt_result.model_version,
+        prompt_format=prompt_result.prompt_format,
+        raw_metadata=raw_metadata,
+        raw_metadata_codec=raw_metadata_codec,
+        parser_version=PROMPT_PARSER_VERSION,
+        classification_root=result.classification_root,
+        model_marker_path=result.model_marker_path,
+        prompt_status=prompt_status,
+        classification_status=result.classification_status,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import zlib
 from pathlib import Path
 
 
@@ -8,7 +9,9 @@ DELETE_BATCH_SIZE = 400
 CROP_INDEX_STATE_KEY = "crop_index_state"
 CROP_INDEX_VERSION_KEY = "crop_index_version"
 CROP_INDEX_VERSION = "1"
-
+PROMPT_SCHEMA_VERSION_KEY = "prompt_schema_version"
+PROMPT_SCHEMA_VERSION = "2"
+MAX_PROMPT_METADATA_BYTES = 4 * 1024 * 1024
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -86,7 +89,18 @@ CREATE TABLE IF NOT EXISTS image_prompts (
     prompt TEXT,
     metadata_source TEXT,
     prompt_indexed_at TEXT NOT NULL,
-    prompt_error TEXT
+    prompt_error TEXT,
+    model_type TEXT,
+    model_hash TEXT,
+    model_version TEXT,
+    prompt_format TEXT,
+    raw_metadata BLOB,
+    raw_metadata_codec TEXT,
+    parser_version INTEGER,
+    classification_root TEXT,
+    model_marker_path TEXT,
+    prompt_status TEXT,
+    classification_status TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_tags (
@@ -94,6 +108,7 @@ CREATE TABLE IF NOT EXISTS prompt_tags (
     tag TEXT NOT NULL,
     tag_norm TEXT NOT NULL,
     position INTEGER NOT NULL,
+    tag_kind TEXT NOT NULL DEFAULT 'prompt',
     PRIMARY KEY (image_id, tag_norm)
 );
 
@@ -122,6 +137,21 @@ CREATE INDEX IF NOT EXISTS idx_images_modified_ns ON images(modified_ns);
 """
 
 
+PROMPT_COLUMNS = {
+    "model_type": "TEXT",
+    "model_hash": "TEXT",
+    "model_version": "TEXT",
+    "prompt_format": "TEXT",
+    "raw_metadata": "BLOB",
+    "raw_metadata_codec": "TEXT",
+    "parser_version": "INTEGER",
+    "classification_root": "TEXT",
+    "model_marker_path": "TEXT",
+    "prompt_status": "TEXT",
+    "classification_status": "TEXT",
+}
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
@@ -134,10 +164,25 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
-    _ensure_column(conn, "images", "created_ns", "INTEGER")
-    _ensure_column(conn, "images", "modified_ns", "INTEGER")
+    with conn:
+        _ensure_column(conn, "images", "created_ns", "INTEGER")
+        _ensure_column(conn, "images", "modified_ns", "INTEGER")
     conn.executescript(MIGRATIONS)
-    conn.commit()
+    # Keep additive upgrades in one transaction. The version marker is written
+    # last, so it never advertises a partially applied prompt-schema migration.
+    with conn:
+        for column, column_type in PROMPT_COLUMNS.items():
+            _ensure_column(conn, "image_prompts", column, column_type)
+        _ensure_column(conn, "prompt_tags", "tag_kind", "TEXT NOT NULL DEFAULT 'prompt'")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_image_prompts_model_type_image "
+            "ON image_prompts(model_type, image_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prompt_tags_kind_norm_image "
+            "ON prompt_tags(tag_kind, tag_norm, image_id)"
+        )
+        set_metadata(conn, PROMPT_SCHEMA_VERSION_KEY, PROMPT_SCHEMA_VERSION)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
@@ -147,6 +192,44 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_typ
     }
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def encode_prompt_metadata(raw_metadata: str | bytes | None) -> tuple[bytes | None, str | None]:
+    """Encode bounded prompt metadata for image_prompts raw storage.
+
+    Callers should record ``prompt_metadata_too_large`` when this raises
+    ValueError. The limit applies to decoded UTF-8 bytes, not compressed size.
+    """
+    if raw_metadata is None:
+        return None, None
+    raw = raw_metadata.encode("utf-8") if isinstance(raw_metadata, str) else bytes(raw_metadata)
+    if len(raw) > MAX_PROMPT_METADATA_BYTES:
+        raise ValueError("prompt_metadata_too_large")
+    compressed = zlib.compress(raw)
+    if len(compressed) < len(raw):
+        return compressed, "zlib+utf8"
+    return raw, "utf8"
+
+
+def decode_prompt_metadata(raw_metadata: bytes | None, codec: str | None) -> str | None:
+    """Decode raw prompt metadata while enforcing the decoded-size ceiling."""
+    if raw_metadata is None:
+        return None
+    data = bytes(raw_metadata)
+    if codec == "zlib+utf8":
+        decompressor = zlib.decompressobj()
+        decoded = decompressor.decompress(data, MAX_PROMPT_METADATA_BYTES + 1)
+        if decompressor.unconsumed_tail or len(decoded) > MAX_PROMPT_METADATA_BYTES:
+            raise ValueError("prompt_metadata_too_large")
+        decoded += decompressor.flush()
+        if len(decoded) > MAX_PROMPT_METADATA_BYTES:
+            raise ValueError("prompt_metadata_too_large")
+        data = decoded
+    elif codec != "utf8":
+        raise ValueError(f"unsupported raw metadata codec: {codec}")
+    if len(data) > MAX_PROMPT_METADATA_BYTES:
+        raise ValueError("prompt_metadata_too_large")
+    return data.decode("utf-8")
 
 
 def get_metadata(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
@@ -521,34 +604,82 @@ def replace_prompt(
     metadata_source: str | None,
     prompt_error: str | None,
     indexed_at: str,
-    tags: list[tuple[str, str]],
+    tags: list[tuple[str, str] | tuple[str, str, str]],
+    model_type: str | None = None,
+    model_hash: str | None = None,
+    model_version: str | None = None,
+    prompt_format: str | None = None,
+    raw_metadata: bytes | None = None,
+    raw_metadata_codec: str | None = None,
+    parser_version: int | None = None,
+    classification_root: str | None = None,
+    model_marker_path: str | None = None,
+    prompt_status: str | None = None,
+    classification_status: str | None = None,
 ) -> None:
     conn.execute("DELETE FROM prompt_tags WHERE image_id = ?", (image_id,))
     conn.execute(
         """
         INSERT INTO image_prompts (
-            image_id, prompt, metadata_source, prompt_indexed_at, prompt_error
+            image_id, prompt, metadata_source, prompt_indexed_at, prompt_error,
+            model_type, model_hash, model_version, prompt_format, raw_metadata, raw_metadata_codec,
+            parser_version, classification_root, model_marker_path, prompt_status,
+            classification_status
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(image_id) DO UPDATE SET
             prompt = excluded.prompt,
             metadata_source = excluded.metadata_source,
             prompt_indexed_at = excluded.prompt_indexed_at,
-            prompt_error = excluded.prompt_error
+            prompt_error = excluded.prompt_error,
+            model_type = excluded.model_type,
+            model_hash = excluded.model_hash,
+            model_version = excluded.model_version,
+            prompt_format = excluded.prompt_format,
+            raw_metadata = excluded.raw_metadata,
+            raw_metadata_codec = excluded.raw_metadata_codec,
+            parser_version = excluded.parser_version,
+            classification_root = excluded.classification_root,
+            model_marker_path = excluded.model_marker_path,
+            prompt_status = excluded.prompt_status,
+            classification_status = excluded.classification_status
         """,
-        (image_id, prompt, metadata_source, indexed_at, prompt_error),
+        (
+            image_id,
+            prompt,
+            metadata_source,
+            indexed_at,
+            prompt_error,
+            model_type,
+            model_hash,
+            model_version,
+            prompt_format,
+            raw_metadata,
+            raw_metadata_codec,
+            parser_version,
+            classification_root,
+            model_marker_path,
+            prompt_status,
+            classification_status,
+        ),
     )
     if not tags:
         return
     conn.executemany(
         """
         INSERT OR REPLACE INTO prompt_tags (
-            image_id, tag, tag_norm, position
+            image_id, tag, tag_norm, position, tag_kind
         )
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
         [
-            (image_id, tag, tag_norm, position)
-            for position, (tag, tag_norm) in enumerate(tags)
+            (
+                image_id,
+                tag[0],
+                tag[1],
+                position,
+                tag[2] if len(tag) == 3 else "prompt",
+            )
+            for position, tag in enumerate(tags)
         ],
     )
