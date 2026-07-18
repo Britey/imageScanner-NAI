@@ -19,6 +19,7 @@ env/
 
 # Local databases and scan outputs
 model_paths.ini
+/run_debug.bat
 *.sqlite
 *.sqlite-*
 *.sqlite3
