@@ -1,6 +1,6 @@
 # Prompt extraction reference manifest
 
-`reference_prompt_tags.json` is the reviewed golden output for the 30 PNG files
+`reference_prompt_tags.json` is the reviewed golden output for the 33 PNG files
 in the local `参考图示例` folder. It records each file's SHA-256, metadata-level
 model detection, model version, model hash, prompt format, and exact ordered
 positive tags.

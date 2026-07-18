@@ -120,7 +120,7 @@ class StealthPromptMetadataTests(unittest.TestCase):
             for entry in load_manifest(MANIFEST_PATH)["images"]
             if entry["prompt_format"] == "novelai"
         ]
-        self.assertEqual(len(entries), 12)
+        self.assertEqual(len(entries), 15)
 
         with tempfile.TemporaryDirectory() as directory:
             carriers = Path(directory)

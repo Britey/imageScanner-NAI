@@ -83,7 +83,9 @@ Only positive tags are indexed. A1111 negative prompts, NovelAI Undesired
 Content, and negative/zero-weight NovelAI spans are excluded. Emphasis weights,
 LoRA directives, generation settings, and common CJK/IME punctuation are cleaned
 during indexing. Display tags preserve underscores, while search treats
-`sanoba_witch` and `sanoba witch` as equivalent.
+`sanoba_witch` and `sanoba witch` as equivalent. NovelAI parenthesized tag
+qualifiers such as `yuuki (sao)` are preserved; A1111 parentheses remain SD
+emphasis syntax.
 
 NovelAI images are detected authoritatively from `Software = NovelAI`; their
 `Source` distinguishes NAI3 from NAI4. Other generation metadata is treated as

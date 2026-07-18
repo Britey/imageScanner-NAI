@@ -14,12 +14,12 @@ REFERENCE_ROOT = PROJECT_ROOT / "参考图示例"
 class ReferencePromptManifestTests(unittest.TestCase):
     def test_manifest_is_complete_and_well_formed(self) -> None:
         entries = load_manifest(MANIFEST)["images"]
-        self.assertEqual(len(entries), 30)
-        self.assertEqual(len({entry["path"] for entry in entries}), 30)
+        self.assertEqual(len(entries), 33)
+        self.assertEqual(len({entry["path"] for entry in entries}), 33)
         self.assertTrue(all(len(entry["sha256"]) == 64 for entry in entries))
         self.assertTrue(all(entry["prompt_format"] in {"a1111", "novelai"} for entry in entries))
         self.assertTrue(all(entry["tags"] for entry in entries))
-        self.assertEqual(sum(len(entry["tags"]) for entry in entries), 751)
+        self.assertEqual(sum(len(entry["tags"]) for entry in entries), 887)
 
     @unittest.skipUnless(REFERENCE_ROOT.is_dir(), "local ignored reference corpus is unavailable")
     def test_extractor_matches_every_reviewed_reference(self) -> None:

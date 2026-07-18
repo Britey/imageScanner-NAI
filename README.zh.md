@@ -78,7 +78,8 @@ imgdupe scan "E:\Images" --db images.sqlite --workers 16 --reindex-prompts
 数据库只索引正面标签；A1111 负面提示词、NovelAI Undesired Content，以及
 NovelAI 中负权重或零权重的片段都不会进入搜索索引。索引时会清理强调权重、
 LoRA 指令、生成参数和常见的中日韩输入法标点。显示文本会保留下划线，但搜索时
-`sanoba_witch` 与 `sanoba witch` 等价。
+`sanoba_witch` 与 `sanoba witch` 等价。NovelAI 的括号标签限定词（例如
+`yuuki (sao)`）会被保留；A1111 中的圆括号仍按 SD 强调语法处理。
 
 模型分类默认是 `sd`，并通过 `Software = NovelAI` 自动识别 NovelAI 图片。
 如需覆盖分类，可在文件夹中放置 `.model_type`，内容为 `sd`、`noob`、`nai3`

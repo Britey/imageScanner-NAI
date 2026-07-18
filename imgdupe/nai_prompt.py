@@ -24,7 +24,7 @@ NOVELAI_RAW_FIELDS = (
     "v4_negative_prompt",
     "actual_prompts",
 )
-PROMPT_PARSER_VERSION = 4
+PROMPT_PARSER_VERSION = 5
 
 
 class PromptMetadataTooLarge(ValueError):
@@ -252,9 +252,24 @@ def parse_novelai_prompt(prompt: str, *, model_type: str = "nai4") -> list[str]:
     eligible = _filter_novelai_numeric_scopes(text)
     if model_type == "nai3":
         eligible = _filter_nai3_mix_segments(eligible)
-    eligible = _strip_round_emphasis(eligible)
     eligible = eligible.translate(str.maketrans({"{": "", "}": "", "[": "", "]": ""}))
-    return split_prompt_tags(_restore_escapes(eligible))
+    # Parentheses are not NovelAI emphasis syntax.  Preserve qualifiers that are
+    # part of a tag (for example ``yuuki (sao)``), while still cleaning the very
+    # common A1111-style wrappers pasted at the beginning of an NAI tag.
+    eligible = _strip_novelai_round_wrappers(eligible)
+    # Keep escaped punctuation protected until structural cleanup is complete.
+    # Otherwise an explicitly literal ``\(tag\)`` would look like a removable
+    # boundary wrapper here.
+    tags = split_prompt_tags(eligible)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        tag = _restore_escapes(_clean_novelai_round_punctuation(tag))
+        tag_norm = normalize_prompt_tag(tag)
+        if tag_norm and tag_norm not in seen:
+            seen.add(tag_norm)
+            cleaned.append(tag)
+    return cleaned
 
 
 def split_prompt_tags(prompt: str) -> list[str]:
@@ -356,14 +371,26 @@ def _filter_nai3_mix_segments(text: str) -> str:
     return ",".join(kept)
 
 
-def _strip_round_emphasis(text: str, depth: int = 0) -> str:
+def _strip_novelai_round_wrappers(text: str, depth: int = 0) -> str:
+    """Clean pasted SD wrappers without damaging NAI tag qualifiers.
+
+    A round group is considered a wrapper only at the beginning of the prompt or
+    immediately after a tag separator.  Parentheses after tag text are literal:
+    ``(masterpiece)`` is cleaned, but ``yuuki (sao)`` is retained verbatim.
+    """
     if depth >= MAX_NESTING:
         return text
     output: list[str] = []
     index = 0
+    at_tag_boundary = True
     while index < len(text):
-        if text[index] != "(":
-            output.append(text[index])
+        character = text[index]
+        if character != "(" or not at_tag_boundary:
+            output.append(character)
+            if character in COMMA_SEPARATORS + CJK_FULL_STOPS + PIPE_CHARS:
+                at_tag_boundary = True
+            elif not character.isspace():
+                at_tag_boundary = False
             index += 1
             continue
         end = _matching_delimiter(text, index, "(", ")")
@@ -371,9 +398,39 @@ def _strip_round_emphasis(text: str, depth: int = 0) -> str:
             output.append(text[index:])
             break
         inner = _strip_final_weight(text[index + 1:end])
-        output.append(_strip_round_emphasis(inner, depth + 1))
+        output.append(_strip_novelai_round_wrappers(inner, depth + 1))
+        # A second adjacent group is another pasted wrapper, while ordinary text
+        # following this group will turn the flag off on its first character.
+        at_tag_boundary = True
         index = end + 1
     return "".join(output)
+
+
+def _clean_novelai_round_punctuation(tag: str) -> str:
+    """Remove boundary wrappers and unmatched round punctuation from one tag."""
+    text = _strip_novelai_round_wrappers(tag.strip())
+    while text.startswith("("):
+        end = _matching_delimiter(text, 0, "(", ")")
+        if end != len(text) - 1:
+            break
+        text = _strip_final_weight(text[1:-1]).strip()
+
+    stack: list[int] = []
+    unmatched: set[int] = set()
+    for index, character in enumerate(text):
+        if character == "(":
+            stack.append(index)
+        elif character == ")":
+            if stack:
+                stack.pop()
+            else:
+                unmatched.add(index)
+    unmatched.update(stack)
+    if unmatched:
+        text = "".join(
+            character for index, character in enumerate(text) if index not in unmatched
+        )
+    return clean_prompt_tag(text)
 
 
 def _caption_texts(value: Any) -> list[str]:

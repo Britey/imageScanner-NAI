@@ -205,6 +205,45 @@ def test_fullwidth_weight_syntax_and_cjk_preservation() -> None:
     assert tags == ["青い目", "「title」", "《作品》"]
 
 
+def test_novelai_parenthesized_tag_qualifiers_are_preserved() -> None:
+    tags = parse_novelai_prompt(
+        "yuuki noa, yuuki (princess connect!), yuuki (sao), "
+        "akizuki kanna(cafe stella to shinigami no chou), "
+        "0.5::yd(orange maru), pottsness::"
+    )
+    assert tags == [
+        "yuuki noa",
+        "yuuki (princess connect!)",
+        "yuuki (sao)",
+        "akizuki kanna(cafe stella to shinigami no chou)",
+        "yd(orange maru)",
+        "pottsness",
+    ]
+
+
+def test_novelai_cleans_only_round_wrappers_at_tag_boundaries() -> None:
+    tags = parse_novelai_prompt(
+        "(masterpiece), (digital painting:1.2), artist_name_(circle), "
+        "character (series)"
+    )
+    assert tags == [
+        "masterpiece", "digital painting", "artist_name_(circle)",
+        "character (series)",
+    ]
+
+
+def test_novelai_cleans_unmatched_foreign_round_punctuation_per_tag() -> None:
+    assert parse_novelai_prompt(
+        "(legendary Dragon Queen::, (1 girl), hair flowing) detailed sky"
+    ) == ["legendary Dragon Queen", "1 girl", "hair flowing detailed sky"]
+
+
+def test_novelai_escaped_round_punctuation_remains_literal() -> None:
+    assert parse_novelai_prompt(
+        r"\(literal wrapper\), artist\(circle\), \(unmatched"
+    ) == ["(literal wrapper)", "artist(circle)", "(unmatched"]
+
+
 def test_tag_normalization_preserves_display_but_unifies_underscore() -> None:
     assert split_prompt_tags("blue_hair, blue hair") == ["blue_hair"]
     assert normalize_prompt_tag("Blue_Hair") == "blue hair"
