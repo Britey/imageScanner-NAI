@@ -10,7 +10,7 @@ CROP_INDEX_STATE_KEY = "crop_index_state"
 CROP_INDEX_VERSION_KEY = "crop_index_version"
 CROP_INDEX_VERSION = "1"
 PROMPT_SCHEMA_VERSION_KEY = "prompt_schema_version"
-PROMPT_SCHEMA_VERSION = "2"
+PROMPT_SCHEMA_VERSION = "3"
 MAX_PROMPT_METADATA_BYTES = 4 * 1024 * 1024
 
 SCHEMA = """
@@ -92,7 +92,11 @@ CREATE TABLE IF NOT EXISTS image_prompts (
     prompt_error TEXT,
     model_type TEXT,
     model_hash TEXT,
+    model_identity TEXT,
     model_version TEXT,
+    configured_model TEXT,
+    model_config_root TEXT,
+    model_config_rule_id TEXT,
     prompt_format TEXT,
     raw_metadata BLOB,
     raw_metadata_codec TEXT,
@@ -140,7 +144,11 @@ CREATE INDEX IF NOT EXISTS idx_images_modified_ns ON images(modified_ns);
 PROMPT_COLUMNS = {
     "model_type": "TEXT",
     "model_hash": "TEXT",
+    "model_identity": "TEXT",
     "model_version": "TEXT",
+    "configured_model": "TEXT",
+    "model_config_root": "TEXT",
+    "model_config_rule_id": "TEXT",
     "prompt_format": "TEXT",
     "raw_metadata": "BLOB",
     "raw_metadata_codec": "TEXT",
@@ -181,6 +189,43 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_prompt_tags_kind_norm_image "
             "ON prompt_tags(tag_kind, tag_norm, image_id)"
+        )
+        # Keep pre-v3 databases immediately searchable by their structured
+        # model columns. A later prompt reindex adds full identities and path
+        # labels without invalidating the existing database.
+        conn.execute(
+            """
+            INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
+            SELECT image_id,
+                   '@model:' || model_type,
+                   '@model:' || LOWER(model_type),
+                   1000000000,
+                   'model_type'
+            FROM image_prompts
+            WHERE model_type IS NOT NULL
+              AND TRIM(model_type) <> ''
+              AND (configured_model IS NULL OR TRIM(configured_model) = '')
+            ON CONFLICT(image_id, tag_norm) DO UPDATE SET
+                tag = excluded.tag,
+                tag_kind = excluded.tag_kind
+            WHERE prompt_tags.tag_kind = 'prompt'
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
+            SELECT image_id,
+                   '@model:' || LOWER(model_hash),
+                   '@model:' || LOWER(model_hash),
+                   1000000001,
+                   'model_hash'
+            FROM image_prompts
+            WHERE model_hash IS NOT NULL AND TRIM(model_hash) <> ''
+            ON CONFLICT(image_id, tag_norm) DO UPDATE SET
+                tag = excluded.tag,
+                tag_kind = excluded.tag_kind
+            WHERE prompt_tags.tag_kind = 'prompt'
+            """
         )
         set_metadata(conn, PROMPT_SCHEMA_VERSION_KEY, PROMPT_SCHEMA_VERSION)
 
@@ -607,7 +652,11 @@ def replace_prompt(
     tags: list[tuple[str, str] | tuple[str, str, str]],
     model_type: str | None = None,
     model_hash: str | None = None,
+    model_identity: str | None = None,
     model_version: str | None = None,
+    configured_model: str | None = None,
+    model_config_root: str | None = None,
+    model_config_rule_id: str | None = None,
     prompt_format: str | None = None,
     raw_metadata: bytes | None = None,
     raw_metadata_codec: str | None = None,
@@ -622,11 +671,13 @@ def replace_prompt(
         """
         INSERT INTO image_prompts (
             image_id, prompt, metadata_source, prompt_indexed_at, prompt_error,
-            model_type, model_hash, model_version, prompt_format, raw_metadata, raw_metadata_codec,
+            model_type, model_hash, model_identity, model_version,
+            configured_model, model_config_root, model_config_rule_id,
+            prompt_format, raw_metadata, raw_metadata_codec,
             parser_version, classification_root, model_marker_path, prompt_status,
             classification_status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(image_id) DO UPDATE SET
             prompt = excluded.prompt,
             metadata_source = excluded.metadata_source,
@@ -634,7 +685,11 @@ def replace_prompt(
             prompt_error = excluded.prompt_error,
             model_type = excluded.model_type,
             model_hash = excluded.model_hash,
+            model_identity = excluded.model_identity,
             model_version = excluded.model_version,
+            configured_model = excluded.configured_model,
+            model_config_root = excluded.model_config_root,
+            model_config_rule_id = excluded.model_config_rule_id,
             prompt_format = excluded.prompt_format,
             raw_metadata = excluded.raw_metadata,
             raw_metadata_codec = excluded.raw_metadata_codec,
@@ -652,7 +707,11 @@ def replace_prompt(
             prompt_error,
             model_type,
             model_hash,
+            model_identity,
             model_version,
+            configured_model,
+            model_config_root,
+            model_config_rule_id,
             prompt_format,
             raw_metadata,
             raw_metadata_codec,

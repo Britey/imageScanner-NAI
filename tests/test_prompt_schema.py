@@ -88,7 +88,11 @@ class PromptSchemaTests(unittest.TestCase):
             {
                 "model_type",
                 "model_hash",
+                "model_identity",
                 "model_version",
+                "configured_model",
+                "model_config_root",
+                "model_config_rule_id",
                 "prompt_format",
                 "raw_metadata",
                 "raw_metadata_codec",
@@ -127,7 +131,11 @@ class PromptSchemaTests(unittest.TestCase):
             tags=[("blue hair", "blue hair"), ("@model:abc123", "@model:abc123", "model_hash")],
             model_type="nai4",
             model_hash="abc123",
+            model_identity="NovelAI Diffusion V4.5 ABC123",
             model_version="4.5",
+            configured_model="nai-custom",
+            model_config_root="C:/images",
+            model_config_rule_id="rule-id",
             prompt_format="novelai",
             raw_metadata=raw,
             raw_metadata_codec=codec,
@@ -141,6 +149,8 @@ class PromptSchemaTests(unittest.TestCase):
         prompt = self.conn.execute("SELECT * FROM image_prompts").fetchone()
         self.assertEqual(prompt["model_type"], "nai4")
         self.assertEqual(prompt["model_hash"], "abc123")
+        self.assertEqual(prompt["model_identity"], "NovelAI Diffusion V4.5 ABC123")
+        self.assertEqual(prompt["configured_model"], "nai-custom")
         self.assertEqual(prompt["model_version"], "4.5")
         self.assertEqual(prompt["parser_version"], 2)
         self.assertEqual(
@@ -154,6 +164,30 @@ class PromptSchemaTests(unittest.TestCase):
             [(row["tag"], row["tag_kind"]) for row in tags],
             [("blue hair", "prompt"), ("@model:abc123", "model_hash")],
         )
+
+    def test_reopening_database_does_not_overwrite_configured_category(self) -> None:
+        init_db(self.conn)
+        self.add_image()
+        replace_prompt(
+            self.conn,
+            1,
+            prompt="cat",
+            metadata_source="test",
+            prompt_error=None,
+            indexed_at="now",
+            tags=[("@model:sd", "@model:sd", "model_config")],
+            model_type="sd",
+            model_hash="sd",
+            configured_model="sd",
+        )
+        self.conn.commit()
+
+        init_db(self.conn)
+
+        row = self.conn.execute(
+            "SELECT tag_kind FROM prompt_tags WHERE image_id = 1 AND tag_norm = '@model:sd'"
+        ).fetchone()
+        self.assertEqual(row["tag_kind"], "model_config")
 
     def test_raw_metadata_codec_is_bounded(self) -> None:
         raw, codec = encode_prompt_metadata("same prompt " * 100)

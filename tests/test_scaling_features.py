@@ -16,7 +16,7 @@ from imgdupe.db import (
     is_crop_index_ready,
     set_crop_index_state,
 )
-from imgdupe.query import query_image, query_prompt_tags
+from imgdupe.query import PromptSearchResult, query_image, query_prompt_tags
 from imgdupe.web import (
     PromptSearchOptions,
     WebState,
@@ -130,6 +130,11 @@ class ThumbnailCacheTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_default_scan_parallelism_is_four(self) -> None:
+        from imgdupe.config import ScanConfig
+
+        self.assertEqual(ScanConfig().workers, 4)
+
     def test_settings_allow_unbounded_user_selected_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.ini"
@@ -194,6 +199,59 @@ class SettingsTests(unittest.TestCase):
             self.assertIn("activeSuggestion + 1", page)
             conn.close()
 
+    def test_boolean_search_help_pipe_tokenization_and_dynamic_models_render(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            init_db(conn)
+            conn.execute(
+                """
+                INSERT INTO images (id, path, size_bytes, mtime_ns, indexed_at)
+                VALUES (1, 'one.png', 1, 1, 'now')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO image_prompts (
+                    image_id, prompt_indexed_at, model_type, configured_model
+                ) VALUES (1, 'now', 'sd', '自定义 model')
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
+                VALUES (1, ?, ?, ?, ?)
+                """,
+                [
+                    ("@model:sd", "@model:sd", 0, "model_type"),
+                    ("@model:自定义 model", "@model:自定义 model", 1, "model_config"),
+                ],
+            )
+            state = WebState(
+                conn=conn,
+                db_path=root / "images.sqlite",
+                limit=100,
+                min_score=55,
+                thumbnail_size=256,
+                work_dir=root / "work",
+                thumbs_dir=root / "thumbs",
+                thumbnail_cache_limit=1000,
+                disable_advanced_options=False,
+            )
+
+            page = _index_page(state, "en")
+
+            self.assertIn("Comma means AND; | means OR", page)
+            self.assertIn('[\",\", \"，\", \"、\", \";\", \"；\", \"|\", \"｜\"', page)
+            self.assertIn('value="自定义 model"', page)
+            self.assertNotIn('value="sd"', page)
+            self.assertIn('name="match_mode" value="all"', page)
+            self.assertIn("同一提示词仅显示一次", _index_page(state, "zh"))
+            self.assertIn('class="configured-rescan-form"', page)
+            self.assertIn(".configured-rescan-form { display: block;", page)
+            conn.close()
+
 
 class SingleInstanceTests(unittest.TestCase):
     def test_second_lock_is_refused_until_first_releases(self) -> None:
@@ -235,15 +293,36 @@ class PromptPaginationTests(unittest.TestCase):
     def test_prompt_model_label_includes_hash_and_nai45_variant(self) -> None:
         self.assertEqual(
             _prompt_model_label(
-                {"model_type": "nai4", "model_version": "4.5", "model_hash": "4bde2a90"}
+                {
+                    "model_type": "nai4",
+                    "model_version": "4.5",
+                    "model_hash": "4bde2a90",
+                    "configured_model": None,
+                }
             ),
             "NAI4 (4.5, 4bde2a90)",
         )
         self.assertEqual(
             _prompt_model_label(
-                {"model_type": "sd", "model_version": None, "model_hash": "516047db97"}
+                {
+                    "model_type": "sd",
+                    "model_version": None,
+                    "model_hash": "516047db97",
+                    "configured_model": None,
+                }
             ),
             "SD (516047db97)",
+        )
+        self.assertEqual(
+            _prompt_model_label(
+                {
+                    "model_type": "sd",
+                    "model_version": None,
+                    "model_hash": "caa8fa5606",
+                    "configured_model": "noob",
+                }
+            ),
+            "NOOB (caa8fa5606)",
         )
 
     def test_pager_preserves_search_state(self) -> None:
@@ -266,6 +345,40 @@ class PromptPaginationTests(unittest.TestCase):
         self.assertIn('name="offset" value="200"', page)
         self.assertIn('name="unique_prompts" value="1"', page)
         self.assertIn('name="negative_tags" value="text"', page)
+
+    def test_hidden_model_tags_are_not_rendered_or_highlighted_as_prompt_text(self) -> None:
+        options = PromptSearchOptions(
+            tags="cat",
+            negative_tags="",
+            match_mode="all",
+            sort_by="created_desc",
+            limit=100,
+            offset=0,
+            lang="en",
+            unique_prompts=False,
+        )
+        result = PromptSearchResult(
+            image_row={
+                "id": 1,
+                "path": str(Path("image.png").resolve()),
+                "mtime_ns": 1,
+                "size_bytes": 1,
+                "width": 1,
+                "height": 1,
+                "model_type": "sd",
+                "model_version": None,
+                "model_hash": "abc123",
+                "configured_model": None,
+            },
+            prompt="cat",
+            matched_count=1,
+            matched_tags=("cat", "@model:abc123"),
+        )
+
+        page = _prompt_results_page([result], options, has_next=False)
+
+        self.assertNotIn("@model:abc123", page)
+        self.assertIn("<mark>cat</mark>", page)
 
     def test_adjacent_query_pages_do_not_overlap(self) -> None:
         conn = sqlite3.connect(":memory:")

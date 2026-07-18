@@ -18,6 +18,7 @@ venv/
 env/
 
 # Local databases and scan outputs
+model_paths.ini
 *.sqlite
 *.sqlite-*
 *.sqlite3

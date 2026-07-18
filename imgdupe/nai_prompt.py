@@ -24,7 +24,7 @@ NOVELAI_RAW_FIELDS = (
     "v4_negative_prompt",
     "actual_prompts",
 )
-PROMPT_PARSER_VERSION = 3
+PROMPT_PARSER_VERSION = 4
 
 
 class PromptMetadataTooLarge(ValueError):
@@ -45,6 +45,9 @@ NEGATIVE_PATTERN = re.compile(r"(?im)^\s*Negative\s+prompt\s*[:：﹕]\s*")
 MODEL_HASH_PATTERN = re.compile(
     r"(?i)(?:^|[,，]\s*)Model\s+hash\s*[:：﹕]\s*([0-9a-f]+)(?=\s*(?:[,，]|$))"
 )
+MODEL_NAME_PATTERN = re.compile(
+    r"(?i)(?:^|[,，]\s*)Model\s*[:：﹕]\s*(.*?)(?=\s*[,，]\s*[A-Za-z][^,，]*[:：﹕]|$)"
+)
 SOURCE_HASH_PATTERN = re.compile(r"(?i)([0-9a-f]{6,})\s*$")
 NUMBER_PATTERN = re.compile(r"^[+\-]?\d+(?:\.\d+)?$")
 TRAILING_MIX_WEIGHT = re.compile(r"(?s)^(.*?):([+\-]?\d+(?:\.\d+)?)\s*$")
@@ -62,6 +65,7 @@ NUMERIC_TRANSLATION = str.maketrans(
 # Private-use sentinels protect escaped punctuation while structural syntax is parsed.
 ESCAPED = {character: chr(0xE000 + index) for index, character in enumerate("()[]{}|,;<>\\")}
 UNESCAPED = {value: key for key, value in ESCAPED.items()}
+OTHER_MODEL_IDENTITY = "其他模型 other_model"
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,8 @@ class PromptResult:
     tags: tuple[str, ...] = ()
     raw_metadata: str | None = None
     model_version: str | None = None
+    model_identity: str | None = None
+    model_name: str | None = None
 
 
 def extract_nai_prompt(path: Path, *, stealth_fallback: bool = True) -> PromptResult:
@@ -108,10 +114,33 @@ def parse_text_metadata(values: dict[str, str]) -> PromptResult:
     if isinstance(software, str) and software.strip().casefold() == "novelai":
         comment = _get_ci(values, "Comment")
         if not isinstance(comment, str) or not comment.strip():
-            return PromptResult(None, "text:Comment", "no_prompt", "novelai", "nai3")
+            source_value = _get_ci(values, "Source")
+            source_identity = source_value.strip() if isinstance(source_value, str) and source_value.strip() else OTHER_MODEL_IDENTITY
+            return PromptResult(
+                None, "text:Comment",
+                "no_prompt" if _model_hash_from_source(source_value) else "missing_model_hash",
+                "novelai", "nai4" if _is_nai4({}, source_value) else "nai3",
+                model_hash=_model_hash_from_source(source_value),
+                model_identity=source_identity,
+                model_name=source_identity,
+            )
         metadata = parse_jsonish_text(comment)
         if metadata is None:
-            return PromptResult(None, "text:Comment", "malformed_metadata", "novelai", "nai3", raw_metadata=comment)
+            source_value = _get_ci(values, "Source")
+            source_identity = (
+                source_value.strip()
+                if isinstance(source_value, str) and source_value.strip()
+                else OTHER_MODEL_IDENTITY
+            )
+            return PromptResult(
+                None, "text:Comment", "malformed_metadata", "novelai",
+                "nai4" if _is_nai4({}, source_value) else "nai3",
+                model_hash=_model_hash_from_source(source_value),
+                raw_metadata=comment,
+                model_version=_novelai_model_version(source_value),
+                model_identity=source_identity,
+                model_name=source_identity,
+            )
         source_value = _get_ci(values, "Source")
         if source_value and "Source" not in metadata:
             metadata["Source"] = source_value
@@ -121,17 +150,16 @@ def parse_text_metadata(values: dict[str, str]) -> PromptResult:
     if isinstance(parameters, str) and parameters.strip():
         return parse_a1111_parameters(parameters, metadata_source="text:parameters")
 
-    # Old/stealth exports may expose the NovelAI JSON without Software.
-    for key in ("Comment", "Description", "prompt"):
+    # Without an authoritative NovelAI Software field, prompt text is SD-family.
+    for key in ("Description", "prompt"):
         value = _get_ci(values, key)
         if not isinstance(value, str) or not value.strip():
             continue
-        parsed = parse_jsonish_text(value)
-        if parsed is not None:
-            return parse_novelai_metadata(parsed, metadata_source=f"text:{key}", raw_metadata=value)
-        if key.casefold() in {"description", "prompt"}:
-            tags = tuple(split_prompt_tags(value))
-            return _result_from_tags(tags, f"text:{key}", "novelai", "nai3", None, value)
+        tags = tuple(split_prompt_tags(value))
+        return _result_from_tags(
+            tags, f"text:{key}", "a1111", "sd", None, value,
+            model_identity=OTHER_MODEL_IDENTITY,
+        )
     return PromptResult(None, None, "no_metadata", model_type="sd")
 
 
@@ -142,6 +170,12 @@ def parse_a1111_parameters(parameters: str, *, metadata_source: str = "parameter
     prompt_part = normalized[:settings_match.start()] if settings_match else normalized
     hash_match = MODEL_HASH_PATTERN.search(settings)
     model_hash = hash_match.group(1).casefold() if hash_match else None
+    model_match = MODEL_NAME_PATTERN.search(settings)
+    model_name = (
+        model_match.group(1).strip()
+        if model_match and model_match.group(1).strip()
+        else OTHER_MODEL_IDENTITY
+    )
 
     negative_match = NEGATIVE_PATTERN.search(prompt_part)
     positive = prompt_part[:negative_match.start()] if negative_match else prompt_part
@@ -152,7 +186,7 @@ def parse_a1111_parameters(parameters: str, *, metadata_source: str = "parameter
     tags = tuple(split_prompt_tags(_restore_escapes(expanded)))
     return _result_from_tags(
         tags, metadata_source, "a1111", "sd", model_hash, parameters,
-        error=nesting_error,
+        error=nesting_error, model_identity=model_name,
     )
 
 
@@ -161,6 +195,11 @@ def parse_novelai_metadata(
 ) -> PromptResult:
     source = metadata.get("Source") or metadata.get("source")
     model_hash = _model_hash_from_source(source)
+    model_identity = (
+        source.strip()
+        if isinstance(source, str) and source.strip()
+        else OTHER_MODEL_IDENTITY
+    )
     is_v4 = _is_nai4(metadata, source)
     model_type = "nai4" if is_v4 else "nai3"
     model_version = _novelai_model_version(source) if is_v4 else None
@@ -197,12 +236,14 @@ def parse_novelai_metadata(
     )
     if not all_tags and not texts:
         return PromptResult(
-            None, metadata_source, "no_prompt", "novelai", model_type,
+            None, metadata_source, "no_prompt" if model_hash else "missing_model_hash", "novelai", model_type,
             model_hash, raw_metadata=raw_metadata, model_version=model_version,
+            model_identity=model_identity, model_name=model_identity,
         )
     return _result_from_tags(
         tuple(all_tags), metadata_source, "novelai", model_type, model_hash,
         raw_metadata, error=nesting_error, model_version=model_version,
+        model_identity=model_identity,
     )
 
 
@@ -356,8 +397,6 @@ def _caption_texts(value: Any) -> list[str]:
 
 
 def _is_nai4(metadata: dict[str, Any], source: Any) -> bool:
-    if isinstance(metadata.get("v4_prompt"), dict):
-        return True
     return isinstance(source, str) and bool(re.search(r"(?i)\bV4(?:\.5)?\b", source))
 
 
@@ -379,13 +418,21 @@ def _result_from_tags(
     tags: Iterable[str], source: str, prompt_format: str, model_type: str,
     model_hash: str | None, raw_metadata: str | None, *, error: str | None = None,
     model_version: str | None = None,
+    model_identity: str,
 ) -> PromptResult:
     items = list(tags)
     prompt = ", ".join(items) if items else None
-    status = error if error is not None else (None if items else "no_prompt")
+    if error is not None:
+        status = error
+    elif model_hash is None:
+        status = "missing_model_hash"
+    elif not items:
+        status = "no_prompt"
+    else:
+        status = None
     return PromptResult(
         prompt, source, status, prompt_format, model_type, model_hash,
-        tuple(items), raw_metadata, model_version,
+        tuple(items), raw_metadata, model_version, model_identity, model_identity,
     )
 
 

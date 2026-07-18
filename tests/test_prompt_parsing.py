@@ -8,6 +8,7 @@ import zlib
 from pathlib import Path
 
 from imgdupe.nai_prompt import (
+    OTHER_MODEL_IDENTITY,
     MAX_TEXT_CHUNK_BYTES,
     PromptMetadataTooLarge,
     _gzip_decompress_bounded,
@@ -125,6 +126,20 @@ def test_novelai_software_detection_requires_valid_comment() -> None:
     assert malformed.error == "malformed_metadata"
 
 
+def test_malformed_novelai_comment_still_preserves_source_identity() -> None:
+    result = parse_text_metadata({
+        "Software": "NovelAI",
+        "Source": "NovelAI Diffusion V4.5 37442FCA",
+        "Comment": "{not valid json",
+    })
+
+    assert result.error == "malformed_metadata"
+    assert result.model_type == "nai4"
+    assert result.model_version == "4.5"
+    assert result.model_hash == "37442fca"
+    assert result.model_identity == "NovelAI Diffusion V4.5 37442FCA"
+
+
 def test_nai3_prompt_and_source_hash() -> None:
     result = parse_text_metadata({
         "Software": "NovelAI",
@@ -193,6 +208,73 @@ def test_fullwidth_weight_syntax_and_cjk_preservation() -> None:
 def test_tag_normalization_preserves_display_but_unifies_underscore() -> None:
     assert split_prompt_tags("blue_hair, blue hair") == ["blue_hair"]
     assert normalize_prompt_tag("Blue_Hair") == "blue hair"
+
+
+def test_structured_novelai_generator_identity_uses_full_source() -> None:
+    result = parse_text_metadata({
+        "Software": "NovelAI",
+        "Source": "NovelAI Diffusion V4.5 4BDE2A90",
+        "Comment": '{"prompt":"cat"}',
+    })
+    assert result.model_type == "nai4"
+    assert result.model_identity == "NovelAI Diffusion V4.5 4BDE2A90"
+    assert result.model_name == result.model_identity
+    assert result.model_hash == "4bde2a90"
+    assert result.error is None
+
+
+def test_novelai_source_is_authoritative_for_generation() -> None:
+    result = parse_text_metadata({
+        "Software": "NovelAI",
+        "Source": "Stable Diffusion XL C1E1DE52",
+        "Comment": '{"prompt":"cat","v4_prompt":{"caption":{"base_caption":"v4 text"}}}',
+    })
+    assert result.model_type == "nai3"
+    assert result.tags == ("cat",)
+
+
+def test_non_novelai_json_comment_does_not_claim_novelai() -> None:
+    result = parse_text_metadata({"Comment": '{"prompt":"cat"}'})
+    assert result.error == "no_metadata"
+    assert result.model_type == "sd"
+    assert result.model_identity is None
+
+
+def test_a1111_model_name_and_hash_are_extracted() -> None:
+    result = parse_a1111_parameters(
+        "cat\nSteps: 20, Sampler: Euler, Model hash: ABCDEF12, "
+        "Model: blended_model-v2, Clip skip: 2"
+    )
+    assert result.model_identity == "blended_model-v2"
+    assert result.model_name == "blended_model-v2"
+    assert result.model_hash == "abcdef12"
+    assert result.error is None
+
+
+def test_prompt_metadata_without_name_uses_bilingual_other_model_identity() -> None:
+    result = parse_a1111_parameters("cat\nSteps: 20, Sampler: Euler, Model hash: ABCDEF12")
+    assert result.model_identity == OTHER_MODEL_IDENTITY
+    assert result.model_name == OTHER_MODEL_IDENTITY
+
+
+def test_prompt_metadata_without_hash_returns_distinct_error_but_keeps_tags() -> None:
+    sd = parse_a1111_parameters("cat\nSteps: 20, Sampler: Euler, Model: example")
+    nai = parse_text_metadata({
+        "Software": "NovelAI",
+        "Source": "NovelAI Diffusion V4.5",
+        "Comment": '{"prompt":"dog"}',
+    })
+    assert sd.tags == ("cat",)
+    assert sd.error == "missing_model_hash"
+    assert nai.tags == ("dog",)
+    assert nai.error == "missing_model_hash"
+
+
+def test_prompt_metadata_without_name_or_hash_uses_other_and_missing_hash() -> None:
+    result = parse_text_metadata({"Description": "cat"})
+    assert result.model_type == "sd"
+    assert result.model_identity == OTHER_MODEL_IDENTITY
+    assert result.error == "missing_model_hash"
 
 
 def load_tests(_loader, _tests, _pattern):

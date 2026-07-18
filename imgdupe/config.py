@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass
 
 
@@ -7,7 +6,9 @@ class ScanConfig:
     min_width: int = 32
     min_height: int = 32
     batch_size: int = 500
-    workers: int = max(1, min((os.cpu_count() or 2) - 1, 8))
+    # Keep enough parallelism to overlap decoding and perceptual hashing without
+    # flooding a mechanical disk with the larger queues used by older builds.
+    workers: int = 4
     crop_index: bool = False
     prompt_index: bool = True
     stealth_prompt: bool = False

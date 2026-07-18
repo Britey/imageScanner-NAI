@@ -24,6 +24,13 @@ from PIL import Image, ImageOps
 
 from .config import ScanConfig
 from .db import checkpoint_database, connect, init_db, is_crop_index_ready
+from .model_paths import (
+    DEFAULT_MODEL_PATHS_PATH,
+    build_config,
+    load_model_paths,
+    make_rule,
+    save_model_paths,
+)
 from .query import PromptSearchResult, query_image, query_prompt_tags
 from .scan import ScanStats, scan_roots
 from .settings import AppSettings, load_settings
@@ -90,6 +97,7 @@ TRANSLATIONS = {
         "image": "Image",
         "prompt_tags": "Prompt Tags",
         "prompt_placeholder": "1girl, blue eyes, smile",
+        "boolean_search_help": "Comma means AND; | means OR within a group. Example: a | b, c",
         "model_type": "Model category",
         "model_all": "All models",
         "negative_prompt_tags": "Negative Tags",
@@ -169,6 +177,11 @@ TRANSLATIONS = {
         "read_stealth_prompts": "Read stealth prompts",
         "delete_missing": "Delete records for missing files",
         "confirm_update_index": "Confirm update index",
+        "rescan_configured": "Rescan all configured folders",
+        "classify_folders": "Classify folders",
+        "classify_help": "These folders have no configured model label. Enter any label to store in model_paths.ini before scanning.",
+        "model_label": "Model label",
+        "save_and_scan": "Save labels and scan",
     },
     "zh": {
         "app_title": "图片搜索",
@@ -182,6 +195,7 @@ TRANSLATIONS = {
         "image": "图片",
         "prompt_tags": "提示词标签",
         "prompt_placeholder": "1girl, blue eyes, smile",
+        "boolean_search_help": "逗号表示 AND；| 表示同一组内的 OR。例如：a | b, c",
         "model_type": "模型分类",
         "model_all": "所有模型",
         "negative_prompt_tags": "排除标签",
@@ -197,7 +211,7 @@ TRANSLATIONS = {
         "all_tags": "全部标签",
         "any_tag": "任一标签",
         "autocomplete": "自动补全",
-        "unique_prompts": "仅显示唯一提示词",
+        "unique_prompts": "同一提示词仅显示一次",
         "excluding_tags": "排除 {tags}",
         "show_in_folder": "在文件夹中显示",
         "folder_opened": "已打开文件夹",
@@ -261,6 +275,11 @@ TRANSLATIONS = {
         "read_stealth_prompts": "读取隐写提示词",
         "delete_missing": "删除已不存在的记录",
         "confirm_update_index": "确认更新索引",
+        "rescan_configured": "一键重扫所有已配置目录",
+        "classify_folders": "分类目录",
+        "classify_help": "以下目录尚未配置模型标签。输入任意标签后会保存到 model_paths.ini，再开始扫描。",
+        "model_label": "模型标签",
+        "save_and_scan": "保存标签并扫描",
     },
 }
 
@@ -480,8 +499,76 @@ def _make_handler(state: WebState):
             if parsed.path == "/scan":
                 try:
                     request = self._save_scan_request()
-                    state.start_scan(request)
+                    unconfigured = _unconfigured_scan_roots(request.roots)
+                    if unconfigured:
+                        self._send_html(_model_path_prompt_page(request, unconfigured))
+                        return
+                    if not state.start_scan(request):
+                        raise RuntimeError("an index update is already running")
                     self._redirect(f"/?lang={request.lang}#scan-index")
+                except Exception as exc:
+                    self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/scan-configure":
+                try:
+                    fields = self._read_form_fields("scan classification")
+                    request = _scan_request_from_fields(fields)
+                    if state.get_scan_status().state == "running":
+                        raise RuntimeError("an index update is already running")
+                    unconfigured = _unconfigured_scan_roots(request.roots)
+                    config = load_model_paths(DEFAULT_MODEL_PATHS_PATH)
+                    if config.issues:
+                        raise ValueError("model_paths.ini contains invalid rules; fix them before adding labels")
+                    additions = []
+                    expected = {str(root).casefold(): root for root in unconfigured}
+                    submitted: set[str] = set()
+                    target_keys = sorted(
+                        (key for key in fields if key.startswith("model_target_")),
+                        key=lambda key: int(key.removeprefix("model_target_")),
+                    )
+                    for target_key in target_keys:
+                        index = target_key.removeprefix("model_target_")
+                        target = _configured_target(Path(fields[target_key]))
+                        canonical_key = str(target).casefold()
+                        if canonical_key not in expected or canonical_key in submitted:
+                            raise ValueError("the folder classification request is stale or invalid")
+                        submitted.add(canonical_key)
+                        additions.append(make_rule(target, fields.get(f"model_label_{index}", "")))
+                    if submitted != set(expected):
+                        raise ValueError("the folder classification request is incomplete or stale")
+                    if additions:
+                        config = build_config((*config.rules, *additions))
+                        save_model_paths(DEFAULT_MODEL_PATHS_PATH, config)
+                    if not state.start_scan(request):
+                        raise RuntimeError("an index update is already running")
+                    self._redirect(f"/?lang={request.lang}#scan-index")
+                except Exception as exc:
+                    self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/scan-configured":
+                try:
+                    fields = self._read_form_fields("configured rescan")
+                    lang = _normalize_lang(fields.get("lang"))
+                    config = load_model_paths(DEFAULT_MODEL_PATHS_PATH)
+                    if config.issues:
+                        raise ValueError("model_paths.ini contains invalid rules; fix them before rescanning")
+                    roots = tuple(root for root in config.deduplicated_rescan_roots() if root.exists())
+                    if not roots:
+                        raise ValueError("no configured folders are currently available")
+                    defaults = ScanConfig()
+                    request = ScanRequest(
+                        roots=roots,
+                        workers=defaults.workers,
+                        crop_index=False,
+                        prompt_index=True,
+                        stealth_prompt=False,
+                        reindex_prompts=False,
+                        delete_missing=False,
+                        lang=lang,
+                    )
+                    if not state.start_scan(request):
+                        raise RuntimeError("an index update is already running")
+                    self._redirect(f"/?lang={lang}#scan-index")
                 except Exception as exc:
                     self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
                 return
@@ -522,37 +609,18 @@ def _make_handler(state: WebState):
                     self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
 
         def _save_scan_request(self) -> ScanRequest:
+            return _scan_request_from_fields(self._read_form_fields("scan request"))
+
+        def _read_form_fields(self, description: str) -> dict[str, str]:
             content_type = self.headers.get("Content-Type", "")
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length).decode("utf-8", errors="replace")
             if not content_type.startswith("application/x-www-form-urlencoded"):
-                raise ValueError("expected form-urlencoded scan request")
-            fields = {
+                raise ValueError(f"expected form-urlencoded {description}")
+            return {
                 key: values[-1]
                 for key, values in urllib.parse.parse_qs(body, keep_blank_values=True).items()
             }
-            roots = tuple(
-                Path(line.strip()).expanduser()
-                for line in fields.get("roots", "").splitlines()
-                if line.strip()
-            )
-            if not roots:
-                raise ValueError("enter at least one folder or image path to index")
-            missing_roots = [str(root) for root in roots if not root.exists()]
-            if missing_roots:
-                raise ValueError(f"path does not exist: {missing_roots[0]}")
-            default_config = ScanConfig()
-            workers = max(1, min(_int_field(fields, "workers", default_config.workers), 64))
-            return ScanRequest(
-                roots=roots,
-                workers=workers,
-                crop_index=fields.get("crop_index") == "1",
-                prompt_index=fields.get("prompt_index") == "1",
-                stealth_prompt=fields.get("stealth_prompt") == "1",
-                reindex_prompts=fields.get("reindex_prompts") == "1",
-                delete_missing=fields.get("delete_missing") == "1",
-                lang=_normalize_lang(fields.get("lang")),
-            )
 
         def _save_prompt_search(self) -> PromptSearchOptions:
             content_type = self.headers.get("Content-Type", "")
@@ -577,11 +645,7 @@ def _make_handler(state: WebState):
                 offset=max(0, _int_field(fields, "offset", 0)),
                 lang=_normalize_lang(fields.get("lang")),
                 unique_prompts=fields.get("unique_prompts") == "1",
-                model_type=(
-                    fields.get("model_type", "all")
-                    if fields.get("model_type", "all") in {"all", "sd", "noob", "nai3", "nai4"}
-                    else "all"
-                ),
+                model_type=fields.get("model_type", "all").strip()[:500] or "all",
             )
 
         def _show_in_folder(self, query: str, lang: str) -> None:
@@ -706,6 +770,128 @@ def _make_handler(state: WebState):
     return Handler
 
 
+def _scan_request_from_fields(fields: dict[str, str]) -> ScanRequest:
+    roots = tuple(
+        Path(line.strip()).expanduser()
+        for line in fields.get("roots", "").splitlines()
+        if line.strip()
+    )
+    if not roots:
+        raise ValueError("enter at least one folder or image path to index")
+    missing_roots = [str(root) for root in roots if not root.exists()]
+    if missing_roots:
+        raise ValueError(f"path does not exist: {missing_roots[0]}")
+    default_config = ScanConfig()
+    workers = max(1, min(_int_field(fields, "workers", default_config.workers), 64))
+    return ScanRequest(
+        roots=roots,
+        workers=workers,
+        crop_index=fields.get("crop_index") == "1",
+        prompt_index=fields.get("prompt_index") == "1",
+        stealth_prompt=fields.get("stealth_prompt") == "1",
+        reindex_prompts=fields.get("reindex_prompts") == "1",
+        delete_missing=fields.get("delete_missing") == "1",
+        lang=_normalize_lang(fields.get("lang")),
+    )
+
+
+def _configured_target(root: Path) -> Path:
+    canonical = root.resolve(strict=False)
+    return canonical if canonical.is_dir() else canonical.parent
+
+
+def _unconfigured_scan_roots(roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    config = load_model_paths(DEFAULT_MODEL_PATHS_PATH)
+    if config.issues:
+        details = "; ".join(f"{issue.section}: {issue.message}" for issue in config.issues)
+        raise ValueError(f"invalid model_paths.ini: {details}")
+    missing: list[Path] = []
+    seen: set[str] = set()
+    for supplied in roots:
+        target = _configured_target(supplied)
+        key = str(target).casefold()
+        if key in seen or config.resolve(target) is not None:
+            continue
+        seen.add(key)
+        missing.append(target)
+    return tuple(missing)
+
+
+def _scan_request_hidden_fields(request: ScanRequest) -> str:
+    values = {
+        "roots": "\n".join(str(root) for root in request.roots),
+        "workers": str(request.workers),
+        "lang": request.lang,
+    }
+    for name in ("crop_index", "prompt_index", "stealth_prompt", "reindex_prompts", "delete_missing"):
+        if getattr(request, name):
+            values[name] = "1"
+    return "".join(
+        f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
+        for name, value in values.items()
+    )
+
+
+def _model_path_prompt_page(request: ScanRequest, roots: tuple[Path, ...]) -> str:
+    text = _text(request.lang)
+    rows = []
+    for index, root in enumerate(roots):
+        rows.append(
+            f"""
+            <label class="prompt-input-label">
+              <span class="path">{html.escape(str(root))}</span>
+              <span>{text['model_label']}</span>
+              <input type="hidden" name="model_target_{index}" value="{html.escape(str(root), quote=True)}">
+              <input type="text" name="model_label_{index}" required autocomplete="off">
+            </label>
+            """
+        )
+    body = f"""
+    <nav><a href="/?lang={request.lang}#scan-index">{text['new_search']}</a></nav>
+    <section class="scan-panel">
+      <h1>{text['classify_folders']}</h1>
+      <p>{text['classify_help']}</p>
+      <form method="post" action="/scan-configure">
+        {_scan_request_hidden_fields(request)}
+        {''.join(rows)}
+        <button type="submit">{text['save_and_scan']}</button>
+      </form>
+    </section>
+    """
+    return _page(text["classify_folders"], body, lang=request.lang)
+
+
+def _model_filter_options(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        """
+        SELECT MIN(pt.tag) AS tag, pt.tag_norm
+        FROM prompt_tags pt
+        JOIN image_prompts ip ON ip.image_id = pt.image_id
+        WHERE (
+                pt.tag_kind = 'model_config'
+                OR (pt.tag_kind = 'model_type' AND ip.configured_model IS NULL)
+              )
+          AND pt.tag_norm LIKE '@model:%'
+        GROUP BY pt.tag_norm
+        ORDER BY CASE tag_norm
+            WHEN '@model:sd' THEN 0
+            WHEN '@model:nai3' THEN 1
+            WHEN '@model:nai4' THEN 2
+            WHEN '@model:no_metadata' THEN 4
+            ELSE 3
+        END, tag_norm
+        """
+    ).fetchall()
+    options: list[tuple[str, str]] = []
+    for row in rows:
+        tag = str(row["tag"] or "")
+        if not tag.casefold().startswith("@model:"):
+            continue
+        label = tag[len("@model:"):]
+        options.append((label, label.upper() if label.casefold() in {"sd", "nai3", "nai4"} else label))
+    return options
+
+
 def _scan_panel(state: WebState, lang: str) -> str:
     text = _text(lang)
     status = state.get_scan_status()
@@ -795,6 +981,10 @@ def _scan_panel(state: WebState, lang: str) -> str:
         {advanced_options}
         <button type="submit" {disabled}>{text["confirm_update_index"]}</button>
       </form>
+      <form method="post" action="/scan-configured" class="configured-rescan-form">
+        <input type="hidden" name="lang" value="{html.escape(lang, quote=True)}">
+        <button type="submit" {disabled}>{text["rescan_configured"]}</button>
+      </form>
     </section>
     {refresh_script}
     """
@@ -804,6 +994,11 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
     text = _text(lang)
     stats = _stats(state.conn)
     query_values = urllib.parse.parse_qs(query)
+    model_filter_options = _model_filter_options(state.conn)
+    model_filter_html = "".join(
+        f'<option value="{html.escape(value, quote=True)}">{html.escape(label)}</option>'
+        for value, label in model_filter_options
+    )
     cache_notice = ""
     if "thumbnail_cache_cleared" in query_values:
         try:
@@ -891,6 +1086,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
       <form id="prompt-search" method="post" action="/prompt-search" class="prompt-form">
         <h2>{text['prompt_search']}</h2>
         <label class="prompt-input-label" for="prompt-tags-input">{text['prompt_tags']}</label>
+        <p class="muted">{text['boolean_search_help']}</p>
         <div class="prompt-input-wrap">
           <textarea id="prompt-tags-input" name="tags" rows="5" placeholder="{text['prompt_placeholder']}" autocomplete="off" spellcheck="false"></textarea>
           <div id="tag-suggestions" class="suggestions" hidden></div>
@@ -910,21 +1106,12 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         </label>
         <div class="controls prompt-controls">
           <input type="hidden" name="lang" value="{lang}">
-          <label>
-            {text['match_mode']}
-            <select name="match_mode">
-              <option value="all" selected>{text['all_tags']}</option>
-              <option value="any">{text['any_tag']}</option>
-            </select>
-          </label>
+          <input type="hidden" name="match_mode" value="all">
           <label>
             {text['model_type']}
             <select name="model_type">
               <option value="all" selected>{text['model_all']}</option>
-              <option value="sd">SD</option>
-              <option value="noob">Noob</option>
-              <option value="nai3">NAI3</option>
-              <option value="nai4">NAI4</option>
+              {model_filter_html}
             </select>
           </label>
           <label>
@@ -989,7 +1176,8 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         const value = inputElement.value;
         const caret = inputElement.selectionStart ?? value.length;
         const left = value.slice(0, caret);
-        const start = Math.max(left.lastIndexOf(","), left.lastIndexOf("，"), left.lastIndexOf("\\n")) + 1;
+        const operators = [",", "，", "、", ";", "；", "|", "｜", "\\n"];
+        const start = Math.max(...operators.map(operator => left.lastIndexOf(operator))) + 1;
         return {{ start, end: caret, token: value.slice(start, caret).trimStart() }};
       }};
       const hideSuggestions = suggestionsElement => {{
@@ -1018,7 +1206,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         const value = inputElement.value;
         const leading = value.slice(info.start, info.end).match(/^\\s*/)?.[0] || "";
         const after = value.slice(info.end);
-        const separator = after.startsWith(",") || after.startsWith("，") ? "" : ", ";
+        const separator = /^[,，、;；|｜]/.test(after) ? "" : ", ";
         const insert = leading + tag + separator;
         inputElement.value = value.slice(0, info.start) + insert + value.slice(info.end);
         const caret = info.start + insert.length;
@@ -1158,7 +1346,11 @@ def _prompt_results_page(
     cards = []
     for result in results:
         image_row = result.image_row
-        prompt_html = _highlight_prompt(result.prompt or "", result.matched_tags)
+        visible_matched_tags = tuple(
+            tag for tag in result.matched_tags
+            if not tag.strip().casefold().startswith("@model:")
+        )
+        prompt_html = _highlight_prompt(result.prompt or "", visible_matched_tags)
         prompt_button = (
             f"""
               <button class="prompt-toggle" type="button" data-expanded="false">
@@ -1175,7 +1367,7 @@ def _prompt_results_page(
                 <img src="/thumb/{int(image_row['id'])}.jpg?v={int(image_row['mtime_ns'])}-{int(image_row['size_bytes'])}" alt="" loading="lazy">
               </a>
               <div class="score">{result.matched_count}</div>
-              <div>{html.escape(', '.join(result.matched_tags))}</div>
+              <div>{html.escape(', '.join(visible_matched_tags))}</div>
               <div>{image_row['width']}x{image_row['height']} &middot; {human_size(image_row['size_bytes'])}</div>
               <div>{html.escape(_prompt_model_label(image_row))}</div>
               <a class="folder-link" href="/show-in-folder?id={int(image_row['id'])}&lang={options.lang}">{text['show_in_folder']}</a>
@@ -1263,7 +1455,8 @@ def _prompt_pager(options: PromptSearchOptions, has_next: bool) -> str:
 
 
 def _prompt_model_label(image_row: sqlite3.Row) -> str:
-    model_type = str(image_row["model_type"] or "sd").upper()
+    configured_model = str(image_row["configured_model"] or "").strip()
+    model_type = (configured_model or str(image_row["model_type"] or "sd")).upper()
     details: list[str] = []
     if model_type == "NAI4" and image_row["model_version"] == "4.5":
         details.append("4.5")
@@ -1312,10 +1505,18 @@ def _failures_page(state: WebState, lang: str) -> str:
     text = _text(lang)
     rows = state.conn.execute(
         """
-        SELECT path, decode_error
-        FROM images
-        WHERE decode_error IS NOT NULL
-        ORDER BY indexed_at DESC, path
+        SELECT i.path,
+               CASE
+                   WHEN i.decode_error IS NOT NULL AND ip.prompt_error IS NOT NULL
+                       THEN i.decode_error || '; prompt: ' || ip.prompt_error
+                   WHEN i.decode_error IS NOT NULL THEN i.decode_error
+                   ELSE 'prompt: ' || ip.prompt_error
+               END AS error
+        FROM images i
+        LEFT JOIN image_prompts ip ON ip.image_id = i.id
+        WHERE i.decode_error IS NOT NULL
+           OR (ip.prompt_error IS NOT NULL AND ip.prompt_error NOT IN ('no_metadata', 'no_prompt'))
+        ORDER BY i.indexed_at DESC, i.path
         LIMIT 500
         """
     ).fetchall()
@@ -1325,7 +1526,7 @@ def _failures_page(state: WebState, lang: str) -> str:
             f"""
             <tr>
               <td class="path">{html.escape(row['path'])}</td>
-              <td>{html.escape(row['decode_error'] or '')}</td>
+              <td>{html.escape(row['error'] or '')}</td>
             </tr>
             """
         )
@@ -1352,11 +1553,13 @@ def _tag_suggestions(state: WebState, query: str) -> list[dict[str, object]]:
         SELECT
             MIN(tag) AS tag,
             COUNT(*) AS count
-        FROM prompt_tags
-        WHERE tag_norm >= ?
-          AND tag_norm < ?
-        GROUP BY tag_norm
-        ORDER BY count DESC, tag_norm
+        FROM prompt_tags pt
+        JOIN image_prompts ip ON ip.image_id = pt.image_id
+        WHERE pt.tag_norm >= ?
+          AND pt.tag_norm < ?
+          AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)
+        GROUP BY pt.tag_norm
+        ORDER BY count DESC, pt.tag_norm
         LIMIT 5
         """,
         (prefix, _prefix_upper_bound(prefix)),
@@ -1399,6 +1602,7 @@ def _page(title: str, body: str, *, lang: str = "zh") -> str:
     .topbar {{ display: flex; justify-content: space-between; gap: 16px; align-items: start; margin-bottom: 16px; }}
     .toplinks {{ display: flex; flex-wrap: wrap; gap: 12px; justify-content: flex-end; }}
     .inline-form {{ display: inline; width: auto; }}
+    .configured-rescan-form {{ display: block; width: fit-content; margin-top: 12px; }}
     .link-button {{ background: transparent; color: #245b9f; padding: 0; text-decoration: underline; cursor: pointer; }}
     .notice {{ border: 1px solid #b7dfc2; border-radius: 6px; background: #effaf2; color: #236c3b; padding: 10px 12px; }}
     .muted {{ color: #52606d; word-break: break-all; }}
@@ -1654,9 +1858,13 @@ def _stats(conn: sqlite3.Connection) -> dict[str, int]:
         """
         SELECT
             COUNT(*) AS indexed,
-            SUM(CASE WHEN decode_error IS NULL AND missing_at IS NULL THEN 1 ELSE 0 END) AS ok,
-            SUM(CASE WHEN decode_error IS NOT NULL THEN 1 ELSE 0 END) AS failed
-        FROM images
+            SUM(CASE WHEN i.decode_error IS NULL AND i.missing_at IS NULL THEN 1 ELSE 0 END) AS ok,
+            SUM(CASE WHEN i.decode_error IS NOT NULL
+                          OR (ip.prompt_error IS NOT NULL
+                              AND ip.prompt_error NOT IN ('no_metadata', 'no_prompt'))
+                     THEN 1 ELSE 0 END) AS failed
+        FROM images i
+        LEFT JOIN image_prompts ip ON ip.image_id = i.id
         """
     ).fetchone()
     hashed = conn.execute("SELECT COUNT(*) AS count FROM hashes").fetchone()["count"]
@@ -1666,7 +1874,12 @@ def _stats(conn: sqlite3.Connection) -> dict[str, int]:
         "SELECT COUNT(*) AS count FROM image_prompts WHERE prompt IS NOT NULL"
     ).fetchone()["count"]
     unique_tags = conn.execute(
-        "SELECT COUNT(DISTINCT tag_norm) AS count FROM prompt_tags"
+        """
+        SELECT COUNT(DISTINCT pt.tag_norm) AS count
+        FROM prompt_tags pt
+        JOIN image_prompts ip ON ip.image_id = pt.image_id
+        WHERE NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)
+        """
     ).fetchone()["count"]
     return {
         "indexed": int(row["indexed"] or 0),

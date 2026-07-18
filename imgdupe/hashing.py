@@ -157,10 +157,11 @@ def compute_image_hashes(
     min_width: int = 32,
     min_height: int = 32,
     include_crop_regions: bool = False,
+    precomputed_sha256: bytes | None = None,
 ) -> tuple[dict[str, bytes], dict[str, int | str]]:
     img = load_normalized(path, min_width=min_width, min_height=min_height)
     hashes = {
-        "sha256": sha256_file(path),
+        "sha256": precomputed_sha256 if precomputed_sha256 is not None else sha256_file(path),
         "dhash256": imagehash_to_bytes(imagehash.dhash(img, hash_size=16)),
         "phash256": imagehash_to_bytes(imagehash.phash(img, hash_size=16)),
         "whash256": imagehash_to_bytes(imagehash.whash(img, hash_size=16)),

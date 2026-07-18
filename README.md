@@ -67,7 +67,7 @@ folder. A second launch shows a warning and exits before opening the database.
 Index a folder recursively:
 
 ```powershell
-imgdupe scan "E:\Images" --db images.sqlite --workers 16
+imgdupe scan "E:\Images" --db images.sqlite
 ```
 
 By default, scanning indexes positive prompt tags from NovelAI metadata and
@@ -85,19 +85,40 @@ LoRA directives, generation settings, and common CJK/IME punctuation are cleaned
 during indexing. Display tags preserve underscores, while search treats
 `sanoba_witch` and `sanoba witch` as equivalent.
 
-Model categories default to `sd`. NovelAI images are detected from
-`Software = NovelAI`; place a `.model_type` file containing `sd`, `noob`,
-`nai3`, or `nai4` in a folder to override that folder and its descendants. The
-closest marker wins. Available generation model hashes are searchable as
-`@model:<hash>` tags. Prompt-search results display the category and hash; when
-NovelAI metadata identifies V4.5, it is shown as `NAI4 (4.5, <hash>)` without
-creating a separate filtering category.
+NovelAI images are detected authoritatively from `Software = NovelAI`; their
+`Source` distinguishes NAI3 from NAI4. Other generation metadata is treated as
+Stable Diffusion. The full generator identity and generator hash are indexed as
+hidden `@model:` metadata. Exactly one category is searchable: the configured
+folder label when present, otherwise the detected family. None of these values
+are appended to the copyable prompt. Prompt-search results display
+the configured folder label when one exists, otherwise the detected category,
+followed by the hash; V4.5 is shown as `NAI4 (4.5, <hash>)`.
+
+Folder labels live in the root-level `model_paths.ini`. The web UI asks for an
+arbitrary label the first time an unconfigured folder is scanned, and its
+"Rescan all configured folders" button skips temporarily offline paths. The
+closest configured ancestor wins. For CLI scans, `--model-label noob75` adds
+that label to otherwise-unconfigured roots. Legacy `.model_type` files can be
+imported by the migration helper, but are no longer consulted during scans.
+
+Rules may also be written manually; `id` is generated when omitted:
+
+```ini
+[rule.noob75]
+path = E:\ai绘图\noob75
+label = noob75
+```
+
+Generation metadata with no model name uses the identity
+`其他模型 other_model`. Metadata that is present but lacks its expected model
+hash is recorded as `missing_model_hash` while the rest of the scan continues.
+Images with no generation metadata use the separate `no_metadata` identity.
 
 NovelAI stealth metadata extraction is available, but off by default because it
 requires decoding PNG pixels and can be expensive on large collections:
 
 ```powershell
-imgdupe scan "E:\Images" --db images.sqlite --workers 16 --stealth-prompt
+imgdupe scan "E:\Images" --db images.sqlite --stealth-prompt
 ```
 
 Useful prompt-indexing scan options:
@@ -164,7 +185,7 @@ The web UI supports:
 - maximum results
 - showing or hiding exact file matches
 - tryhard crop search
-- prompt tag search using commas, Chinese commas, or newlines
+- grouped prompt search where commas/CJK separators mean AND and `|` means OR
 - negative prompt tags that exclude images without reindexing
 - prompt result sorting by matching-tag count first, then creation date, modified date, or name
 - prompt-tag autocomplete with up/down/enter keyboard selection
@@ -206,7 +227,7 @@ Tryhard cropped search:
 imgdupe query "E:\cropped.jpg" --db images.sqlite --tryhard --min-score 1
 ```
 
-Search by NovelAI prompt tags:
+Search by prompt or hidden model tags:
 
 ```powershell
 imgdupe tags "1girl, blue eyes" --db images.sqlite
@@ -216,12 +237,16 @@ imgdupe tags "1girl" --not-tags "lowres, blurry" --db images.sqlite
 imgdupe tags "1girl" --sort created-desc --db images.sqlite
 imgdupe tags "1girl" --model-type nai4 --db images.sqlite
 imgdupe tags "@model:4bde2a90" --db images.sqlite
+imgdupe tags "cat | dog, solo" --db images.sqlite
 ```
 
 Tag search uses the same cleaning rules as indexing, so searching for
 `sanoba witch` can match prompts containing `sanoba_witch::`.
 Negative tags use the existing prompt-tag index and do not require rescanning or
 reindexing the database.
+
+In positive searches, `a | b, c` means `(a OR b) AND c`; therefore `a,c`,
+`b,c`, and `a,b,c` match, while `a,b` does not. Full-width `｜` is also accepted.
 
 ## Similar Image Groups
 
@@ -259,4 +284,4 @@ The web UI also has a failures page.
 - Original image files are never modified.
 - SQLite remains the source of truth for paths, metadata, hashes, matches, and groups.
 - Large indexes are expected. A few GB for hundreds of thousands of images can be normal.
-- For best scan speed, tune `--workers`; too many workers can hurt performance on slower disks.
+- Scans default to four workers, with bounded task submission so large libraries do not create an unbounded queue. For especially seek-bound mechanical disks, lowering `--workers` to 1 remains available.

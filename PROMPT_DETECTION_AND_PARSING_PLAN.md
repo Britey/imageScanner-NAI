@@ -1,5 +1,37 @@
 # Prompt Detection and Parsing Plan
 
+> **2026 path/model amendment:** The `.model_type` design described in older
+> sections below is superseded by root-level `model_paths.ini` rules. Labels are
+> arbitrary Unicode strings, the closest configured ancestor wins, and folder
+> labels are additive hidden metadata rather than parser overrides. The web UI
+> requests labels for unconfigured scan roots and can rescan all configured,
+> currently available roots. Legacy markers are importable once but are not read
+> during normal scans.
+>
+> Generator metadata is structured as detected family (`sd`, `nai3`, or
+> `nai4`), full generator identity, generator hash, and configured path label.
+> `Software = NovelAI` is authoritative; its `Source` determines NAI3 versus
+> explicit V4/V4.5. SD stores `Model + Model hash`; a missing model name uses
+> `其他模型 other_model`. Metadata with a missing hash records the per-image
+> `missing_model_hash` error and scanning continues. Completely absent metadata
+> uses the distinct `no_metadata` identity.
+>
+> The full identity and hash are searchable as hidden `@model:` metadata. The
+> category has exactly one searchable value: the configured path label when
+> present, otherwise the detected family. The detected family remains stored
+> internally for diagnostics but must not also match category searches when a
+> configured label exists. None of these values are appended to the positive
+> prompt. Positive search expressions use comma-like
+> separators as AND groups and `|`/`｜` as OR alternatives within a group:
+> `a | b, c` means `(a OR b) AND c`. Negative search terms retain their original
+> independent-exclusion semantics.
+
+## Archived original design
+
+The remainder records the original parser design and fixtures. Wherever it
+mentions fixed `.model_type` categories, hash-less metadata being non-failing,
+or fixed model filters, the amendment above is authoritative.
+
 ## Purpose
 
 Extend prompt indexing beyond the current NovelAI-only base-prompt extraction so the scanner can:

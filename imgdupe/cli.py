@@ -7,6 +7,13 @@ from .cluster import build_clusters
 from .config import ScanConfig
 from .db import checkpoint_database, connect, init_db
 from .failures import iter_failures
+from .model_paths import (
+    DEFAULT_MODEL_PATHS_PATH,
+    build_config,
+    load_model_paths,
+    make_rule,
+    save_model_paths,
+)
 from .query import query_image, query_prompt_tags, write_query_html
 from .review import generate_review
 from .scan import scan_roots
@@ -28,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     scan_parser.add_argument("--stealth-prompt", action="store_true")
     scan_parser.add_argument("--reindex-prompts", action="store_true")
     scan_parser.add_argument("--delete-missing", action="store_true")
+    scan_parser.add_argument(
+        "--model-label",
+        help="Save this arbitrary model label for each otherwise-unconfigured scan root.",
+    )
 
     query_parser = subparsers.add_parser("query", help="Find visually similar images.")
     query_parser.add_argument("image", type=Path)
@@ -38,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     query_parser.add_argument("--hide-exact", action="store_true")
     query_parser.add_argument("--tryhard", action="store_true")
 
-    tags_parser = subparsers.add_parser("tags", help="Find images by NovelAI prompt tags.")
+    tags_parser = subparsers.add_parser("tags", help="Find images by indexed prompt or model tags.")
     tags_parser.add_argument("tags", nargs="*", help="Prompt tag(s), comma/CJK-comma/newline separated.")
     tags_parser.add_argument("--db", type=Path, required=True)
     tags_parser.add_argument("--mode", choices=("all", "any"), default="all")
@@ -65,8 +76,8 @@ def main(argv: list[str] | None = None) -> int:
     tags_parser.add_argument("--offset", type=int, default=0)
     tags_parser.add_argument(
         "--model-type",
-        choices=("all", "sd", "noob", "nai3", "nai4"),
         default="all",
+        help="Detected or configured model label (for example nai4, noob75, or sd1.5).",
     )
 
     cluster_parser = subparsers.add_parser("cluster", help="Build similar-image groups.")
@@ -125,7 +136,23 @@ def _run_command(args, parser: argparse.ArgumentParser, conn) -> int:
             reindex_prompts=args.reindex_prompts,
             delete_missing=args.delete_missing,
         )
-        stats = scan_roots(conn, args.roots, config=scan_config)
+        model_paths = load_model_paths(DEFAULT_MODEL_PATHS_PATH)
+        if args.model_label:
+            if model_paths.issues:
+                parser.error("model_paths.ini contains invalid rules; fix it before adding labels")
+            additions = []
+            added_targets: set[str] = set()
+            for supplied in args.roots:
+                canonical = supplied.resolve(strict=False)
+                target = canonical if canonical.is_dir() else canonical.parent
+                target_key = str(target).casefold()
+                if model_paths.resolve(target) is None and target_key not in added_targets:
+                    additions.append(make_rule(target, args.model_label))
+                    added_targets.add(target_key)
+            if additions:
+                model_paths = build_config((*model_paths.rules, *additions))
+                save_model_paths(DEFAULT_MODEL_PATHS_PATH, model_paths)
+        stats = scan_roots(conn, args.roots, config=scan_config, model_paths=model_paths)
         print(
             "scan complete: "
             f"seen={stats.seen} queued={stats.queued} indexed={stats.indexed} "

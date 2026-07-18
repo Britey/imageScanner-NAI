@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,8 +8,21 @@ from pathlib import Path
 try:
     from tqdm import tqdm
 except ImportError:  # Progress output is optional for library/test environments.
+    class _ProgressFallback:
+        def __init__(self, iterable=None):
+            self.iterable = iterable if iterable is not None else ()
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def update(self, _amount: int = 1) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
     def tqdm(iterable=None, **_kwargs):
-        return iterable if iterable is not None else ()
+        return _ProgressFallback(iterable)
 
 from .bands import insert_bands
 from .config import ScanConfig
@@ -19,8 +32,6 @@ from .db import (
     delete_images,
     encode_prompt_metadata,
     get_crop_index_state,
-    get_existing_image,
-    has_prompt_status,
     replace_crop_hashes,
     replace_hashes,
     replace_prompt,
@@ -31,8 +42,15 @@ from .db import (
     upsert_image,
 )
 from .hashing import compute_image_hashes, sha256_file
-from .model_type import ModelTypeResolution, ModelTypeResolver
+from .model_paths import (
+    DEFAULT_MODEL_PATHS_PATH,
+    ModelPathConfig,
+    ModelPathRule,
+    load_model_paths,
+    path_is_within,
+)
 from .nai_prompt import (
+    OTHER_MODEL_IDENTITY,
     PROMPT_PARSER_VERSION,
     PromptResult,
     extract_nai_prompt,
@@ -64,10 +82,11 @@ class ScanTask:
     date_only: bool
     existing_image_id: int | None
     classification_root: str
-    marker_model_type: str | None
-    model_marker_path: str | None
+    configured_model: str | None
+    model_config_root: str | None
+    model_config_rule_id: str | None
     classification_status: str
-    classification_error: str | None
+    precomputed_sha256: bytes | None = None
     moved: bool = False
 
 
@@ -91,10 +110,10 @@ class ScanResult:
     moved: bool
     prompt_result: PromptResult | None
     classification_root: str
-    marker_model_type: str | None
-    model_marker_path: str | None
+    configured_model: str | None
+    model_config_root: str | None
+    model_config_rule_id: str | None
     classification_status: str
-    classification_error: str | None
 
 
 def scan_roots(
@@ -102,6 +121,7 @@ def scan_roots(
     roots: list[Path],
     *,
     config: ScanConfig | None = None,
+    model_paths: ModelPathConfig | None = None,
 ) -> ScanStats:
     config = config or ScanConfig()
     if config.crop_index:
@@ -109,10 +129,45 @@ def scan_roots(
         conn.commit()
     workers = max(1, config.workers)
     stats = ScanStats()
+    if model_paths is None:
+        model_paths = load_model_paths(DEFAULT_MODEL_PATHS_PATH)
+    if model_paths.issues:
+        details = "; ".join(f"{issue.section}: {issue.message}" for issue in model_paths.issues)
+        raise ValueError(f"invalid model_paths.ini: {details}")
     paths = list(iter_image_paths(roots))
-    model_resolvers = _build_model_resolvers(roots)
     tasks: list[ScanTask] = []
-    moved_candidates = _missing_hash_candidates(conn)
+    existing_rows = conn.execute("SELECT * FROM images").fetchall()
+    _refresh_model_config_assignments(conn, existing_rows, model_paths)
+    existing_by_path = {str(row["path"]): row for row in existing_rows}
+    existing_by_id = {int(row["id"]): row for row in existing_rows}
+    prompt_rows = {
+        int(row["image_id"]): row
+        for row in conn.execute(
+            """
+            SELECT image_id, model_type, parser_version, classification_root,
+                   configured_model, model_config_root, model_config_rule_id,
+                   classification_status
+            FROM image_prompts
+            """
+        ).fetchall()
+    }
+    center_crop_ids = (
+        {
+            int(row["image_id"])
+            for row in conn.execute(
+                "SELECT image_id FROM crop_hashes WHERE region = 'center_50'"
+            ).fetchall()
+        }
+        if config.crop_index
+        else set()
+    )
+    moved_candidates = _missing_hash_candidates(
+        conn,
+        known_paths={str(path) for path in paths},
+        roots=roots,
+    )
+    precomputed_hashes: dict[Path, bytes] = {}
+    model_rule_cache: dict[Path, ModelPathRule | None] = {}
 
     for path in tqdm(paths, desc="Checking images", unit="image"):
         stats.seen += 1
@@ -124,39 +179,39 @@ def scan_roots(
         created_ns = _created_ns_from_stat(stat)
         modified_ns = stat.st_mtime_ns
 
-        existing = get_existing_image(conn, path)
+        existing = existing_by_path.get(str(path))
         moved_id = None
         if existing is None and moved_candidates:
             try:
-                moved_id = _claim_moved_image(path, stat.st_size, moved_candidates)
+                moved_id = _claim_moved_image(
+                    path,
+                    stat.st_size,
+                    moved_candidates,
+                    precomputed_hashes=precomputed_hashes,
+                )
             except OSError:
                 stats.failed += 1
                 continue
             if moved_id is not None:
-                existing = conn.execute("SELECT * FROM images WHERE id = ?", (moved_id,)).fetchone()
+                existing = existing_by_id.get(moved_id)
         existing_id = int(existing["id"]) if existing is not None else None
-        classification_root, marker = _resolve_model_marker(path, model_resolvers)
-        classification_status = _classification_status(marker)
-        marker_path = str(marker.marker_path) if marker.marker_path else None
-        prompt_row = (
-            conn.execute(
-                """
-                SELECT model_type, parser_version, classification_root,
-                       model_marker_path, classification_status
-                FROM image_prompts
-                WHERE image_id = ?
-                """,
-                (existing_id,),
-            ).fetchone()
-            if existing_id is not None
-            else None
-        )
+        classification_root = _scan_root_for_path(path, roots)
+        model_rule = model_rule_cache.get(path.parent)
+        if path.parent not in model_rule_cache:
+            model_rule = model_paths.resolve(path)
+            model_rule_cache[path.parent] = model_rule
+        classification_status = "configured" if model_rule is not None else "unconfigured"
+        configured_model = model_rule.label if model_rule is not None else None
+        model_config_root = str(model_rule.path) if model_rule is not None else None
+        model_config_rule_id = model_rule.rule_id if model_rule is not None else None
+        prompt_row = prompt_rows.get(existing_id) if existing_id is not None else None
         classification_changed = prompt_row is None or any(
             (
                 prompt_row["classification_root"] != str(classification_root),
-                prompt_row["model_marker_path"] != marker_path,
+                prompt_row["configured_model"] != configured_model,
+                prompt_row["model_config_root"] != model_config_root,
+                prompt_row["model_config_rule_id"] != model_config_rule_id,
                 prompt_row["classification_status"] != classification_status,
-                marker.model_type is not None and prompt_row["model_type"] != marker.model_type,
             )
         )
         needs_prompt = (
@@ -164,7 +219,6 @@ def scan_roots(
             and existing_id is not None
             and (
                 config.reindex_prompts
-                or not has_prompt_status(conn, existing_id)
                 or prompt_row is None
                 or prompt_row["parser_version"] != PROMPT_PARSER_VERSION
                 or classification_changed
@@ -176,7 +230,12 @@ def scan_roots(
             and (moved_id is not None or int(existing["mtime_ns"]) == stat.st_mtime_ns)
             and existing["decode_error"] is None
             and existing["missing_at"] is None
-            and (not config.crop_index or _has_crop_hashes(conn, int(existing["id"])))
+            and (
+                not config.crop_index
+                or (existing["width"] is not None and int(existing["width"]) < 64)
+                or (existing["height"] is not None and int(existing["height"]) < 64)
+                or int(existing["id"]) in center_crop_ids
+            )
         )
         needs_date_update = (
             unchanged_hashes
@@ -204,10 +263,11 @@ def scan_roots(
                 date_only=unchanged_hashes and (needs_date_update or moved_id is not None) and not needs_prompt,
                 existing_image_id=existing_id,
                 classification_root=str(classification_root),
-                marker_model_type=marker.model_type,
-                model_marker_path=marker_path,
+                configured_model=configured_model,
+                model_config_root=model_config_root,
+                model_config_rule_id=model_config_rule_id,
                 classification_status=classification_status,
-                classification_error=marker.error,
+                precomputed_sha256=precomputed_hashes.get(path),
                 moved=moved_id is not None,
             )
         )
@@ -237,8 +297,15 @@ def scan_roots(
             _store_result(conn, result, config, stats)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(
+            task_iterator = iter(tasks)
+            pending = set()
+
+            def submit_next() -> bool:
+                try:
+                    task = next(task_iterator)
+                except StopIteration:
+                    return False
+                pending.add(executor.submit(
                     _hash_task,
                     task,
                     config.min_width,
@@ -246,11 +313,21 @@ def scan_roots(
                     config.crop_index,
                     config.prompt_index,
                     config.stealth_prompt,
-                )
-                for task in tasks
-            ]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Hashing images", unit="image"):
-                _store_result(conn, future.result(), config, stats)
+                ))
+                return True
+
+            max_pending = max(workers, workers * 2)
+            for _ in range(min(max_pending, len(tasks))):
+                submit_next()
+            progress = tqdm(total=len(tasks), desc="Hashing images", unit="image")
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    _store_result(conn, future.result(), config, stats)
+                    progress.update(1)
+                while len(pending) < max_pending and submit_next():
+                    pass
+            progress.close()
 
     conn.commit()
     if config.delete_missing:
@@ -260,38 +337,114 @@ def scan_roots(
     return stats
 
 
-def _build_model_resolvers(roots: list[Path]) -> list[tuple[Path, ModelTypeResolver]]:
-    resolved: dict[str, tuple[Path, ModelTypeResolver]] = {}
-    for root in roots:
-        canonical = root.resolve(strict=False)
-        scan_root = canonical if canonical.is_dir() else canonical.parent
-        key = str(scan_root).casefold()
-        resolved.setdefault(key, (scan_root, ModelTypeResolver(scan_root)))
-    return sorted(resolved.values(), key=lambda item: len(item[0].parts), reverse=True)
-
-
-def _resolve_model_marker(
-    path: Path,
-    resolvers: list[tuple[Path, ModelTypeResolver]],
-) -> tuple[Path, ModelTypeResolution]:
+def _scan_root_for_path(path: Path, roots: list[Path]) -> Path:
     canonical = path.resolve(strict=False)
-    for scan_root, resolver in resolvers:
+    candidates: list[Path] = []
+    for supplied_root in roots:
+        supplied = supplied_root.resolve(strict=False)
+        scan_root = supplied if supplied.is_dir() else supplied.parent
         try:
             canonical.relative_to(scan_root)
         except ValueError:
             continue
-        return scan_root, resolver.resolve_for_image(canonical)
-    # iter_image_paths only yields files below a requested root. This fallback
-    # keeps direct/internal callers deterministic if that invariant changes.
-    scan_root = canonical.parent
-    return scan_root, ModelTypeResolver(scan_root).resolve_for_image(canonical)
+        candidates.append(scan_root)
+    return max(candidates, key=lambda item: len(item.parts)) if candidates else canonical.parent
 
 
-def _classification_status(resolution: ModelTypeResolution) -> str:
-    if resolution.status != "invalid_model_marker":
-        return resolution.status
-    signature = resolution.marker_signature or "unknown"
-    return f"invalid_model_marker:{signature}"
+def _refresh_model_config_assignments(
+    conn: sqlite3.Connection,
+    image_rows: list[sqlite3.Row],
+    model_paths: ModelPathConfig,
+) -> None:
+    current = {
+        int(row["image_id"]): row
+        for row in conn.execute(
+            """
+            SELECT
+                ip.image_id,
+                ip.model_type,
+                ip.configured_model,
+                ip.model_config_root,
+                ip.model_config_rule_id,
+                COALESCE(category.tag_count, 0) AS category_tag_count,
+                category.tag_norm AS category_tag_norm,
+                category.tag_kind AS category_tag_kind
+            FROM image_prompts ip
+            LEFT JOIN (
+                SELECT
+                    image_id,
+                    COUNT(*) AS tag_count,
+                    MIN(tag_norm) AS tag_norm,
+                    MIN(tag_kind) AS tag_kind
+                FROM prompt_tags
+                WHERE tag_kind IN ('model_type', 'model_config')
+                GROUP BY image_id
+            ) category ON category.image_id = ip.image_id
+            """
+        ).fetchall()
+    }
+    rule_cache: dict[Path, ModelPathRule | None] = {}
+    for image in image_rows:
+        image_id = int(image["id"])
+        prompt_row = current.get(image_id)
+        if prompt_row is None:
+            continue
+        image_path = Path(image["path"])
+        rule = rule_cache.get(image_path.parent)
+        if image_path.parent not in rule_cache:
+            rule = model_paths.resolve(image_path)
+            rule_cache[image_path.parent] = rule
+        configured_model = rule.label if rule is not None else None
+        config_root = str(rule.path) if rule is not None else None
+        rule_id = rule.rule_id if rule is not None else None
+        effective_model = configured_model or str(prompt_row["model_type"] or "sd")
+        effective_kind = "model_config" if configured_model else "model_type"
+        effective_tag = f"@model:{effective_model}"
+        effective_tag_norm = normalize_prompt_tag(effective_tag)
+        assignment_matches = (
+            prompt_row["configured_model"] == configured_model
+            and prompt_row["model_config_root"] == config_root
+            and prompt_row["model_config_rule_id"] == rule_id
+        )
+        category_matches = (
+            int(prompt_row["category_tag_count"] or 0) == 1
+            and prompt_row["category_tag_norm"] == effective_tag_norm
+            and prompt_row["category_tag_kind"] == effective_kind
+        )
+        if assignment_matches and category_matches:
+            continue
+        if not category_matches:
+            conn.execute(
+                """
+                DELETE FROM prompt_tags
+                WHERE image_id = ?
+                  AND (tag_kind IN ('model_type', 'model_config') OR tag_norm = ?)
+                """,
+                (image_id, effective_tag_norm),
+            )
+            conn.execute(
+                """
+                INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
+                VALUES (?, ?, ?, 1000000000, ?)
+                """,
+                (image_id, effective_tag, effective_tag_norm, effective_kind),
+            )
+        if not assignment_matches:
+            conn.execute(
+                """
+                UPDATE image_prompts
+                SET configured_model = ?, model_config_root = ?, model_config_rule_id = ?,
+                    classification_status = ?
+                WHERE image_id = ?
+                """,
+                (
+                    configured_model,
+                    config_root,
+                    rule_id,
+                    "configured" if rule is not None else "unconfigured",
+                    image_id,
+                ),
+            )
 
 
 def _finish_crop_index_state(conn: sqlite3.Connection, crop_index_requested: bool) -> None:
@@ -497,10 +650,10 @@ def _hash_task(
             moved=task.moved,
             prompt_result=None,
             classification_root=task.classification_root,
-            marker_model_type=task.marker_model_type,
-            model_marker_path=task.model_marker_path,
+            configured_model=task.configured_model,
+            model_config_root=task.model_config_root,
+            model_config_rule_id=task.model_config_rule_id,
             classification_status=task.classification_status,
-            classification_error=task.classification_error,
         )
 
     if task.prompt_only:
@@ -508,8 +661,6 @@ def _hash_task(
             task.path,
             prompt_index=prompt_index,
             stealth_prompt=stealth_prompt,
-            classification_status=task.classification_status,
-            classification_error=task.classification_error,
         )
         return ScanResult(
             path=task.path,
@@ -530,10 +681,10 @@ def _hash_task(
             moved=task.moved,
             prompt_result=prompt_result,
             classification_root=task.classification_root,
-            marker_model_type=task.marker_model_type,
-            model_marker_path=task.model_marker_path,
+            configured_model=task.configured_model,
+            model_config_root=task.model_config_root,
+            model_config_rule_id=task.model_config_rule_id,
             classification_status=task.classification_status,
-            classification_error=task.classification_error,
         )
 
     try:
@@ -542,13 +693,12 @@ def _hash_task(
             min_width=min_width,
             min_height=min_height,
             include_crop_regions=crop_index,
+            precomputed_sha256=task.precomputed_sha256,
         )
         prompt_result = _extract_prompt_fields(
             task.path,
             prompt_index=prompt_index,
             stealth_prompt=stealth_prompt,
-            classification_status=task.classification_status,
-            classification_error=task.classification_error,
         )
         return ScanResult(
             path=task.path,
@@ -569,18 +719,16 @@ def _hash_task(
             moved=task.moved,
             prompt_result=prompt_result,
             classification_root=task.classification_root,
-            marker_model_type=task.marker_model_type,
-            model_marker_path=task.model_marker_path,
+            configured_model=task.configured_model,
+            model_config_root=task.model_config_root,
+            model_config_rule_id=task.model_config_rule_id,
             classification_status=task.classification_status,
-            classification_error=task.classification_error,
         )
     except Exception as exc:
         prompt_result = _extract_prompt_fields(
             task.path,
             prompt_index=prompt_index,
             stealth_prompt=stealth_prompt,
-            classification_status=task.classification_status,
-            classification_error=task.classification_error,
         )
         return ScanResult(
             path=task.path,
@@ -591,7 +739,7 @@ def _hash_task(
             width=None,
             height=None,
             image_format=None,
-            sha256=_sha256_or_none(task.path),
+            sha256=task.precomputed_sha256 or _sha256_or_none(task.path),
             hashes={},
             decode_error=f"{type(exc).__name__}: {exc}",
             had_existing_hashes=task.had_existing_hashes,
@@ -601,10 +749,10 @@ def _hash_task(
             moved=task.moved,
             prompt_result=prompt_result,
             classification_root=task.classification_root,
-            marker_model_type=task.marker_model_type,
-            model_marker_path=task.model_marker_path,
+            configured_model=task.configured_model,
+            model_config_root=task.model_config_root,
+            model_config_rule_id=task.model_config_rule_id,
             classification_status=task.classification_status,
-            classification_error=task.classification_error,
         )
 
 
@@ -627,7 +775,12 @@ def _optional_int(value) -> int | None:
     return int(value) if value is not None else None
 
 
-def _missing_hash_candidates(conn: sqlite3.Connection) -> dict[int, dict[bytes, list[int]]]:
+def _missing_hash_candidates(
+    conn: sqlite3.Connection,
+    *,
+    known_paths: set[str] | None = None,
+    roots: list[Path] | None = None,
+) -> dict[int, dict[bytes, list[int]]]:
     rows = conn.execute(
         """
         SELECT id, path, size_bytes, sha256
@@ -635,10 +788,22 @@ def _missing_hash_candidates(conn: sqlite3.Connection) -> dict[int, dict[bytes, 
         WHERE sha256 IS NOT NULL
         """
     ).fetchall()
+    directory_roots = (
+        [root.resolve(strict=False) for root in (roots or []) if root.is_dir()]
+        if known_paths is not None
+        else []
+    )
     candidates: dict[int, dict[bytes, list[int]]] = {}
     for row in rows:
-        if Path(row["path"]).exists():
-            continue
+        row_path = Path(row["path"])
+        if known_paths is None:
+            if row_path.exists():
+                continue
+        else:
+            if not any(path_is_within(row_path, root) for root in directory_roots):
+                continue
+            if str(row_path) in known_paths:
+                continue
         hashes_by_size = candidates.setdefault(int(row["size_bytes"]), {})
         hashes_by_size.setdefault(row["sha256"], []).append(int(row["id"]))
     return candidates
@@ -648,11 +813,15 @@ def _claim_moved_image(
     path: Path,
     size_bytes: int,
     candidates: dict[int, dict[bytes, list[int]]],
+    *,
+    precomputed_hashes: dict[Path, bytes] | None = None,
 ) -> int | None:
     hashes_by_size = candidates.get(size_bytes)
     if not hashes_by_size:
         return None
     sha256 = sha256_file(path)
+    if precomputed_hashes is not None:
+        precomputed_hashes[path] = sha256
     image_ids = hashes_by_size.get(sha256, [])
     if len(image_ids) != 1:
         return None
@@ -669,46 +838,14 @@ def _delete_missing_images(conn: sqlite3.Connection) -> int:
     return delete_images(conn, image_ids)
 
 
-def _has_crop_hashes(conn: sqlite3.Connection, image_id: int) -> bool:
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM images i
-        WHERE i.id = ?
-          AND (
-              i.width < 64
-              OR i.height < 64
-              OR EXISTS (
-                  SELECT 1
-                  FROM crop_hashes ch
-                  WHERE ch.image_id = i.id
-                    AND ch.region = 'center_50'
-              )
-          )
-        LIMIT 1
-        """,
-        (image_id,),
-    ).fetchone()
-    return row is not None
-
-
 def _extract_prompt_fields(
     path: Path,
     *,
     prompt_index: bool,
     stealth_prompt: bool,
-    classification_status: str,
-    classification_error: str | None,
 ) -> PromptResult | None:
     if not prompt_index:
         return None
-    if classification_status.startswith("invalid_model_marker"):
-        return PromptResult(
-            prompt=None,
-            metadata_source=None,
-            error=classification_error or "invalid_model_marker",
-            model_type="sd",
-        )
     return extract_nai_prompt(path, stealth_fallback=stealth_prompt)
 
 
@@ -719,15 +856,43 @@ def _store_prompt(
     indexed_at: str,
 ) -> None:
     prompt_result = result.prompt_result or PromptResult(None, None, "no_metadata")
-    model_type = result.marker_model_type or prompt_result.model_type or "sd"
-    tag_rows: list[tuple[str, str, str]] = [
-        (tag, normalize_prompt_tag(tag), "prompt")
-        for tag in prompt_result.tags
-        if normalize_prompt_tag(tag)
-    ]
-    if prompt_result.model_hash:
-        model_tag = f"@model:{prompt_result.model_hash.casefold()}"
-        tag_rows.append((model_tag, normalize_prompt_tag(model_tag), "model_hash"))
+    no_metadata = prompt_result.error == "no_metadata"
+    model_type = "no_metadata" if no_metadata else (prompt_result.model_type or "sd")
+    model_hash = prompt_result.model_hash.casefold() if prompt_result.model_hash else None
+    model_identity = prompt_result.model_identity
+    if no_metadata:
+        model_identity = "无元数据 no_metadata"
+    elif prompt_result.error == "missing_model_hash":
+        model_identity = OTHER_MODEL_IDENTITY
+    elif model_type == "sd" and model_identity and model_hash and model_identity != OTHER_MODEL_IDENTITY:
+        model_identity = f"{model_identity} {model_hash}"
+
+    tag_rows: list[tuple[str, str, str]] = []
+    seen_tags: set[str] = set()
+
+    def add_tag(tag: str, kind: str) -> None:
+        normalized = normalize_prompt_tag(tag)
+        if not normalized:
+            return
+        if normalized in seen_tags:
+            if kind != "prompt":
+                for index, existing in enumerate(tag_rows):
+                    if existing[1] == normalized and existing[2] == "prompt":
+                        tag_rows[index] = (tag, normalized, kind)
+                        break
+            return
+        seen_tags.add(normalized)
+        tag_rows.append((tag, normalized, kind))
+
+    for tag in prompt_result.tags:
+        add_tag(tag, "prompt")
+    effective_model = result.configured_model or model_type
+    effective_kind = "model_config" if result.configured_model else "model_type"
+    add_tag(f"@model:{effective_model}", effective_kind)
+    if model_identity:
+        add_tag(f"@model:{model_identity}", "model_identity")
+    if model_hash:
+        add_tag(f"@model:{model_hash}", "model_hash")
     prompt_error = prompt_result.error
     prompt_status = "ok" if prompt_error is None else prompt_error.split(":", 1)[0]
     try:
@@ -745,15 +910,19 @@ def _store_prompt(
         prompt_error=prompt_error,
         indexed_at=indexed_at,
         tags=tag_rows,
-        model_type=model_type if not result.classification_status.startswith("invalid_model_marker") else None,
-        model_hash=prompt_result.model_hash,
+        model_type=model_type,
+        model_hash=model_hash,
+        model_identity=model_identity,
         model_version=prompt_result.model_version,
+        configured_model=result.configured_model,
+        model_config_root=result.model_config_root,
+        model_config_rule_id=result.model_config_rule_id,
         prompt_format=prompt_result.prompt_format,
         raw_metadata=raw_metadata,
         raw_metadata_codec=raw_metadata_codec,
         parser_version=PROMPT_PARSER_VERSION,
         classification_root=result.classification_root,
-        model_marker_path=result.model_marker_path,
+        model_marker_path=None,
         prompt_status=prompt_status,
         classification_status=result.classification_status,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +12,7 @@ from .db import fetch_crop_hashes, fetch_hash_row, hash_row_to_dict, is_crop_ind
 from .hashing import compute_image_hashes
 from .hashing import load_normalized, tryhard_query_hashes
 from .match import PairScore, score_hashes
-from .nai_prompt import normalize_prompt_tag, split_prompt_tags
+from .nai_prompt import CJK_FULL_STOPS, COMMA_SEPARATORS, normalize_prompt_tag
 from .utils import human_size
 
 
@@ -107,14 +108,12 @@ def query_prompt_tags(
     sort_by: str = "created_desc",
     model_type: str | None = None,
 ) -> list[PromptSearchResult]:
-    tag_terms = _prompt_tag_terms(text_or_tags)
-    negative_tag_terms = _prompt_tag_terms(negative_text_or_tags)
-    if not tag_terms and not negative_tag_terms:
+    tag_groups = _prompt_tag_groups(text_or_tags)
+    negative_tag_terms = _negative_prompt_tag_terms(negative_text_or_tags)
+    if not tag_groups and not negative_tag_terms:
         return []
 
     normalized_model_type = (model_type or "all").strip().casefold()
-    if normalized_model_type not in {"all", "sd", "noob", "nai3", "nai4"}:
-        raise ValueError("model_type must be all, sd, noob, nai3, or nai4")
 
     mode = match_mode.lower()
     if mode not in {"all", "any"}:
@@ -123,24 +122,43 @@ def query_prompt_tags(
     final_order = _prompt_sort_order(sort_by, table_alias="")
 
     params: list[object] = []
-    if tag_terms:
-        match_conditions = " OR ".join(
-            "(tag_norm = ? AND tag_kind = ?)" for _ in tag_terms
-        )
+    if tag_groups:
+        wanted_rows = [
+            (group_index, tag_norm, metadata_only)
+            for group_index, group in enumerate(tag_groups)
+            for tag_norm, metadata_only in group
+        ]
+        wanted_values = ", ".join("(?, ?, ?)" for _ in wanted_rows)
         having = "HAVING matched_count = ?" if mode == "all" else ""
-        for tag_norm, tag_kind in tag_terms:
-            params.extend((tag_norm, tag_kind))
+        for group_index, tag_norm, metadata_only in wanted_rows:
+            params.extend((group_index, tag_norm, int(metadata_only)))
         if mode == "all":
-            params.append(len(tag_terms))
+            params.append(len(tag_groups))
         base_ctes = f"""
-            WITH matches AS (
+            WITH wanted(group_id, tag_norm, metadata_only) AS (
+                VALUES {wanted_values}
+            ),
+            matches AS (
                 SELECT
-                    image_id,
-                    COUNT(DISTINCT tag_norm) AS matched_count,
-                    GROUP_CONCAT(DISTINCT tag) AS matched_tags
+                    prompt_tags.image_id,
+                    COUNT(DISTINCT wanted.group_id) AS matched_count,
+                    GROUP_CONCAT(DISTINCT prompt_tags.tag) AS matched_tags
                 FROM prompt_tags
-                WHERE {match_conditions}
-                GROUP BY image_id
+                JOIN image_prompts effective_prompt
+                  ON effective_prompt.image_id = prompt_tags.image_id
+                JOIN wanted ON wanted.tag_norm = prompt_tags.tag_norm
+                    AND (
+                        (wanted.metadata_only = 0 AND prompt_tags.tag_kind = 'prompt')
+                        OR (
+                            wanted.metadata_only = 1
+                            AND prompt_tags.tag_kind <> 'prompt'
+                            AND NOT (
+                                prompt_tags.tag_kind = 'model_type'
+                                AND effective_prompt.configured_model IS NOT NULL
+                            )
+                        )
+                    )
+                GROUP BY prompt_tags.image_id
                 {having}
             )
         """
@@ -159,7 +177,9 @@ def query_prompt_tags(
     exclude_clause = ""
     if negative_tag_terms:
         negative_conditions = " OR ".join(
-            "(excluded_tags.tag_norm = ? AND excluded_tags.tag_kind = ?)"
+            "(excluded_tags.tag_norm = ? AND "
+            "((? = 0 AND excluded_tags.tag_kind = 'prompt') OR "
+            "(? = 1 AND excluded_tags.tag_kind <> 'prompt')))"
             for _ in negative_tag_terms
         )
         exclude_clause = f"""
@@ -167,15 +187,33 @@ def query_prompt_tags(
                   SELECT 1
                   FROM prompt_tags excluded_tags
                   WHERE excluded_tags.image_id = i.id
+                    AND NOT (
+                        excluded_tags.tag_kind = 'model_type'
+                        AND ip.configured_model IS NOT NULL
+                    )
                     AND ({negative_conditions})
               )
         """
-        for tag_norm, tag_kind in negative_tag_terms:
-            params.extend((tag_norm, tag_kind))
+        for tag_norm, metadata_only in negative_tag_terms:
+            params.extend((tag_norm, int(metadata_only), int(metadata_only)))
     model_clause = ""
     if normalized_model_type != "all":
-        model_clause = "AND ip.model_type = ?"
-        params.append(normalized_model_type)
+        model_clause = """
+          AND EXISTS (
+              SELECT 1
+              FROM prompt_tags model_filter
+              WHERE model_filter.image_id = i.id
+                AND model_filter.tag_norm = ?
+                AND (
+                    model_filter.tag_kind = 'model_config'
+                    OR (
+                        model_filter.tag_kind = 'model_type'
+                        AND ip.configured_model IS NULL
+                    )
+                )
+          )
+        """
+        params.append(normalize_prompt_tag(f"@model:{normalized_model_type}"))
     params.extend([max(1, limit), max(0, offset)])
     if unique_prompts:
         sql = (
@@ -188,17 +226,20 @@ def query_prompt_tags(
                 ip.model_type,
                 ip.model_hash,
                 ip.model_version,
+                ip.configured_model,
                 matches.matched_count,
                 matches.matched_tags,
                 ROW_NUMBER() OVER (
-                    PARTITION BY ip.prompt
+                    PARTITION BY CASE
+                        WHEN ip.prompt IS NULL THEN 'image:' || i.id
+                        ELSE 'prompt:' || ip.prompt
+                    END
                     ORDER BY {ranked_order}
                 ) AS prompt_rank
             FROM matches
             JOIN images i ON i.id = matches.image_id
             JOIN image_prompts ip ON ip.image_id = i.id
             WHERE i.missing_at IS NULL
-              AND ip.prompt IS NOT NULL
               {exclude_clause}
               {model_clause}
         )
@@ -219,6 +260,7 @@ def query_prompt_tags(
             ip.model_type,
             ip.model_hash,
             ip.model_version,
+            ip.configured_model,
             matches.matched_count,
             matches.matched_tags
         FROM matches
@@ -249,28 +291,68 @@ def query_prompt_tags(
 
 
 def _prompt_tag_norms(text_or_tags: str | list[str] | None) -> list[str]:
-    return [tag_norm for tag_norm, _ in _prompt_tag_terms(text_or_tags)]
+    return [tag_norm for group in _prompt_tag_groups(text_or_tags) for tag_norm, _ in group]
 
 
-def _prompt_tag_terms(text_or_tags: str | list[str] | None) -> list[tuple[str, str]]:
+def _prompt_tag_groups(
+    text_or_tags: str | list[str] | None,
+) -> list[tuple[tuple[str, bool], ...]]:
     if text_or_tags is None:
         return []
-    raw_tags = (
-        split_prompt_tags(text_or_tags)
-        if isinstance(text_or_tags, str)
-        else [tag for item in text_or_tags for tag in split_prompt_tags(item)]
-    )
-    tag_terms: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for tag in raw_tags:
-        tag_norm = normalize_prompt_tag(tag)
-        tag_kind = "model_hash" if tag.strip().casefold().startswith("@model:") else "prompt"
-        term = (tag_norm, tag_kind)
-        if not tag_norm or term in seen:
-            continue
-        seen.add(term)
-        tag_terms.append(term)
-    return tag_terms
+    inputs = [text_or_tags] if isinstance(text_or_tags, str) else text_or_tags
+    groups: list[tuple[tuple[str, bool], ...]] = []
+    seen_groups: set[frozenset[tuple[str, bool]]] = set()
+    separators = str.maketrans({character: "," for character in COMMA_SEPARATORS + CJK_FULL_STOPS})
+    for item in inputs:
+        for raw_group in item.translate(separators).split(","):
+            group_text = _strip_whole_group_parentheses(raw_group.strip())
+            terms: list[tuple[str, bool]] = []
+            seen_terms: set[tuple[str, bool]] = set()
+            for raw_term in re.split(r"[|｜]", group_text):
+                tag_norm = normalize_prompt_tag(raw_term)
+                metadata_only = raw_term.strip().casefold().startswith("@model:")
+                term = (tag_norm, metadata_only)
+                if not tag_norm or term in seen_terms:
+                    continue
+                seen_terms.add(term)
+                terms.append(term)
+            group_key = frozenset(terms)
+            if not terms or group_key in seen_groups:
+                continue
+            seen_groups.add(group_key)
+            groups.append(tuple(terms))
+    return groups
+
+
+def _negative_prompt_tag_terms(
+    text_or_tags: str | list[str] | None,
+) -> list[tuple[str, bool]]:
+    terms: list[tuple[str, bool]] = []
+    seen: set[tuple[str, bool]] = set()
+    for group in _prompt_tag_groups(text_or_tags):
+        for term in group:
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+    return terms
+
+
+def _strip_whole_group_parentheses(text: str) -> str:
+    while len(text) >= 2 and text[0] == "(" and text[-1] == ")":
+        depth = 0
+        encloses_whole_group = True
+        for index, character in enumerate(text):
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth < 0 or (depth == 0 and index != len(text) - 1):
+                    encloses_whole_group = False
+                    break
+        if not encloses_whole_group or depth != 0:
+            break
+        text = text[1:-1].strip()
+    return text
 
 
 def _prompt_sort_order(sort_by: str, *, table_alias: str) -> str:
