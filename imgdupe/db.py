@@ -176,6 +176,13 @@ def init_db(conn: sqlite3.Connection) -> None:
         _ensure_column(conn, "images", "created_ns", "INTEGER")
         _ensure_column(conn, "images", "modified_ns", "INTEGER")
     conn.executescript(MIGRATIONS)
+    # The data backfill below can touch every prompt and tag. Repeating it when
+    # an already-upgraded database is opened makes startup time grow with the
+    # collection, even though no scan was requested.
+    prompt_schema_is_current = (
+        get_metadata(conn, PROMPT_SCHEMA_VERSION_KEY) == PROMPT_SCHEMA_VERSION
+    )
+
     # Keep additive upgrades in one transaction. The version marker is written
     # last, so it never advertises a partially applied prompt-schema migration.
     with conn:
@@ -190,44 +197,45 @@ def init_db(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_prompt_tags_kind_norm_image "
             "ON prompt_tags(tag_kind, tag_norm, image_id)"
         )
-        # Keep pre-v3 databases immediately searchable by their structured
-        # model columns. A later prompt reindex adds full identities and path
-        # labels without invalidating the existing database.
-        conn.execute(
-            """
-            INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
-            SELECT image_id,
-                   '@model:' || model_type,
-                   '@model:' || LOWER(model_type),
-                   1000000000,
-                   'model_type'
-            FROM image_prompts
-            WHERE model_type IS NOT NULL
-              AND TRIM(model_type) <> ''
-              AND (configured_model IS NULL OR TRIM(configured_model) = '')
-            ON CONFLICT(image_id, tag_norm) DO UPDATE SET
-                tag = excluded.tag,
-                tag_kind = excluded.tag_kind
-            WHERE prompt_tags.tag_kind = 'prompt'
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
-            SELECT image_id,
-                   '@model:' || LOWER(model_hash),
-                   '@model:' || LOWER(model_hash),
-                   1000000001,
-                   'model_hash'
-            FROM image_prompts
-            WHERE model_hash IS NOT NULL AND TRIM(model_hash) <> ''
-            ON CONFLICT(image_id, tag_norm) DO UPDATE SET
-                tag = excluded.tag,
-                tag_kind = excluded.tag_kind
-            WHERE prompt_tags.tag_kind = 'prompt'
-            """
-        )
-        set_metadata(conn, PROMPT_SCHEMA_VERSION_KEY, PROMPT_SCHEMA_VERSION)
+        if not prompt_schema_is_current:
+            # Keep pre-v3 databases immediately searchable by their structured
+            # model columns. A later prompt reindex adds full identities and
+            # path labels without invalidating the existing database.
+            conn.execute(
+                """
+                INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
+                SELECT image_id,
+                       '@model:' || model_type,
+                       '@model:' || LOWER(model_type),
+                       1000000000,
+                       'model_type'
+                FROM image_prompts
+                WHERE model_type IS NOT NULL
+                  AND TRIM(model_type) <> ''
+                  AND (configured_model IS NULL OR TRIM(configured_model) = '')
+                ON CONFLICT(image_id, tag_norm) DO UPDATE SET
+                    tag = excluded.tag,
+                    tag_kind = excluded.tag_kind
+                WHERE prompt_tags.tag_kind = 'prompt'
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO prompt_tags (image_id, tag, tag_norm, position, tag_kind)
+                SELECT image_id,
+                       '@model:' || LOWER(model_hash),
+                       '@model:' || LOWER(model_hash),
+                       1000000001,
+                       'model_hash'
+                FROM image_prompts
+                WHERE model_hash IS NOT NULL AND TRIM(model_hash) <> ''
+                ON CONFLICT(image_id, tag_norm) DO UPDATE SET
+                    tag = excluded.tag,
+                    tag_kind = excluded.tag_kind
+                WHERE prompt_tags.tag_kind = 'prompt'
+                """
+            )
+            set_metadata(conn, PROMPT_SCHEMA_VERSION_KEY, PROMPT_SCHEMA_VERSION)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
