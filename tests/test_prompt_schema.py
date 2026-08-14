@@ -116,6 +116,21 @@ class PromptSchemaTests(unittest.TestCase):
         self.assertIn("idx_prompt_tags_norm_image", indexes)
         self.assertIn("idx_prompt_tags_kind_norm_image", indexes)
 
+    def test_current_database_skips_collection_wide_prompt_backfill(self) -> None:
+        init_db(self.conn)
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+
+        init_db(self.conn)
+
+        self.conn.set_trace_callback(None)
+        self.assertFalse(
+            any(
+                statement.lstrip().upper().startswith("INSERT INTO PROMPT_TAGS")
+                for statement in statements
+            )
+        )
+
     def test_replace_prompt_accepts_old_and_typed_tags(self) -> None:
         init_db(self.conn)
         self.add_image()
