@@ -1873,12 +1873,21 @@ def _stats(conn: sqlite3.Connection) -> dict[str, int]:
     prompts = conn.execute(
         "SELECT COUNT(*) AS count FROM image_prompts WHERE prompt IS NOT NULL"
     ).fetchone()["count"]
+    # Enumerate names using the covering tag index, then stop at the first
+    # visible occurrence of each name. Joining every occurrence first causes
+    # millions of scattered reads of the wide prompt/metadata table just to
+    # render the home-page counters.
     unique_tags = conn.execute(
         """
-        SELECT COUNT(DISTINCT pt.tag_norm) AS count
-        FROM prompt_tags pt
-        JOIN image_prompts ip ON ip.image_id = pt.image_id
-        WHERE NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)
+        SELECT COUNT(*) AS count
+        FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags
+        WHERE EXISTS (
+            SELECT 1
+            FROM prompt_tags pt
+            JOIN image_prompts ip ON ip.image_id = pt.image_id
+            WHERE pt.tag_norm = tags.tag_norm
+              AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)
+        )
         """
     ).fetchone()["count"]
     return {
