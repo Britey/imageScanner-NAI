@@ -83,10 +83,14 @@ class ScanCoverageTests(unittest.TestCase):
             self.image(f"{index}.png")
         # Thread futures obey the same executor/wait contract while keeping
         # worker execution visible to the coverage collector.
-        with patch.object(scan, "ProcessPoolExecutor", wraps=ThreadPoolExecutor) as executor:
+        def executor_for_coverage(*, max_workers, mp_context):
+            self.assertEqual(mp_context.get_start_method(), "spawn")
+            return ThreadPoolExecutor(max_workers=max_workers)
+
+        with patch.object(scan, "ProcessPoolExecutor", side_effect=executor_for_coverage) as executor:
             stats = scan.scan_roots(self.conn, [self.root], config=ScanConfig(workers=2, delete_missing=True),
                                     model_paths=ModelPathConfig())
-        executor.assert_called_once_with(max_workers=2)
+        self.assertEqual(executor.call_count, 1)
         self.assertEqual((stats.seen, stats.indexed, stats.failed), (7, 7, 0))
         self.assertEqual(self.conn.execute("SELECT count(*) FROM hashes").fetchone()[0], 7)
 
@@ -106,7 +110,7 @@ class ScanCoverageTests(unittest.TestCase):
         self.assertEqual((stats.seen, stats.failed), (1, 1))
         path = self.image()
         self.record(self.root / "old.png", size_bytes=path.stat().st_size, sha256=b"old")
-        with patch.object(scan, "_claim_moved_image", side_effect=OSError("unreadable")):
+        with patch.object(scan, "sha256_file", side_effect=OSError("unreadable")):
             stats = self.run_scan([self.root])
         self.assertEqual((stats.seen, stats.failed, stats.queued), (1, 1, 0))
         stats = self.run_scan([self.root])

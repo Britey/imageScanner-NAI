@@ -11,7 +11,7 @@ except ImportError:  # Progress output is optional for library/test environments
 
 from .bands import find_candidates
 from .config import ScanConfig, Thresholds
-from .db import fetch_hash_row, hash_row_to_dict, temporary_image_ids
+from .db import hash_row_to_dict, temporary_image_ids
 from .match import PairScore, score_hashes
 from .utils import utc_now_sql
 
@@ -87,7 +87,8 @@ def build_clusters(
         candidates = find_candidates(
             conn,
             hashes,
-            exclude_image_id=image_id,
+            min_image_id=image_id,
+            sort=False,
             whole_band_size=config.whole_band_size,
             grid_band_size=config.grid_band_size,
         )
@@ -99,13 +100,16 @@ def build_clusters(
             other_hashes = hashes_by_id.get(other_id)
             if other_hashes is None:
                 continue
-            stats.scored_pairs += 1
             pair_score = score_hashes(
                 hashes,
                 other_hashes,
                 sha_equal=sha_by_id.get(image_id) == sha_by_id.get(other_id),
                 thresholds=thresholds,
+                minimum_score=min_score,
             )
+            if pair_score is None:
+                continue
+            stats.scored_pairs += 1
             if pair_score.decision == "reject" or pair_score.score < min_score:
                 continue
             _store_match(conn, image_id, other_id, pair_score, now)
@@ -153,13 +157,13 @@ def _load_hashes(
     conn: sqlite3.Connection,
     rows: list[sqlite3.Row],
 ) -> dict[int, dict[str, bytes]]:
-    hashes_by_id: dict[int, dict[str, bytes]] = {}
-    for row in rows:
-        image_id = int(row["id"])
-        hash_row = fetch_hash_row(conn, image_id)
-        if hash_row is not None:
-            hashes_by_id[image_id] = hash_row_to_dict(hash_row)
-    return hashes_by_id
+    # A single ordered scan replaces one Python/SQLite round trip per image.
+    wanted = {int(row["id"]) for row in rows}
+    return {
+        int(row["image_id"]): hash_row_to_dict(row)
+        for row in conn.execute("SELECT * FROM hashes ORDER BY image_id")
+        if int(row["image_id"]) in wanted
+    }
 
 
 def _store_match(

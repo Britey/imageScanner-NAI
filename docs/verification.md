@@ -1,5 +1,31 @@
 # Verification results
 
+## Performance changes, 2026-11-07
+
+The performance PR starts from main `ce47e444f5d056bc3f1e117e7cda37ffa5998020`.
+Local validation uses Python 3.13.15, SQLite 3.53.1 and coverage.py 7.17.2.
+The complete suite runs **290 tests**, with the same two optional corpus skips,
+and reaches **100% application statements and branches** (3,554 statements,
+1,120 branches), without exclusions.
+All **38/38 curated semantic mutations** are rejected by assertions (288-test
+isolated baseline); both review mutations were also rerun against the final
+290-test baseline. No mutant survived or failed merely with an import/runtime
+error. Validation logs and raw measurements are retained locally under the ignored
+`performance-results/2026-11-07-final/` directory, outside Git. The measured findings
+are summarized in [performance improvements](performance-improvements.md).
+
+New regressions exercise an actual spawned process pool from a background thread
+with a WAL connection open; inaccessible directories and move safety; failed-file
+recovery; bounded scan batches; low SQLite parameter limits; summary updates,
+rollback and migration; score equivalence; linear prompt parsing; atomic export
+and thumbnail failures; and concurrent HTTP requests with separate connections.
+
+The finite TLA+ visibility model still passes with its negative control. Its
+scope is now explicitly the reference visibility semantics; incremental trigger
+transitions are validated by SQLite tests, not claimed to be formally modeled.
+
+## Earlier verification baseline
+
 Validated locally on 2026-11-07, starting from PR #2 head
 `193e75c2ffc98c4ff30658b5d65db4ea45878e38`. Latest `origin/main` was fetched and
 confirmed to be an ancestor before implementation.

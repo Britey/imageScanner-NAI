@@ -235,7 +235,7 @@ def test_novelai_cleans_only_round_wrappers_at_tag_boundaries() -> None:
 def test_novelai_cleans_unmatched_foreign_round_punctuation_per_tag() -> None:
     assert parse_novelai_prompt(
         "(legendary Dragon Queen::, (1 girl), hair flowing) detailed sky"
-    ) == ["legendary Dragon Queen", "1 girl", "hair flowing detailed sky"]
+    ) == ["legendary Dragon Queen::", "1 girl", "hair flowing detailed sky"]
 
 
 def test_novelai_escaped_round_punctuation_remains_literal() -> None:

@@ -81,10 +81,12 @@ class CropQueryGateTests(unittest.TestCase):
 
     @patch("imgdupe.query.compute_image_hashes", return_value=({"phash256": b"hash", "sha256": b"sha"}, {}))
     @patch("imgdupe.query.find_candidates", return_value=[])
-    @patch("imgdupe.query.fetch_crop_hashes")
-    def test_disabled_crop_index_is_never_queried(self, fetch_crop_hashes, _find, _compute) -> None:
+    def test_disabled_crop_index_is_never_queried(self, _find, _compute) -> None:
+        statements = []
+        self.conn.set_trace_callback(statements.append)
         query_image(self.conn, Path("query.png"), tryhard=False)
-        fetch_crop_hashes.assert_not_called()
+        self.conn.set_trace_callback(None)
+        self.assertFalse(any("FROM crop_hashes" in sql for sql in statements))
 
 
 class ThumbnailCacheTests(unittest.TestCase):

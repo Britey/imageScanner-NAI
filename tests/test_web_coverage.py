@@ -130,15 +130,15 @@ class WebStateTests(WebFixture):
     def test_thumbnail_counts_cleanup_and_failures(self):
         for name in ["a.jpg", "b.jpg", "c.jpg"]:
             (self.state.thumbs_dir / name).write_bytes(b"jpg")
-            self.state.thumbnail_created()
+            self.state.thumbnail_created(self.state.thumbs_dir / name)
         self.assertEqual(self.state.thumbnail_cache_count, 2)
         self.assertEqual(len(list(self.state.thumbs_dir.glob("*.jpg"))), 2)
-        self.state.thumbnail_removed()
+        self.state.thumbnail_removed(self.state.thumbs_dir / "b.jpg")
         self.assertEqual(self.state.thumbnail_cache_count, 1)
         with patch.object(Path, "unlink", side_effect=OSError("busy")):
             self.assertEqual(self.state.clear_thumbnail_cache(), 0)
         self.assertEqual(self.state.clear_thumbnail_cache(), 2)
-        self.state.thumbnail_removed()
+        self.state.thumbnail_removed(self.state.thumbs_dir / "b.jpg")
         self.assertEqual(self.state.thumbnail_cache_count, 0)
 
     def test_background_scan_success_and_failure(self):
@@ -768,7 +768,7 @@ class WebHandlerTests(WebFixture):
         self.image()
         stale = self.state.thumbs_dir / "1-stale.jpg"
         stale.write_bytes(b"old")
-        self.state.thumbnail_cache_count = 1
+        self.state.thumbnail_created(stale)
         handler = self.request(path="/thumb/1.jpg")
         handler.do_GET()
         header, _, body = handler.wfile.getvalue().partition(b"\r\n\r\n")
@@ -781,6 +781,7 @@ class WebHandlerTests(WebFixture):
         self.assertEqual(self.response(self.request(path="/thumb/1.jpg"))[0], 200)
         self.state.clear_thumbnail_cache()
         stale.write_bytes(b"old")
+        self.state.thumbnail_created(stale)
         with (
             patch.object(Path, "unlink", side_effect=OSError("busy")),
             patch.object(web, "_write_thumbnail", return_value=False),

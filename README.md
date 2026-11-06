@@ -61,6 +61,11 @@ The GitHub **Manual verification** workflow runs these checks only through
 opening a pull request does not start CI.
 See the [recorded local verification results](docs/verification.md).
 
+For reproducible multi-gigabyte SQLite, HTTP, and browser performance testing,
+see the [performance testing toolkit](docs/performance-testing.md). It generates
+owned synthetic fixtures, retains timings/profiles, and removes disposable
+databases after the run. See the [implemented improvements and measured tradeoffs](docs/performance-improvements.md).
+
 ## Installation
 
 Clone the repository, create a virtual environment, then install the package:

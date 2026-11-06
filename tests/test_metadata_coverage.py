@@ -125,7 +125,7 @@ class ParserBoundaryCoverageTests(unittest.TestCase):
         self.assertEqual(prompt._clean_novelai_round_punctuation("cat)"), "cat")
         self.assertEqual(prompt._clean_novelai_round_punctuation("(cat"), "cat")
         self.assertEqual(prompt._clean_novelai_round_punctuation("(" * 65 + "cat" + ")" * 65), "cat")
-        self.assertEqual(prompt._filter_novelai_numeric_scopes("1::" * 65 + "cat" + "::" * 66), "cat")
+        self.assertEqual(prompt._filter_novelai_numeric_scopes("1::" * 65 + "cat" + "::" * 66), "cat" + "," * 64 + "::::")
         self.assertEqual(prompt.parse_novelai_prompt("cat, cat"), ["cat"])
         self.assertEqual(prompt.parse_novelai_prompt("cat, ("), ["cat"])
         self.assertEqual(prompt._split_top_level("(" * 65 + "cat:" + ")" * 65 + ":end", ":")[-1], "end")

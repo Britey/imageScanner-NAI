@@ -261,7 +261,8 @@ class QueryTests(SearchDatabaseCase):
         self.assertEqual(query.query_image(self.conn, pa, include_exact=False), [])
         self.assertEqual([item[0]["id"] for item in query.query_image(self.conn, pa, min_score=100)], [b])
         self.assertEqual(query.query_image(self.conn, pa, min_score=101), [])
-        self.assertEqual(query.query_image(self.conn, pa, limit=0), [])
+        with self.assertRaisesRegex(ValueError, "limit must be positive"):
+            query.query_image(self.conn, pa, limit=0)
         self.assertEqual(query.query_image(self.conn, pb, tryhard=True)[0][0]["id"], a)
         set_crop_index_state(self.conn, "ready")
         self.assertEqual(query.query_image(self.conn, pa, tryhard=True)[0][0]["id"], b)
@@ -281,11 +282,8 @@ class QueryTests(SearchDatabaseCase):
         a, pa = self.add_image("a.png", hashes={"phash256": bytes(32)}, sha=b"a")
         b, pb = self.add_image("b.png", hashes={"phash256": bytes(32)}, sha=b"b")
         candidates = [bands.Candidate(999, 2, {}), bands.Candidate(998, 2, {}), bands.Candidate(b, 2, {})]
-        actual = query.fetch_hash_row
-        def fetch(conn, image_id):
-            return actual(conn, b if image_id == 998 else image_id)
         rejected = match.PairScore(None, None, None, 0, None, None, 0, "reject")
-        with patch.object(query, "find_candidates", return_value=candidates), patch.object(query, "fetch_hash_row", side_effect=fetch), patch.object(query, "score_hashes", return_value=rejected):
+        with patch.object(query, "find_candidates", return_value=candidates), patch.object(query, "score_hashes", return_value=rejected):
             self.assertEqual(query.query_image(self.conn, pa), [])
         # A partial hash result without pHash is valid: tryhard still searches tiles.
         set_crop_index_state(self.conn, "ready")

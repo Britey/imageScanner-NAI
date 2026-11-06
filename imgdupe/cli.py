@@ -103,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     failures_parser.add_argument("--limit", type=int, default=100)
 
     args = parser.parse_args(argv)
+    if args.command in {"query", "tags"} and args.limit <= 0:
+        parser.error("--limit must be greater than zero")
 
     instance_lock = SingleInstanceLock() if args.command == "serve" else None
     if instance_lock is not None and not instance_lock.acquire():
