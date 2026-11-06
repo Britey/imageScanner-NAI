@@ -7,7 +7,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
+coverage.json
+coverage.xml
 build/
 dist/
 *.egg-info/
@@ -53,3 +56,7 @@ NAI-extractor/
 
 # Local prompt-parser reference fixtures and tools
 参考图示例/
+
+# TLC state and counterexample output (runner uses a temporary directory)
+formal/states/
+formal/*_TTrace_*

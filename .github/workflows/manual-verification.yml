@@ -1,0 +1,46 @@
+name: Manual verification
+
+# Deliberately no push, pull_request, schedule, or workflow_run triggers.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies (bounded retries for connection failover)
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if python -m pip install --timeout 60 --retries 0 -e '.[test]'; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then exit 1; fi
+            sleep 15
+          done
+      - name: Require 100% package statements and branches
+        run: |
+          python -m coverage erase
+          python -m coverage run -m unittest discover -s tests
+          python -m coverage report
+      - name: Check realistic semantic mutations
+        run: python scripts/check_mutations.py
+      - name: Fetch pinned TLA+ tools
+        shell: bash
+        run: |
+          curl --fail --location --connect-timeout 60 --max-time 180 \
+            --retry 3 --retry-delay 15 --retry-all-errors \
+            -o "$RUNNER_TEMP/tla2tools.jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+      - name: Check TLA+ safety, termination, and negative control
+        env:
+          TLA2TOOLS_JAR: ${{ runner.temp }}/tla2tools.jar
+        run: bash scripts/check_formal.sh

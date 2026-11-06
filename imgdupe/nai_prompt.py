@@ -692,7 +692,7 @@ def read_png_text_chunks(path: Path) -> dict[str, str]:
                         chunks[decode_png_text(key)] = decode_png_text(
                             _zlib_decompress_bounded(rest[1:])
                         )
-                elif chunk_type == b"iTXt":
+                else:  # Only iTXt remains after the non-text chunks above.
                     parsed = parse_png_itxt(data)
                     if parsed:
                         chunks[parsed[0]] = parsed[1]
@@ -700,17 +700,15 @@ def read_png_text_chunks(path: Path) -> dict[str, str]:
                 raise
             except (ValueError, zlib.error, UnicodeError):
                 pass
-            if chunk_type == b"IEND":
-                break
     return chunks
 
 
 def metadata_from_text_values(values: dict[str, str]) -> tuple[dict[str, Any] | None, str | None]:
     """Legacy helper retained for callers that expect decoded metadata dictionaries."""
     result = parse_text_metadata(values)
-    if result.prompt_format == "a1111":
+    if result.metadata_source == "text:parameters":
         parameters = _get_ci(values, "parameters")
-        return ({"parameters": parameters, "prompt": result.prompt} if parameters else None), result.metadata_source
+        return {"parameters": parameters, "prompt": result.prompt}, result.metadata_source
     for key in ("Comment", "Description", "prompt"):
         value = _get_ci(values, key)
         if isinstance(value, str):

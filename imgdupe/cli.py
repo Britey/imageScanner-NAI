@@ -251,7 +251,6 @@ def _run_command(args, parser: argparse.ArgumentParser, conn) -> int:
         return 0
 
     parser.error(f"unknown command {args.command}")
-    return 2
 
 
 if __name__ == "__main__":

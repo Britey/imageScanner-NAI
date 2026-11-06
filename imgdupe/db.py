@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import zlib
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 
 DELETE_BATCH_SIZE = 400
@@ -12,6 +15,34 @@ CROP_INDEX_VERSION = "1"
 PROMPT_SCHEMA_VERSION_KEY = "prompt_schema_version"
 PROMPT_SCHEMA_VERSION = "3"
 MAX_PROMPT_METADATA_BYTES = 4 * 1024 * 1024
+
+
+@contextmanager
+def temporary_image_ids(conn: sqlite3.Connection, image_ids: Iterable[int]) -> Iterator[str]:
+    """Provide deduplicated SQL membership without unbounded bind parameters.
+
+    The generated table is local to this connection and does not commit or
+    roll back caller work. Start a transaction if needed so a later rollback
+    cannot resurrect a table created before its transactional DROP.
+    WITHOUT ROWID makes NULL membership inert under INSERT OR IGNORE instead
+    of allocating an unintended integer ID.
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    table = f"image_ids_{uuid4().hex}"
+    conn.execute(
+        f"CREATE TEMP TABLE {table} (image_id INTEGER NOT NULL PRIMARY KEY) WITHOUT ROWID"
+    )
+    try:
+        conn.executemany(
+            f"INSERT OR IGNORE INTO temp.{table} (image_id) VALUES (?)",
+            ((image_id,) for image_id in image_ids),
+        )
+        yield f"temp.{table}"
+    finally:
+        # A caller may roll back the table creation before leaving the context.
+        conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
