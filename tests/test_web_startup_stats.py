@@ -4,7 +4,7 @@ import sqlite3
 import unittest
 
 from imgdupe.db import init_db
-from imgdupe.web import _stats
+from imgdupe.web import _count_unique_tags, _stats
 
 
 LEGACY_UNIQUE_TAGS = """
@@ -95,12 +95,12 @@ class WebStartupStatsTests(unittest.TestCase):
         legacy_count, legacy_ticks = measure(
             lambda: self.conn.execute(LEGACY_UNIQUE_TAGS).fetchone()[0]
         )
-        stats, optimized_ticks = measure(lambda: _stats(self.conn))
+        optimized_count, optimized_ticks = measure(lambda: _count_unique_tags(self.conn))
 
-        self.assertEqual(stats["unique_tags"], legacy_count)
+        self.assertEqual(optimized_count, legacy_count)
         self.assertEqual(legacy_count, 32)
-        # Compare VM work, not wall time: include all other home-page counters
-        # and still require a substantial reduction against the old tag count.
+        # Compare only the unique-tag queries so unrelated home-page counters
+        # cannot affect the VM-work bound across SQLite versions.
         self.assertLess(optimized_ticks, legacy_ticks // 2)
 
 
