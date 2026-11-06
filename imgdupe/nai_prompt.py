@@ -24,7 +24,7 @@ NOVELAI_RAW_FIELDS = (
     "v4_negative_prompt",
     "actual_prompts",
 )
-PROMPT_PARSER_VERSION = 5
+PROMPT_PARSER_VERSION = 6
 
 
 class PromptMetadataTooLarge(ValueError):
@@ -299,6 +299,11 @@ def normalize_prompt_tag(tag: str) -> str:
     return SPACE_PATTERN.sub(" ", unicodedata.normalize("NFC", cleaned)).casefold()
 
 
+def sanitize_model_name(name: str) -> str:
+    """Keep a model identity in one searchable tag without losing name words."""
+    return SPACE_PATTERN.sub(" ", name.translate({key: " " for key in SEPARATOR_TRANSLATION})).strip()
+
+
 def _parse_a1111_fragment(text: str, depth: int = 0) -> str:
     if depth >= MAX_NESTING:
         return text
@@ -335,27 +340,38 @@ def _parse_a1111_fragment(text: str, depth: int = 0) -> str:
 
 
 def _filter_novelai_numeric_scopes(text: str) -> str:
+    # Visit each delimiter/segment once. Looking for a numeric suffix backwards
+    # avoids repeatedly searching and copying the entire remaining prompt.
     output: list[str] = []
     scopes: list[float] = []
-    index = 0
-    while index < len(text):
-        if text.startswith("::", index):
+    zero_count = negative_count = 0
+    start = 0
+    for delimiter in re.finditer("::", text):
+        segment = text[start:delimiter.start()]
+        reversed_number = re.match(r"\s*\d+(?:\.\d+)?[+\-]?", segment.translate(NUMERIC_TRANSLATION)[::-1])
+        if reversed_number:
+            number_start = len(segment) - reversed_number.end()
+            if zero_count == 0 and negative_count % 2 == 0:
+                output.append(segment[:number_start])
+            if len(scopes) < MAX_NESTING:
+                value = float(segment[number_start:].strip().translate(NUMERIC_TRANSLATION))
+                scopes.append(value)
+                zero_count += value == 0
+                negative_count += value < 0
+        else:
+            if zero_count == 0 and negative_count % 2 == 0:
+                output.append(segment)
             if scopes:
-                scopes.pop()
-            index += 2
-            continue
-        delimiter = text.find("::", index)
-        if delimiter >= 0:
-            candidate = text[index:delimiter].strip().translate(NUMERIC_TRANSLATION)
-            if _is_number(candidate):
-                if len(scopes) < MAX_NESTING:
-                    scopes.append(float(candidate))
-                index = delimiter + 2
-                continue
-        eligible = bool(not scopes or (all(value != 0 for value in scopes) and sum(value < 0 for value in scopes) % 2 == 0))
-        if eligible:
-            output.append(text[index])
-        index += 1
+                value = scopes.pop()
+                zero_count -= value == 0
+                negative_count -= value < 0
+                # A closing delimiter separates the next tag from this scope.
+                output.append(",")
+            else:
+                output.append("::")
+        start = delimiter.end()
+    if zero_count == 0 and negative_count % 2 == 0:
+        output.append(text[start:])
     return "".join(output)
 
 
@@ -574,24 +590,33 @@ def bits_to_bytes(bits: list[int]) -> bytes:
 
 def read_stealth_metadata(image: Image.Image) -> dict[str, Any] | None:
     import numpy as np
-    alpha = np.asarray(image.convert("RGBA"), dtype=np.uint8)[:, :, 3]
-    streams = ((alpha.T.reshape(-1) & 1).tolist(), (alpha.reshape(-1) & 1).tolist())
+    if "A" not in image.getbands():
+        if "transparency" not in image.info:
+            return None
+        image = image.convert("RGBA")
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)
     prefix_bits = max(map(len, STEALTH_SIGNATURES)) * 8
-    for bits in streams:
-        prefix = bits_to_bytes(bits[:prefix_bits]).decode("utf-8", errors="ignore")
+    # flat slicing copies only the requested header or validated payload, even
+    # for the transposed orientation; no full-image Python bit lists are built.
+    for orientation in (alpha.T, alpha):
+        prefix = np.packbits(orientation.flat[:prefix_bits] & 1).tobytes().decode("utf-8", errors="ignore")
         signature = next((item for item in STEALTH_SIGNATURES if prefix.startswith(item)), None)
         if not signature:
             continue
         offset = len(signature) * 8
-        length_bits = bits[offset:offset + 32]
+        length_bits = orientation.flat[offset:offset + 32] & 1
         if len(length_bits) != 32:
             continue
-        length = int("".join(map(str, length_bits)), 2)
-        payload = bits_to_bytes(bits[offset + 32:offset + 32 + length])
+        length = int.from_bytes(np.packbits(length_bits).tobytes(), "big")
+        # Reject impossible/truncated headers before allocating their payload.
+        if length > orientation.size - offset - 32:
+            continue
+        payload_bytes = length // 8
+        if payload_bytes > MAX_TEXT_CHUNK_BYTES:
+            raise PromptMetadataTooLarge("prompt_metadata_too_large")
+        payload = np.packbits(orientation.flat[offset + 32:offset + 32 + payload_bytes * 8] & 1).tobytes()
         if STEALTH_SIGNATURES[signature]:
             payload = _gzip_decompress_bounded(payload)
-        elif len(payload) > MAX_TEXT_CHUNK_BYTES:
-            raise PromptMetadataTooLarge("prompt_metadata_too_large")
         text = payload.decode("utf-8")
         value = parse_jsonish_text(text) or {"prompt": text}
         value["_metadata_source"] = signature

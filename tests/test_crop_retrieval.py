@@ -42,14 +42,12 @@ class CropRetrievalTests(unittest.TestCase):
         set_crop_index_state(self.conn, "ready" if ready else "incomplete")
         def compute(_path, **options):
             hashes = {"sha256": b"query", "phash256": self.query_whole if whole is None else whole}
-            if options["include_crop_regions"]:
-                hashes.update({name: value for name, value in regions.items() if name.startswith("crop:")})
+            if options["include_query_tiles"]:
+                hashes.update(regions)
             return hashes, {}
-        with patch.object(query, "compute_image_hashes", side_effect=compute), patch.object(
-            query, "_query_crop_hashes", return_value=regions
-        ) as crops:
+        with patch.object(query, "compute_image_hashes", side_effect=compute) as computed:
             result = query.query_image(self.conn, self.query_path, tryhard=tryhard)
-        self.assertEqual(crops.call_count, int(tryhard))
+        self.assertEqual(computed.call_count, 1)
         return result
 
     def assert_crop_only_result(self, result, image_id, stored_type):

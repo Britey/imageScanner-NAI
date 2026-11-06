@@ -15,6 +15,7 @@ CROP_INDEX_VERSION = "1"
 PROMPT_SCHEMA_VERSION_KEY = "prompt_schema_version"
 PROMPT_SCHEMA_VERSION = "3"
 MAX_PROMPT_METADATA_BYTES = 4 * 1024 * 1024
+HASH_COLUMNS = ("dhash256", "phash256", "whash256", *(f"grid{i}" for i in range(9)))
 
 
 @contextmanager
@@ -27,7 +28,8 @@ def temporary_image_ids(conn: sqlite3.Connection, image_ids: Iterable[int]) -> I
     WITHOUT ROWID makes NULL membership inert under INSERT OR IGNORE instead
     of allocating an unintended integer ID.
     """
-    if not conn.in_transaction:
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
         conn.execute("BEGIN")
     table = f"image_ids_{uuid4().hex}"
     conn.execute(
@@ -42,6 +44,8 @@ def temporary_image_ids(conn: sqlite3.Connection, image_ids: Iterable[int]) -> I
     finally:
         # A caller may roll back the table creation before leaving the context.
         conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+        if owns_transaction:
+            conn.commit()
 
 
 SCHEMA = """
@@ -153,10 +157,13 @@ CREATE TABLE IF NOT EXISTS app_metadata (
 );
 
 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
+CREATE INDEX IF NOT EXISTS idx_images_size_sha ON images(size_bytes,sha256) WHERE sha256 IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_images_path ON images(path);
 CREATE INDEX IF NOT EXISTS idx_hash_bands_image_id ON hash_bands(image_id);
 CREATE INDEX IF NOT EXISTS idx_crop_hashes_image_id ON crop_hashes(image_id);
 CREATE INDEX IF NOT EXISTS idx_matches_score ON matches(score);
+CREATE INDEX IF NOT EXISTS idx_matches_reverse ON matches(image_id_b);
+CREATE INDEX IF NOT EXISTS idx_clusters_image ON clusters(image_id, cluster_id);
 CREATE INDEX IF NOT EXISTS idx_clusters_cluster ON clusters(cluster_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_tags_norm_image ON prompt_tags(tag_norm, image_id);
 """
@@ -196,12 +203,14 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA recursive_triggers = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: sqlite3.Connection, *, defer_search_index: bool = False) -> None:
+    conn.execute("PRAGMA recursive_triggers = ON")
     conn.executescript(SCHEMA)
     with conn:
         _ensure_column(conn, "images", "created_ns", "INTEGER")
@@ -228,6 +237,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_prompt_tags_kind_norm_image "
             "ON prompt_tags(tag_kind, tag_norm, image_id)"
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_prompt_tags_category ON prompt_tags(image_id,tag_kind) "
+                     "WHERE tag_kind IN ('model_type','model_config')")
         if not prompt_schema_is_current:
             # Keep pre-v3 databases immediately searchable by their structured
             # model columns. A later prompt reindex adds full identities and
@@ -267,6 +278,8 @@ def init_db(conn: sqlite3.Connection) -> None:
                 """
             )
             set_metadata(conn, PROMPT_SCHEMA_VERSION_KEY, PROMPT_SCHEMA_VERSION)
+    if not defer_search_index:
+        _init_search_schema(conn)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
@@ -633,8 +646,7 @@ def fetch_hash_row(conn: sqlite3.Connection, image_id: int) -> sqlite3.Row | Non
 
 
 def hash_row_to_dict(row: sqlite3.Row) -> dict[str, bytes]:
-    keys = ["dhash256", "phash256", "whash256"] + [f"grid{i}" for i in range(9)]
-    return {key: row[key] for key in keys if row[key] is not None}
+    return {key: row[key] for key in HASH_COLUMNS if row[key] is not None}
 
 
 def replace_crop_hashes(
@@ -781,3 +793,202 @@ def replace_prompt(
             for position, tag in enumerate(tags)
         ],
     )
+
+
+# These tables deliberately exclude raw metadata and image payloads. The initial
+# migration reads the collection once; subsequent opens only check its version.
+SEARCH_SCHEMA = """
+CREATE TABLE prompt_texts(id INTEGER PRIMARY KEY, prompt TEXT NOT NULL UNIQUE);
+CREATE TABLE prompt_search(
+    image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    prompt_id INTEGER,
+    configured_model TEXT,
+    has_prompt_row INTEGER NOT NULL DEFAULT 0,
+    decode_failed INTEGER NOT NULL DEFAULT 0,
+    prompt_failed INTEGER NOT NULL DEFAULT 0,
+    missing INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_prompt_search_prompt ON prompt_search(prompt_id);
+CREATE TABLE tag_stats(
+    tag_norm TEXT NOT NULL, tag_kind TEXT NOT NULL, tag TEXT NOT NULL,
+    count INTEGER NOT NULL,
+    PRIMARY KEY(tag_norm, tag_kind, tag)
+) WITHOUT ROWID;
+CREATE INDEX idx_tag_stats_kind ON tag_stats(tag_kind,tag_norm,tag,count);
+CREATE TABLE tag_names(tag_norm TEXT PRIMARY KEY, variants INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE cluster_counts(cluster_id INTEGER PRIMARY KEY, count INTEGER NOT NULL);
+CREATE TABLE collection_stats(
+    id INTEGER PRIMARY KEY CHECK(id=1), indexed INTEGER NOT NULL DEFAULT 0,
+    ok INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+    hashed INTEGER NOT NULL DEFAULT 0, groups INTEGER NOT NULL DEFAULT 0,
+    matches INTEGER NOT NULL DEFAULT 0, prompts INTEGER NOT NULL DEFAULT 0,
+    unique_tags INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO prompt_texts(prompt) SELECT DISTINCT prompt FROM image_prompts WHERE prompt IS NOT NULL;
+INSERT INTO prompt_search
+SELECT i.id, t.id, ip.configured_model, ip.image_id IS NOT NULL,
+       i.decode_error IS NOT NULL,
+       ip.prompt_error IS NOT NULL AND ip.prompt_error NOT IN ('no_metadata','no_prompt'),
+       i.missing_at IS NOT NULL
+FROM images i LEFT JOIN image_prompts ip ON ip.image_id=i.id
+LEFT JOIN prompt_texts t ON t.prompt=ip.prompt;
+INSERT INTO tag_stats
+SELECT pt.tag_norm, pt.tag_kind, pt.tag, COUNT(*) FROM prompt_tags pt
+JOIN prompt_search s ON s.image_id=pt.image_id
+WHERE s.has_prompt_row AND NOT(pt.tag_kind='model_type' AND s.configured_model IS NOT NULL)
+GROUP BY pt.tag_norm,pt.tag_kind,pt.tag;
+INSERT INTO tag_names SELECT tag_norm, COUNT(*) FROM tag_stats GROUP BY tag_norm;
+INSERT INTO cluster_counts SELECT cluster_id,COUNT(*) FROM clusters GROUP BY cluster_id;
+INSERT INTO collection_stats
+SELECT 1, COUNT(*), COALESCE(SUM(NOT decode_failed AND NOT missing),0),
+       COALESCE(SUM(decode_failed OR prompt_failed),0),
+       (SELECT COUNT(*) FROM hashes), (SELECT COUNT(*) FROM cluster_counts),
+       (SELECT COUNT(*) FROM matches), COALESCE(SUM(prompt_id IS NOT NULL),0),
+       (SELECT COUNT(*) FROM tag_names)
+FROM prompt_search;
+"""
+
+
+def _init_search_schema(conn: sqlite3.Connection) -> None:
+    if get_metadata(conn, "search_schema_version") == "1":
+        return
+    # DDL, backfill, triggers, and the marker are atomic even after interruption.
+    script = SEARCH_SCHEMA + _search_triggers()
+    try:
+        conn.executescript("BEGIN IMMEDIATE;\n" + script)
+        set_metadata(conn, "search_schema_version", "1")
+        if conn.execute("SELECT indexed FROM collection_stats").fetchone()[0] == 0:
+            import hashlib
+
+            set_metadata(conn, "model_config_revision", hashlib.sha256(b"[]").hexdigest())
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _search_triggers() -> str:
+    statements: list[str] = []
+
+    def trigger(name: str, event: str, table: str, body: str, when: str = "") -> None:
+        condition = f" WHEN {when}" if when else ""
+        statements.append(f"CREATE TRIGGER {name} AFTER {event} ON {table}{condition} BEGIN {body} END;")
+
+    # The projection follows all SQL writers, including cascades and REPLACE.
+    trigger("search_image_insert", "INSERT", "images", """
+        INSERT INTO prompt_search(image_id,decode_failed,missing)
+        VALUES(new.id,new.decode_error IS NOT NULL,new.missing_at IS NOT NULL);
+    """)
+    trigger("search_image_update", "UPDATE OF decode_error,missing_at", "images", """
+        UPDATE prompt_search SET decode_failed=new.decode_error IS NOT NULL,
+          missing=new.missing_at IS NOT NULL WHERE image_id=new.id;
+    """)
+    for event in ("INSERT", "UPDATE"):
+        reset_old = """UPDATE prompt_search SET prompt_id=NULL,configured_model=NULL,has_prompt_row=0,prompt_failed=0
+            WHERE image_id=old.image_id AND old.image_id<>new.image_id;""" if event == "UPDATE" else ""
+        trigger(f"search_prompt_{event.lower()}", event, "image_prompts", reset_old + """
+            INSERT INTO prompt_texts(prompt) SELECT new.prompt WHERE new.prompt IS NOT NULL
+              AND NOT EXISTS(SELECT 1 FROM prompt_texts WHERE prompt=new.prompt);
+            UPDATE prompt_search SET prompt_id=(SELECT id FROM prompt_texts WHERE prompt=new.prompt),
+              configured_model=new.configured_model,has_prompt_row=1,
+              prompt_failed=new.prompt_error IS NOT NULL AND new.prompt_error NOT IN ('no_metadata','no_prompt')
+            WHERE image_id=new.image_id;
+        """)
+    trigger("search_prompt_delete", "DELETE", "image_prompts", """
+        UPDATE prompt_search SET prompt_id=NULL,configured_model=NULL,has_prompt_row=0,prompt_failed=0
+        WHERE image_id=old.image_id;
+    """)
+    # Count variants, not just names: deleting the lexically first spelling must
+    # reveal the next spelling without scanning every image carrying that tag.
+    # Deletions target only the affected keys, rather than scanning tag_stats.
+    def tag_delta(row: str, positive: bool) -> str:
+        key = f"tag_norm={row}.tag_norm AND tag_kind={row}.tag_kind AND tag={row}.tag"
+        if positive:
+            return f"""INSERT INTO tag_stats VALUES({row}.tag_norm,{row}.tag_kind,{row}.tag,1)
+                ON CONFLICT(tag_norm,tag_kind,tag) DO UPDATE SET count=count+1;"""
+        return f"UPDATE tag_stats SET count=count-1 WHERE {key}; DELETE FROM tag_stats WHERE {key} AND count=0;"
+
+    for event, row, positive in (("INSERT", "new", True), ("DELETE", "old", False)):
+        visibility = f"EXISTS(SELECT 1 FROM prompt_search s WHERE s.image_id={row}.image_id AND s.has_prompt_row AND NOT({row}.tag_kind='model_type' AND s.configured_model IS NOT NULL))"
+        trigger(f"search_tag_{event.lower()}", event, "prompt_tags", tag_delta(row, positive), visibility)
+    # Updates may change identity, spelling, kind, or the owning image.
+    trigger("search_tag_update", "UPDATE", "prompt_tags", """
+        UPDATE tag_stats SET count=count-1
+        WHERE tag_norm=old.tag_norm AND tag_kind=old.tag_kind AND tag=old.tag
+          AND EXISTS(SELECT 1 FROM prompt_search s WHERE s.image_id=old.image_id AND s.has_prompt_row
+            AND NOT(old.tag_kind='model_type' AND s.configured_model IS NOT NULL));
+        DELETE FROM tag_stats WHERE tag_norm=old.tag_norm AND tag_kind=old.tag_kind AND tag=old.tag AND count=0;
+        INSERT INTO tag_stats SELECT new.tag_norm,new.tag_kind,new.tag,1
+        WHERE EXISTS(SELECT 1 FROM prompt_search s WHERE s.image_id=new.image_id AND s.has_prompt_row
+            AND NOT(new.tag_kind='model_type' AND s.configured_model IS NOT NULL))
+        ON CONFLICT(tag_norm,tag_kind,tag) DO UPDATE SET count=count+1;
+    """)
+    old_keys = """SELECT tag_norm,tag_kind,tag FROM prompt_tags WHERE image_id=old.image_id
+        AND old.has_prompt_row AND NOT(tag_kind='model_type' AND old.configured_model IS NOT NULL)"""
+    subtract = f"""UPDATE tag_stats SET count=count-1 WHERE (tag_norm,tag_kind,tag) IN ({old_keys});
+        DELETE FROM tag_stats WHERE count=0 AND (tag_norm,tag_kind,tag) IN ({old_keys});"""
+    trigger("search_visibility_update", "UPDATE OF has_prompt_row,configured_model", "prompt_search", subtract + """
+        INSERT INTO tag_stats SELECT tag_norm,tag_kind,tag,1 FROM prompt_tags WHERE image_id=new.image_id
+          AND new.has_prompt_row AND NOT(tag_kind='model_type' AND new.configured_model IS NOT NULL)
+        ON CONFLICT(tag_norm,tag_kind,tag) DO UPDATE SET count=count+1;
+    """, "old.has_prompt_row<>new.has_prompt_row OR (old.configured_model IS NULL)<>(new.configured_model IS NULL)")
+    trigger("search_visibility_delete", "DELETE", "prompt_search", subtract)
+    trigger("tag_name_insert", "INSERT", "tag_stats", """
+        INSERT INTO tag_names VALUES(new.tag_norm,1) ON CONFLICT(tag_norm) DO UPDATE SET variants=variants+1;
+    """)
+    trigger("tag_name_delete", "DELETE", "tag_stats", """
+        UPDATE tag_names SET variants=variants-1 WHERE tag_norm=old.tag_norm;
+        DELETE FROM tag_names WHERE tag_norm=old.tag_norm AND variants=0;
+    """)
+    for table, column in (("hashes", "hashed"), ("matches", "matches"), ("tag_names", "unique_tags"), ("cluster_counts", "groups")):
+        for event, delta in (("INSERT", "+1"), ("DELETE", "-1")):
+            trigger(f"count_{table}_{event.lower()}", event, table, f"UPDATE collection_stats SET {column}={column}{delta};")
+    cluster_add = "INSERT INTO cluster_counts VALUES(new.cluster_id,1) ON CONFLICT(cluster_id) DO UPDATE SET count=count+1;"
+    cluster_remove = "UPDATE cluster_counts SET count=count-1 WHERE cluster_id=old.cluster_id; DELETE FROM cluster_counts WHERE cluster_id=old.cluster_id AND count=0;"
+    trigger("count_cluster_insert", "INSERT", "clusters", cluster_add)
+    trigger("count_cluster_delete", "DELETE", "clusters", cluster_remove)
+    trigger("count_cluster_update", "UPDATE OF cluster_id", "clusters", cluster_remove + cluster_add)
+    def counters(row: str, sign: str) -> str:
+        return f"""indexed=indexed{sign}1, ok=ok{sign}(NOT {row}.decode_failed AND NOT {row}.missing),
+            failed=failed{sign}({row}.decode_failed OR {row}.prompt_failed),
+            prompts=prompts{sign}({row}.prompt_id IS NOT NULL)"""
+    trigger("count_search_insert", "INSERT", "prompt_search", f"UPDATE collection_stats SET {counters('new','+')};")
+    trigger("count_search_delete", "DELETE", "prompt_search", f"UPDATE collection_stats SET {counters('old','-')};")
+    trigger("count_search_update", "UPDATE", "prompt_search", f"UPDATE collection_stats SET {counters('old','-')}; UPDATE collection_stats SET {counters('new','+')};")
+    cleanup_prompt = "DELETE FROM prompt_texts WHERE id=old.prompt_id AND NOT EXISTS(SELECT 1 FROM prompt_search WHERE prompt_id=old.prompt_id);"
+    trigger("prompt_text_update", "UPDATE OF prompt_id", "prompt_search", cleanup_prompt, "old.prompt_id IS NOT new.prompt_id")
+    trigger("prompt_text_delete", "DELETE", "prompt_search", cleanup_prompt)
+    return "\n".join(statements)
+
+
+def fetch_tag_suggestions(conn: sqlite3.Connection, prefix: str, limit: int = 5) -> list[dict[str, object]]:
+    rows = conn.execute("""
+        SELECT MIN(tag) AS tag,SUM(count) AS count FROM tag_stats
+        WHERE tag_norm>=? AND tag_norm<? GROUP BY tag_norm ORDER BY count DESC,tag_norm LIMIT ?
+    """, (prefix, prefix + "\U0010ffff", limit))
+    return [{"tag": row["tag"], "count": int(row["count"])} for row in rows if row["tag"]]
+
+
+def fetch_model_options(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    rows = conn.execute("""
+        SELECT MIN(tag) AS tag,tag_norm FROM tag_stats
+        WHERE tag_kind IN ('model_config','model_type') AND tag_norm LIKE '@model:%'
+        GROUP BY tag_norm ORDER BY CASE tag_norm WHEN '@model:sd' THEN 0 WHEN '@model:nai3' THEN 1
+          WHEN '@model:nai4' THEN 2 WHEN '@model:no_metadata' THEN 4 ELSE 3 END,tag_norm
+    """)
+    options = []
+    for row in rows:
+        tag = row["tag"]
+        if tag.casefold().startswith("@model:"):
+            label = tag[len("@model:"):]
+            options.append((label, label.upper() if label.casefold() in {"sd", "nai3", "nai4"} else label))
+    return options
+
+
+def count_unique_tags(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT unique_tags FROM collection_stats").fetchone()[0])
+
+
+def fetch_stats(conn: sqlite3.Connection) -> dict[str, int]:
+    row = conn.execute("SELECT * FROM collection_stats").fetchone()
+    return {**{key: int(row[key]) for key in row.keys() if key != "id"}, "crop_ready": int(is_crop_index_ready(conn))}

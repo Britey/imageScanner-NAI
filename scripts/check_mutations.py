@@ -33,23 +33,21 @@ class Mutation:
 
 MUTATIONS = (
     Mutation(
-        "unique-tags-deduplication", "web",
-        "FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags",
-        "FROM (SELECT tag_norm FROM prompt_tags) tags",
+        "unique-tags-deduplication", "db",
+        'SELECT unique_tags FROM collection_stats',
+        'SELECT COALESCE(SUM(count),0) FROM tag_stats',
         "Repeated occurrences must contribute only one distinct visible tag.",
     ),
     Mutation(
-        "unique-tags-model-visibility", "web",
-        "WHERE pt.tag_norm = tags.tag_norm\n"
-        "              AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)",
-        "WHERE pt.tag_norm = tags.tag_norm\n"
-        "              AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NULL)",
+        "unique-tags-model-visibility", "db",
+        "AND NOT({row}.tag_kind='model_type' AND s.configured_model IS NOT NULL)",
+        "AND NOT({row}.tag_kind='model_type' AND s.configured_model IS NULL)",
         "Configured labels suppress detected model tags, including empty non-NULL labels.",
     ),
     Mutation(
-        "unique-tags-existential-witness", "web",
-        "FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags\n        WHERE EXISTS (",
-        "FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags\n        WHERE NOT EXISTS (",
+        "unique-tags-existential-witness", "db",
+        "s.image_id={row}.image_id AND s.has_prompt_row AND NOT",
+        "s.image_id={row}.image_id AND NOT s.has_prompt_row AND NOT",
         "A name counts when at least one occurrence has a visible prompt-row witness.",
     ),
     Mutation(
@@ -212,8 +210,8 @@ MUTATIONS = (
     ),
     Mutation(
         "review-match-membership-both-endpoints", "review",
-        'AND m.image_id_b IN (SELECT image_id FROM {membership})',
-        'AND m.image_id_a IN (SELECT image_id FROM {membership})',
+        'WHERE other.image_id = m.image_id_b)',
+        'WHERE other.image_id = m.image_id_a)',
         "Cluster review must exclude matches with either endpoint outside the selected cluster.",
     ),
     Mutation(
@@ -300,8 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
         for directory in ("imgdupe", "tests"):
             shutil.copytree(repository / directory, workspace / directory, ignore=ignored)
-        (workspace / "scripts").mkdir()
-        shutil.copy2(repository / "scripts" / "compare_reference_prompt_tags.py", workspace / "scripts")
+        shutil.copytree(repository / "scripts", workspace / "scripts", ignore=ignored)
         shutil.copy2(repository / "settings.ini", workspace / "settings.ini")
 
         # Verify the package location in the same isolated environment used by

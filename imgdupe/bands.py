@@ -84,6 +84,8 @@ def find_candidates(
     hashes: dict[str, bytes],
     *,
     exclude_image_id: int | None = None,
+    min_image_id: int | None = None,
+    sort: bool = True,
     crop_query_hashes: Iterable[bytes] = (),
     whole_band_size: int = 2,
     grid_band_size: int = 2,
@@ -94,6 +96,8 @@ def find_candidates(
     It accepts query crops, query tiles and the query's whole-image pHash. Each
     stored band contributes at most one hit, even when several query regions or
     aliases contain the same band. Batching avoids one SQL call per region/band.
+    ``min_image_id`` restricts the indexed lookup itself to later images, so
+    clustering visits each pair once. ``sort=False`` avoids unused rank sorting.
     """
     probes: set[tuple[str, int, bytes]] = set()
     for hash_key, hash_bytes in hashes.items():
@@ -119,7 +123,10 @@ def find_candidates(
     }
     hit_counts: Counter[int] = Counter()
     type_counts: dict[int, Counter[str]] = defaultdict(Counter)
-    for rows in (_matching_band_rows(conn, probes), _matching_band_rows(conn, crop_probes, crop=True)):
+    for rows in (
+        _matching_band_rows(conn, probes, min_image_id=min_image_id),
+        _matching_band_rows(conn, crop_probes, crop=True, min_image_id=min_image_id),
+    ):
         for row in rows:
             image_id = int(row["image_id"])
             if exclude_image_id is not None and image_id == exclude_image_id:
@@ -136,11 +143,15 @@ def find_candidates(
         crop_hit = any(name.startswith("crop:") for name in by_type)
         if total_hits >= 2 or whole_hit or grid_hit or crop_hit:
             candidates.append(Candidate(image_id, total_hits, by_type))
-    candidates.sort(key=lambda item: (-item.total_hits, item.image_id))
+    if sort:
+        candidates.sort(key=lambda item: (-item.total_hits, item.image_id))
     return candidates
 
 
-def _matching_band_rows(conn: sqlite3.Connection, probes: set[tuple], *, crop: bool = False):
+def _matching_band_rows(
+    conn: sqlite3.Connection, probes: set[tuple], *, crop: bool = False,
+    min_image_id: int | None = None,
+):
     ordered = sorted(probes)
     columns = "band_index, band_value" if crop else "hash_type, band_index, band_value"
     placeholders = "(?, ?)" if crop else "(?, ?, ?)"
@@ -154,6 +165,10 @@ def _matching_band_rows(conn: sqlite3.Connection, probes: set[tuple], *, crop: b
         parameters = [value for probe in batch for value in probe]
         if crop:
             parameters.extend(CROP_HASH_TYPES)
+        id_condition = ""
+        if min_image_id is not None:
+            id_condition = "AND hb.image_id > ?"
+            parameters.append(min_image_id)
         # Keep the small wanted relation outermost. Otherwise SQLite can scan
         # every stored crop band and build an automatic index on wanted.
         yield from conn.execute(
@@ -165,6 +180,7 @@ def _matching_band_rows(conn: sqlite3.Connection, probes: set[tuple], *, crop: b
             WHERE hb.band_index = wanted.band_index
              AND hb.band_value = wanted.band_value
              AND {type_condition}
+             {id_condition}
             """,
             parameters,
         )

@@ -52,11 +52,11 @@ class ModelPathConfig:
     rules: tuple[ModelPathRule, ...] = ()
     issues: tuple[ConfigIssue, ...] = ()
 
-    def resolve(self, candidate: Path | str) -> ModelPathRule | None:
+    def resolve(self, candidate: Path | str, *, canonical: bool = False) -> ModelPathRule | None:
         """Return the rule at the closest configured ancestor of ``candidate``."""
 
-        path = canonical_path(candidate)
-        matches = [rule for rule in self.rules if path_is_within(path, rule.path)]
+        path = Path(candidate) if canonical else canonical_path(candidate)
+        matches = [rule for rule in self.rules if lexical_path_is_within(path, rule.path)]
         if not matches:
             return None
         # Canonical duplicate paths are removed while loading/constructing.  The
@@ -277,6 +277,13 @@ def path_key(path: Path | str) -> str:
 def path_is_within(path: Path | str, ancestor: Path | str) -> bool:
     candidate_key = path_key(path)
     ancestor_key = path_key(ancestor)
+    return lexical_path_is_within(candidate_key, ancestor_key)
+
+
+def lexical_path_is_within(path: Path | str, ancestor: Path | str) -> bool:
+    """Compare already-canonical paths without walking or statting the filesystem."""
+    candidate_key = os.path.normcase(os.path.abspath(str(path)))
+    ancestor_key = os.path.normcase(os.path.abspath(str(ancestor)))
     try:
         return os.path.normcase(os.path.commonpath((candidate_key, ancestor_key))) == ancestor_key
     except ValueError:

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import html
 import json
+import os
+import tempfile
+from contextlib import closing, contextmanager
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,39 +41,75 @@ def generate_review(
 
     payload = []
     thumbnail_count = 0
-    for cluster in tqdm(clusters, desc="Writing review", unit="cluster"):
-        cluster_id = int(cluster["cluster_id"])
-        images = _fetch_cluster_images(conn, cluster_id)
-        matches = _fetch_cluster_matches(conn, [int(row["id"]) for row in images])
-        image_payload = []
-        for row in images:
-            thumb_name = f"{int(row['id'])}.jpg"
-            thumb_path = thumbs_dir / thumb_name
-            if _write_thumbnail(Path(row["path"]), thumb_path, thumbnail_size):
-                thumbnail_count += 1
-            image_payload.append(_image_json(row, f"thumbnails/{thumb_name}"))
+    with _atomic_text(out_dir / "clusters.json") as manifest:
+        manifest.write('{"clusters":[')
+        for cluster in tqdm(clusters, desc="Writing review", unit="cluster"):
+            cluster_id = int(cluster["cluster_id"])
+            images = _fetch_cluster_images(conn, cluster_id)
+            image_payload = []
+            for row in images:
+                thumb_name = f"{int(row['id'])}.jpg"
+                thumb_path = thumbs_dir / thumb_name
+                if _write_thumbnail(Path(row["path"]), thumb_path, thumbnail_size):
+                    thumbnail_count += 1
+                image_payload.append(_image_json(row, f"thumbnails/{thumb_name}"))
 
-        cluster_payload = {
-            "cluster_id": cluster_id,
-            "count": len(images),
-            "representative": _representative_path(images),
-            "images": image_payload,
-            "matches": [_match_json(row) for row in matches],
-        }
-        payload.append(cluster_payload)
-        _write_cluster_page(out_dir / f"cluster_{cluster_id:06d}.html", cluster_payload)
-
-    (out_dir / "clusters.json").write_text(
-        json.dumps({"clusters": payload}, indent=2),
-        encoding="utf-8",
-    )
-    _write_index_page(out_dir / "index.html", payload)
+            cluster_payload = {
+                "cluster_id": cluster_id,
+                "count": len(images),
+                "representative": _representative_path(images),
+                "images": image_payload,
+            }
+            if payload:
+                manifest.write(",")
+            manifest.write("{")
+            for key, value in cluster_payload.items():
+                json.dump(key, manifest)
+                manifest.write(":")
+                json.dump(value, manifest)
+                manifest.write(",")
+            manifest.write('"matches":[')
+            # Feed each edge to the manifest and HTML once. The SQLite cursor
+            # may spill its ordering to disk; Python never retains all edges.
+            with closing(_iter_cluster_matches(conn, [int(row["id"]) for row in images])) as matches:
+                cluster_payload["matches"] = _manifest_matches(matches, manifest)
+                _write_cluster_page(out_dir / f"cluster_{cluster_id:06d}.html", cluster_payload)
+            manifest.write("]}")
+            payload.append({**cluster_payload, "images": image_payload[:1], "matches": []})
+        manifest.write("]}")
+        _write_index_page(out_dir / "index.html", payload)
     return ReviewStats(
         clusters=len(payload),
         images=sum(cluster["count"] for cluster in payload),
         thumbnails=thumbnail_count,
         out_dir=out_dir,
     )
+
+
+@contextmanager
+def _atomic_text(path: Path):
+    """Publish completed output only; retain the prior export on any failure."""
+    output = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False)
+    temporary = Path(output.name)
+    try:
+        with output:
+            yield output
+        os.replace(temporary, path)
+    finally:
+        # Windows requires the handle to be closed even on the failure path.
+        temporary.unlink(missing_ok=True)
+
+
+def _manifest_matches(rows, manifest):
+    first = True
+    for row in rows:
+        if not first:
+            manifest.write(",")
+        first = False
+        value = _match_json(row)
+        json.dump(value, manifest)
+        yield value
 
 
 def _fetch_clusters(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -106,19 +145,25 @@ def _fetch_cluster_matches(
     conn: sqlite3.Connection,
     image_ids: list[int],
 ) -> list[sqlite3.Row]:
+    return list(_iter_cluster_matches(conn, image_ids))
+
+
+def _iter_cluster_matches(conn: sqlite3.Connection, image_ids: list[int]):
     if len(image_ids) < 2:
-        return []
+        return
     with temporary_image_ids(conn, image_ids) as membership:
         # Keep membership indexed instead of scanning the global score index.
-        return conn.execute(
+        yield from conn.execute(
             f"""
             SELECT m.*
-            FROM matches m
-            WHERE m.image_id_a IN (SELECT image_id FROM {membership})
-              AND m.image_id_b IN (SELECT image_id FROM {membership})
+            FROM {membership} members
+            CROSS JOIN matches m
+            WHERE m.image_id_a = members.image_id
+              AND EXISTS (SELECT 1 FROM {membership} other
+                          WHERE other.image_id = m.image_id_b)
             ORDER BY m.score DESC, m.decision
             """
-        ).fetchall()
+        )
 
 
 def _write_thumbnail(source: Path, target: Path, thumbnail_size: int) -> bool:
@@ -152,15 +197,22 @@ def _write_index_page(path: Path, clusters: list[dict]) -> None:
             </a>
             """
         )
-    path.write_text(_page("imgdupe review", "".join(rows), index=True), encoding="utf-8")
+    with _atomic_text(path) as output:
+        output.write(_page("imgdupe review", "".join(rows), index=True))
 
 
 def _write_cluster_page(path: Path, cluster: dict) -> None:
-    cards = []
-    for image in cluster["images"]:
-        badge = "KEEP" if image["representative"] else ""
-        cards.append(
-            f"""
+    header, footer = _page(f"Cluster {cluster['cluster_id']}", "\0").split("\0")
+    with _atomic_text(path) as output:
+        output.write(header)
+        output.write(f"""
+        <nav><a href="index.html">Review index</a></nav>
+        <h1>Cluster {cluster['cluster_id']}</h1>
+        <section class="grid">
+        """)
+        for image in cluster["images"]:
+            badge = "KEEP" if image["representative"] else ""
+            output.write(f"""
             <article class="card">
               <img src="{html.escape(image['thumbnail'])}" alt="">
               <div class="meta">
@@ -171,12 +223,17 @@ def _write_cluster_page(path: Path, cluster: dict) -> None:
               </div>
               <p class="path">{html.escape(image['path'])}</p>
             </article>
-            """
-        )
-    match_rows = []
-    for match in cluster["matches"]:
-        match_rows.append(
-            f"""
+            """)
+        output.write("""
+        </section>
+        <h2>Pair Scores</h2>
+        <table><thead><tr>
+          <th>A</th><th>B</th><th>Score</th><th>Decision</th>
+          <th>pHash</th><th>wHash</th><th>dHash</th><th>Grid</th>
+        </tr></thead><tbody>
+        """)
+        for match in cluster["matches"]:
+            output.write(f"""
             <tr>
               <td>{match['image_id_a']}</td>
               <td>{match['image_id_b']}</td>
@@ -187,24 +244,9 @@ def _write_cluster_page(path: Path, cluster: dict) -> None:
               <td>{match['dhash_dist']}</td>
               <td>{match['grid_match_count']}</td>
             </tr>
-            """
-        )
-    body = f"""
-    <nav><a href="index.html">Review index</a></nav>
-    <h1>Cluster {cluster['cluster_id']}</h1>
-    <section class="grid">{''.join(cards)}</section>
-    <h2>Pair Scores</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>A</th><th>B</th><th>Score</th><th>Decision</th>
-          <th>pHash</th><th>wHash</th><th>dHash</th><th>Grid</th>
-        </tr>
-      </thead>
-      <tbody>{''.join(match_rows)}</tbody>
-    </table>
-    """
-    path.write_text(_page(f"Cluster {cluster['cluster_id']}", body), encoding="utf-8")
+            """)
+        output.write("</tbody></table>")
+        output.write(footer)
 
 
 def _page(title: str, body: str, *, index: bool = False) -> str:
