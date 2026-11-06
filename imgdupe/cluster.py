@@ -11,7 +11,7 @@ except ImportError:  # Progress output is optional for library/test environments
 
 from .bands import find_candidates
 from .config import ScanConfig, Thresholds
-from .db import fetch_hash_row, hash_row_to_dict
+from .db import fetch_hash_row, hash_row_to_dict, temporary_image_ids
 from .match import PairScore, score_hashes
 from .utils import utc_now_sql
 
@@ -210,15 +210,14 @@ def _groups_from_union_find(union_find: UnionFind) -> list[list[int]]:
 
 
 def _choose_representative(conn: sqlite3.Connection, members: list[int]) -> int:
-    placeholders = ",".join("?" for _ in members)
-    rows = conn.execute(
-        f"""
-        SELECT id, width, height, size_bytes
-        FROM images
-        WHERE id IN ({placeholders})
-        """,
-        members,
-    ).fetchall()
+    with temporary_image_ids(conn, members) as membership:
+        rows = conn.execute(
+            f"""
+            SELECT i.id, i.width, i.height, i.size_bytes
+            FROM images i
+            JOIN {membership} member ON member.image_id = i.id
+            """
+        ).fetchall()
     best = max(
         rows,
         key=lambda row: (

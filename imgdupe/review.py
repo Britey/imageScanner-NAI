@@ -13,6 +13,7 @@ except ImportError:  # Progress output is optional for library/test environments
     def tqdm(iterable=None, **_kwargs):
         return iterable if iterable is not None else ()
 
+from .db import temporary_image_ids
 from .utils import human_size
 
 
@@ -107,17 +108,16 @@ def _fetch_cluster_matches(
 ) -> list[sqlite3.Row]:
     if len(image_ids) < 2:
         return []
-    placeholders = ",".join("?" for _ in image_ids)
-    return conn.execute(
-        f"""
-        SELECT *
-        FROM matches
-        WHERE image_id_a IN ({placeholders})
-          AND image_id_b IN ({placeholders})
-        ORDER BY score DESC, decision
-        """,
-        [*image_ids, *image_ids],
-    ).fetchall()
+    with temporary_image_ids(conn, image_ids) as membership:
+        return conn.execute(
+            f"""
+            SELECT m.*
+            FROM matches m
+            JOIN {membership} a ON a.image_id = m.image_id_a
+            JOIN {membership} b ON b.image_id = m.image_id_b
+            ORDER BY m.score DESC, m.decision
+            """
+        ).fetchall()
 
 
 def _write_thumbnail(source: Path, target: Path, thumbnail_size: int) -> bool:

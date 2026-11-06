@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bands import CROP_HASH_TYPES, Candidate, find_candidates
+from .bands import Candidate, find_candidates
 from .config import ScanConfig
 from .db import fetch_crop_hashes, fetch_hash_row, hash_row_to_dict, is_crop_index_ready
 from .hashing import compute_image_hashes
@@ -48,18 +48,21 @@ def query_image(
     ).fetchone()
     lookup_hashes = dict(hashes)
     query_crop_hashes = _query_crop_hashes(image_path, config) if tryhard else {}
-    if crop_index_ready:
-        lookup_hashes.update(query_crop_hashes)
-    if tryhard and crop_index_ready and hashes.get("phash256"):
-        for crop_hash_type in CROP_HASH_TYPES:
-            lookup_hashes[crop_hash_type] = hashes["phash256"]
+    crop_lookup_hashes = []
     if tryhard:
         for index, crop_hash in enumerate(query_crop_hashes.values()):
             lookup_hashes[f"phash256:query_crop:{index}"] = crop_hash
+        if crop_index_ready:
+            # Keep all three crop directions: whole -> crop, crop/tile -> whole
+            # (the aliases above), and crop/tile -> any candidate crop region.
+            crop_lookup_hashes.extend(query_crop_hashes.values())
+            if hashes.get("phash256"):
+                crop_lookup_hashes.append(hashes["phash256"])
     candidates = find_candidates(
         conn,
         lookup_hashes,
         exclude_image_id=int(indexed_row["id"]) if indexed_row is not None else None,
+        crop_query_hashes=crop_lookup_hashes,
         whole_band_size=config.whole_band_size,
         grid_band_size=config.grid_band_size,
     )

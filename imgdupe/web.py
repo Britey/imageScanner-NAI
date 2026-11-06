@@ -6,6 +6,8 @@ import mimetypes
 import ctypes
 import os
 import re
+import secrets
+import socket
 import shutil
 import sqlite3
 import subprocess
@@ -16,6 +18,7 @@ import urllib.parse
 import webbrowser
 from ctypes import wintypes
 from dataclasses import dataclass
+from email.message import Message
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -80,6 +83,36 @@ class WebScanStatus:
     finished_at: str | None = None
     stats: ScanStats | None = None
     error: str | None = None
+
+
+MAX_FORM_BYTES = 256 * 1024
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+REQUEST_TIMEOUT_SECONDS = 10.0
+BODY_TIMEOUT_SECONDS = 30.0
+
+
+class RequestError(ValueError):
+    def __init__(self, status: HTTPStatus, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def _request_authority(value: str) -> tuple[str, int]:
+    parsed = urllib.parse.urlsplit("//" + value)
+    if (not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.path or parsed.query or parsed.fragment or any(char.isspace() for char in value)):
+        raise ValueError("invalid request authority")
+    return parsed.hostname.casefold(), parsed.port if parsed.port is not None else 80
+
+
+def _csrf_forms(document: str, token: str) -> str:
+    field = f'<input type="hidden" name="csrf_token" value="{html.escape(token, quote=True)}">'
+    return re.sub(
+        r"""(<form\b(?=[^>]*\bmethod=["']post["'])(?=[^>]*\baction=["']/(?!/)[^"']*["'])[^>]*>)""",
+        lambda match: match.group(0) + field,
+        document,
+        flags=re.IGNORECASE,
+    )
 
 
 PROMPT_SEARCH_DEFAULT_LIMIT = 100
@@ -312,6 +345,10 @@ def serve(
     )
     handler = _make_handler(state)
     server = HTTPServer((host, port), handler)
+    state.server_port = server.server_port
+    state.allowed_hosts = frozenset({host.casefold()})
+    if host.casefold() in {"localhost", "127.0.0.1", "::1"}:
+        state.allowed_hosts = frozenset({"localhost", "127.0.0.1", "::1"})
     url = f"http://{host}:{server.server_port}"
     try:
         print(f"Serving imgdupe web UI at {url}")
@@ -343,6 +380,9 @@ class WebState:
         disable_advanced_options: bool,
     ) -> None:
         self.conn = conn
+        self.csrf_token = secrets.token_urlsafe(32)
+        self.allowed_hosts = frozenset({"localhost", "127.0.0.1", "::1"})
+        self.server_port = 8765
         self.db_path = db_path
         self.limit = limit
         self.min_score = min_score
@@ -464,7 +504,117 @@ def _local_timestamp() -> str:
 
 def _make_handler(state: WebState):
     class Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
+            self._header_timer = threading.Timer(REQUEST_TIMEOUT_SECONDS, self._expire_headers)
+            self._header_timer.daemon = True
+            self._header_timer.start()
+
+        def _expire_headers(self) -> None:
+            try:
+                self.connection.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+        def finish(self) -> None:
+            self._header_timer.cancel()
+            super().finish()
+
+        def end_headers(self) -> None:
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "same-origin")
+            super().end_headers()
+
+        def _check_request_source(self) -> None:
+            self._header_timer.cancel()
+            hosts = self.headers.get_all("Host", [])
+            try:
+                if len(hosts) != 1:
+                    raise ValueError("exactly one Host header is required")
+                authority = _request_authority(hosts[0])
+                local_host = self.connection.getsockname()[0].casefold()
+                allowed_hosts = state.allowed_hosts | {local_host}
+                if authority[0] not in allowed_hosts or authority[1] != state.server_port:
+                    raise ValueError("untrusted Host header")
+                if self.headers.get("Sec-Fetch-Site", "none") not in {"none", "same-origin"}:
+                    raise ValueError("cross-site request rejected")
+                for name in ("Origin", "Referer"):
+                    value = self.headers.get(name)
+                    if value is not None:
+                        origin = urllib.parse.urlsplit(value)
+                        if origin.scheme != "http" or _request_authority(origin.netloc) != authority:
+                            raise ValueError("foreign request origin")
+            except ValueError as exc:
+                raise RequestError(HTTPStatus.FORBIDDEN, str(exc)) from exc
+
+        def _read_request_body(self, limit: int) -> bytes:
+            self.close_connection = True
+            if self.headers.get("Transfer-Encoding"):
+                raise RequestError(HTTPStatus.BAD_REQUEST, "Transfer-Encoding is unsupported")
+            if self.headers.get("Content-Encoding", "identity").casefold() != "identity":
+                raise RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Content-Encoding is unsupported")
+            lengths = self.headers.get_all("Content-Length", [])
+            if not lengths:
+                raise RequestError(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+            if len(lengths) != 1 or re.fullmatch(r"[0-9]+", lengths[0]) is None:
+                raise RequestError(HTTPStatus.BAD_REQUEST, "invalid Content-Length")
+            if len(lengths[0]) > 20 or int(lengths[0]) > limit:
+                raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body is too large")
+            remaining = int(lengths[0])
+            deadline = time.monotonic() + BODY_TIMEOUT_SECONDS
+            chunks = []
+            while remaining:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise RequestError(HTTPStatus.REQUEST_TIMEOUT, "request body deadline exceeded")
+                self.connection.settimeout(timeout)
+                try:
+                    chunk = self.rfile.read1(min(64 * 1024, remaining))
+                except OSError as exc:
+                    raise RequestError(HTTPStatus.REQUEST_TIMEOUT, "request body timed out") from exc
+                if not chunk:
+                    raise RequestError(HTTPStatus.BAD_REQUEST, "incomplete request body")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
+        def _prepare_post(self) -> None:
+            self._check_request_source()
+            is_upload = urllib.parse.urlsplit(self.path).path == "/search"
+            body = self._read_request_body(MAX_UPLOAD_BYTES if is_upload else MAX_FORM_BYTES)
+            content_type = self.headers.get("Content-Type", "")
+            media = Message()
+            media["Content-Type"] = content_type
+            if media.get_content_charset("utf-8") not in {"utf-8", "utf8"}:
+                raise RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "only UTF-8 form encoding is supported")
+            try:
+                if is_upload:
+                    if media.get_content_type() != "multipart/form-data":
+                        raise ValueError("expected multipart/form-data upload")
+                    self._multipart = _extract_multipart(body, _boundary_from_content_type(content_type))
+                    self._fields = self._multipart[0]
+                else:
+                    if media.get_content_type() != "application/x-www-form-urlencoded":
+                        raise ValueError("expected form-urlencoded request")
+                    self._fields = {
+                        key: values[-1]
+                        for key, values in urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=4096).items()
+                    }
+            except ValueError as exc:
+                raise RequestError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+            token = self._fields.get("csrf_token", "").encode("utf-8")
+            if not secrets.compare_digest(token, state.csrf_token.encode("ascii")):
+                raise RequestError(HTTPStatus.FORBIDDEN, "invalid CSRF token")
+
         def do_GET(self) -> None:
+            try:
+                self._check_request_source()
+            except RequestError as exc:
+                self.send_error(exc.status, str(exc))
+                return
             parsed = urllib.parse.urlparse(self.path)
             lang = _lang_from_query(parsed.query)
             if parsed.path == "/":
@@ -477,7 +627,7 @@ def _make_handler(state: WebState):
                 self._send_json(_tag_suggestions(state, parsed.query))
                 return
             if parsed.path == "/show-in-folder":
-                self._show_in_folder(parsed.query, lang)
+                self.send_error(HTTPStatus.METHOD_NOT_ALLOWED, "use the authenticated POST form")
                 return
             if parsed.path.startswith("/thumb/"):
                 self._send_thumbnail(parsed.path.removeprefix("/thumb/"))
@@ -485,12 +635,17 @@ def _make_handler(state: WebState):
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
+            try:
+                self._prepare_post()
+            except RequestError as exc:
+                self.send_error(exc.status, str(exc))
+                return
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/show-in-folder":
+                self._show_in_folder(self._fields, _normalize_lang(self._fields.get("lang")))
+                return
             if parsed.path == "/clear-thumbnail-cache":
-                length = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(length).decode("utf-8", errors="replace")
-                fields = urllib.parse.parse_qs(body, keep_blank_values=True)
-                lang = _normalize_lang(fields.get("lang", ["zh"])[-1])
+                lang = _normalize_lang(self._fields.get("lang"))
                 removed = state.clear_thumbnail_cache()
                 self._redirect(
                     f"/?lang={urllib.parse.quote(lang)}&thumbnail_cache_cleared={removed}"
@@ -511,7 +666,7 @@ def _make_handler(state: WebState):
                 return
             if parsed.path == "/scan-configure":
                 try:
-                    fields = self._read_form_fields("scan classification")
+                    fields = self._read_form_fields()
                     request = _scan_request_from_fields(fields)
                     if state.get_scan_status().state == "running":
                         raise RuntimeError("an index update is already running")
@@ -547,7 +702,7 @@ def _make_handler(state: WebState):
                 return
             if parsed.path == "/scan-configured":
                 try:
-                    fields = self._read_form_fields("configured rescan")
+                    fields = self._read_form_fields()
                     lang = _normalize_lang(fields.get("lang"))
                     config = load_model_paths(DEFAULT_MODEL_PATHS_PATH)
                     if config.issues:
@@ -594,6 +749,7 @@ def _make_handler(state: WebState):
             if parsed.path != "/search":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
+            upload_path = None
             try:
                 upload_path, options = self._save_upload()
                 results = query_image(
@@ -606,32 +762,19 @@ def _make_handler(state: WebState):
                 )
                 self._send_html(_results_page(results, options))
             except Exception as exc:
-                    self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
+                self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
+            finally:
+                if upload_path is not None:
+                    upload_path.unlink(missing_ok=True)
 
         def _save_scan_request(self) -> ScanRequest:
-            return _scan_request_from_fields(self._read_form_fields("scan request"))
+            return _scan_request_from_fields(self._read_form_fields())
 
-        def _read_form_fields(self, description: str) -> dict[str, str]:
-            content_type = self.headers.get("Content-Type", "")
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length).decode("utf-8", errors="replace")
-            if not content_type.startswith("application/x-www-form-urlencoded"):
-                raise ValueError(f"expected form-urlencoded {description}")
-            return {
-                key: values[-1]
-                for key, values in urllib.parse.parse_qs(body, keep_blank_values=True).items()
-            }
+        def _read_form_fields(self) -> dict[str, str]:
+            return self._fields
 
         def _save_prompt_search(self) -> PromptSearchOptions:
-            content_type = self.headers.get("Content-Type", "")
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length).decode("utf-8", errors="replace")
-            if not content_type.startswith("application/x-www-form-urlencoded"):
-                raise ValueError("expected form-urlencoded prompt search")
-            fields = {
-                key: values[-1]
-                for key, values in urllib.parse.parse_qs(body, keep_blank_values=True).items()
-            }
+            fields = self._read_form_fields()
             tags = fields.get("tags", "").strip()
             negative_tags = fields.get("negative_tags", "").strip()
             if not tags and not negative_tags:
@@ -648,10 +791,9 @@ def _make_handler(state: WebState):
                 model_type=fields.get("model_type", "all").strip()[:500] or "all",
             )
 
-        def _show_in_folder(self, query: str, lang: str) -> None:
-            values = urllib.parse.parse_qs(query)
+        def _show_in_folder(self, fields: dict[str, str], lang: str) -> None:
             try:
-                image_id = int(values.get("id", [""])[0])
+                image_id = int(fields.get("id", ""))
             except ValueError:
                 self.send_error(HTTPStatus.BAD_REQUEST, "invalid image id")
                 return
@@ -686,19 +828,21 @@ def _make_handler(state: WebState):
             )
 
         def _save_upload(self) -> tuple[Path, SearchOptions]:
-            content_type = self.headers.get("Content-Type", "")
-            if not content_type.startswith("multipart/form-data"):
-                raise ValueError("expected multipart/form-data upload")
-            boundary = _boundary_from_content_type(content_type)
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length)
-            fields, file_bytes, filename = _extract_multipart(body, boundary)
+            fields, file_bytes, filename = self._multipart
             suffix = Path(filename).suffix.lower()
             if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}:
                 suffix = ".upload"
-            upload_path = state.uploads_dir / f"query-{len(list(state.uploads_dir.iterdir())) + 1}{suffix}"
-            upload_path.write_bytes(file_bytes)
-            return upload_path, _options_from_fields(fields, state)
+            options = _options_from_fields(fields, state)
+            upload_path = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=state.uploads_dir, prefix="query-", suffix=suffix, delete=False) as upload:
+                    upload_path = Path(upload.name)
+                upload_path.write_bytes(file_bytes)
+            except OSError:
+                if upload_path is not None:
+                    upload_path.unlink(missing_ok=True)
+                raise
+            return upload_path, options
 
         def _send_thumbnail(self, raw_image_id: str) -> None:
             try:
@@ -735,7 +879,7 @@ def _make_handler(state: WebState):
             self._send_file(thumb_path, "image/jpeg")
 
         def _send_html(self, document: str, *, status: HTTPStatus = HTTPStatus.OK) -> None:
-            data = document.encode("utf-8")
+            data = _csrf_forms(document, state.csrf_token).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -1311,7 +1455,11 @@ def _results_page(results, options: SearchOptions) -> str:
               <div class="score">{score.score:.2f}</div>
               <div>{html.escape(_label(score.decision, options.lang))}</div>
               <div>{image_row['width']}x{image_row['height']} &middot; {human_size(image_row['size_bytes'])}</div>
-              <a class="folder-link" href="/show-in-folder?id={int(image_row['id'])}&lang={options.lang}">{text['show_in_folder']}</a>
+              <form method="post" action="/show-in-folder" class="folder-form">
+                <input type="hidden" name="id" value="{int(image_row['id'])}">
+                <input type="hidden" name="lang" value="{options.lang}">
+                <button class="folder-link" type="submit">{text['show_in_folder']}</button>
+              </form>
               <div class="details">pHash {score.phash_dist} &middot; wHash {score.whash_dist} &middot; dHash {score.dhash_dist} &middot; grid {score.grid_match_count} &middot; crop {score.crop_min_dist} &middot; bands {candidate.total_hits}</div>
               <p class="path">{html.escape(image_row['path'])}</p>
             </article>
@@ -1370,7 +1518,11 @@ def _prompt_results_page(
               <div>{html.escape(', '.join(visible_matched_tags))}</div>
               <div>{image_row['width']}x{image_row['height']} &middot; {human_size(image_row['size_bytes'])}</div>
               <div>{html.escape(_prompt_model_label(image_row))}</div>
-              <a class="folder-link" href="/show-in-folder?id={int(image_row['id'])}&lang={options.lang}">{text['show_in_folder']}</a>
+              <form method="post" action="/show-in-folder" class="folder-form">
+                <input type="hidden" name="id" value="{int(image_row['id'])}">
+                <input type="hidden" name="lang" value="{options.lang}">
+                <button class="folder-link" type="submit">{text['show_in_folder']}</button>
+              </form>
               <p class="prompt is-collapsed">{prompt_html}</p>
               {prompt_button}
               <p class="path">{html.escape(image_row['path'])}</p>
@@ -1485,20 +1637,27 @@ def _prompt_page_form(options: PromptSearchOptions, offset: int, label: str) -> 
 
 
 def _highlight_prompt(prompt: str, matched_tags: tuple[str, ...]) -> str:
-    escaped_prompt = html.escape(prompt.strip())
+    raw_prompt = prompt.strip()
     tags = sorted(
         {tag.strip() for tag in matched_tags if tag.strip()},
         key=len,
         reverse=True,
     )
-    if not escaped_prompt or not tags:
-        return escaped_prompt
+    if not raw_prompt or not tags:
+        return html.escape(raw_prompt)
 
     pattern = re.compile(
-        "|".join(re.escape(html.escape(tag)) for tag in tags),
+        "|".join(re.escape(tag) for tag in tags),
         flags=re.IGNORECASE,
     )
-    return pattern.sub(lambda match: f"<mark>{match.group(0)}</mark>", escaped_prompt)
+    fragments = []
+    start = 0
+    for match in pattern.finditer(raw_prompt):
+        fragments.append(html.escape(raw_prompt[start:match.start()]))
+        fragments.append(f"<mark>{html.escape(match.group(0))}</mark>")
+        start = match.end()
+    fragments.append(html.escape(raw_prompt[start:]))
+    return "".join(fragments)
 
 
 def _failures_page(state: WebState, lang: str) -> str:
@@ -1813,7 +1972,7 @@ def _filename_from_header(header: str) -> str:
     marker = "filename="
     if marker not in header:
         return "query.upload"
-    value = header.split(marker, 1)[1].split(";", 1)[0].strip().strip('"')
+    value = header.split(marker, 1)[1].partition("\n")[0].split(";", 1)[0].strip().strip('"')
     return value or "query.upload"
 
 

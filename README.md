@@ -27,6 +27,40 @@ files on disk are never deleted.
 - Optional similar-image grouping and static review pages
 - Failure reporting for corrupt or unsupported files
 
+## Verification
+
+Install the test extra in your environment, then run the checks explicitly:
+
+```bash
+python -m pip install -e '.[test]'
+python -m coverage erase
+python -m coverage run -m unittest discover -s tests
+python -m coverage report
+python scripts/check_mutations.py
+```
+
+Coverage requires **100% of all `imgdupe` statements and branches**, without
+source exclusions. Tests use generated images, temporary SQLite databases,
+real background scans and HTTP request handlers, plus controlled failure and
+platform API boundaries. Two optional tests skip when the uncommitted reference
+image corpus is absent. Native Windows calls are mocked on Linux; coverage is
+not a claim of native Windows integration testing. The coverage gate is verified
+on Linux with Python 3.13 and 3.14 (SQLite 3.53.1 and 3.46.1).
+
+The mutation runner makes isolated temporary copies and deliberately introduces
+realistic semantic defects. Every mutant must trigger an assertion failure;
+syntax/import/runtime errors alone do not count as a successful kill. This is a
+curated regression check, not an exhaustive mutation score.
+
+The [TLA+ model](formal/README.md) checks unique-tag query safety and termination,
+with exhaustive SQL conformance tests and an intentionally failing negative
+control. Its README describes the finite bounds, assumptions, and run command.
+
+The GitHub **Manual verification** workflow runs these checks only through
+`workflow_dispatch` from the Actions UI or `gh workflow run`; pushing commits or
+opening a pull request does not start CI.
+See the [recorded local verification results](docs/verification.md).
+
 ## Installation
 
 Clone the repository, create a virtual environment, then install the package:
@@ -196,6 +230,17 @@ The web UI supports:
 - show-in-folder buttons that open Explorer and select the image
 
 Tryhard mode can run on a normal index by splitting the query image into many temporary crop and tile variants. It works best with the optional crop index described below.
+With that index ready, it can also retrieve images that share only a crop or tile,
+including regions at different positions in the two images.
+
+Web forms include a token that changes when the server restarts; refresh an old
+page before submitting it after a restart. Requests from other origins or with an
+untrusted Host header are rejected. Show-in-folder actions require the page's
+POST form, rather than a direct GET link.
+
+Image uploads are limited to 64 MiB per multipart request and other form bodies
+to 256 KiB. Headers have a 10-second deadline and bodies a 30-second deadline.
+Temporary query uploads are removed after each search, including failed searches.
 
 ## Optional Crop Index
 

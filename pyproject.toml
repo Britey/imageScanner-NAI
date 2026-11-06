@@ -10,6 +10,9 @@ dependencies = [
     "tqdm",
 ]
 
+[project.optional-dependencies]
+test = ["coverage==7.17.2"]
+
 [project.scripts]
 imgdupe = "imgdupe.cli:main"
 
@@ -19,3 +22,14 @@ include = ["imgdupe*"]
 [build-system]
 requires = ["setuptools>=65"]
 build-backend = "setuptools.build_meta"
+
+[tool.coverage.run]
+branch = true
+source = ["imgdupe"]
+
+[tool.coverage.report]
+fail_under = 100
+precision = 2
+show_missing = true
+exclude_lines = []
+partial_branches = []
