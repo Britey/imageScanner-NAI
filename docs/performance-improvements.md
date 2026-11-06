@@ -1,9 +1,10 @@
 # Performance improvements and validation
 
-Implemented against main `ce47e444f5d056bc3f1e117e7cda37ffa5998020`. The original
-benchmark evidence is in [the baseline report](../performance-results/2026-11-07/findings.md);
-final raw samples, SQL plans, profiles, HTTP timings and browser traces are in
-[the final results](../performance-results/2026-11-07-final/report.md).
+Implemented against main `ce47e444f5d056bc3f1e117e7cda37ffa5998020`.
+Raw benchmark results are retained locally under the ignored `performance-results/`
+directory, outside Git. The [toolkit](performance-testing.md) reproduces the samples,
+SQL plans, profiles, HTTP measurements and browser traces. This document records
+the findings and tradeoffs.
 
 ## Measured results
 
@@ -43,7 +44,7 @@ one autocomplete request and completed in 632 ms including typing/debounce
 (baseline about 2,181 ms). All 100 lazy result images loaded, with zero failures
 and no observed long tasks. Scrolling remains about one second because the probe
 deliberately pauses between scroll steps. These are single browser observations.
-Full navigation/resource data is in [browser.json](../performance-results/2026-11-07-final/browser.json).
+Navigation/resource traces are retained locally with the benchmark results.
 
 ## Cold-cache follow-up
 
@@ -84,6 +85,20 @@ backfill and needs disk space for the new summaries/indexes. Interrupted backfil
 rolls back its version marker and data. Parser version 6 causes prompt parsing to
 be refreshed on the next applicable scan.
 
+## Completed clustering run
+
+The final 200,000-image clustering run completed in **153.53 seconds**
+with 402.3 MiB peak worker RSS. It enumerated
+12,975,635 pairs; the exact upper bound rejected all before
+full grid scoring. This synthetic random-hash fixture produced no accepted
+matches, so it does **not** represent the cost of writing a dense duplicate graph.
+Within the comparable 90-second cap, progress increased from about 43,100 to
+80,800 images. The baseline timed out, so no complete-runtime speedup ratio is claimed.
+Dense candidate sets remain quadratic; this PR does not remove that fundamental
+limitation. Both timed-out runs rolled back, and the completed run passed SQLite
+quick-check, match/cluster foreign-key checks, summary-counter comparison and a
+successful WAL checkpoint.
+
 ## Correctness fixes from the independent review
 
 - Spawn worker processes explicitly, including scans launched by the Web UI.
@@ -102,6 +117,6 @@ be refreshed on the next applicable scan.
 and 1,120 branches are covered, with no exclusions. All 38 curated mutations fail
 with assertions; both review mutations also pass a final rerun. The TLA+ visibility
 model and its negative control pass. Independent cross-reviews covered each subsystem.
-Logs are in [verification](../performance-results/2026-11-07-final/verification/).
+Verification logs are retained locally with the benchmark results, outside Git.
 The reusable [toolkit](performance-testing.md) remains. Generated databases, WALs,
 images, thumbnail caches and the temporary test environment are removed after measurement.

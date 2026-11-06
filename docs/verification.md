@@ -10,8 +10,9 @@ and reaches **100% application statements and branches** (3,554 statements,
 All **38/38 curated semantic mutations** are rejected by assertions (288-test
 isolated baseline); both review mutations were also rerun against the final
 290-test baseline. No mutant survived or failed merely with an import/runtime
-error. Validation logs and measured performance are retained under
-`performance-results/2026-11-07-final/`.
+error. Validation logs and raw measurements are retained locally under the ignored
+`performance-results/2026-11-07-final/` directory, outside Git. The measured findings
+are summarized in [performance improvements](performance-improvements.md).
 
 New regressions exercise an actual spawned process pool from a background thread
 with a WAL connection open; inaccessible directories and move safety; failed-file

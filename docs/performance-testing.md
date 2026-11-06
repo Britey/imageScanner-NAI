@@ -14,7 +14,9 @@ python scripts/perf_test.py \
   --output performance-results/my-run
 ```
 
-The default scratch parent is `.perf-work/`, which is Git-ignored. Use
+Both `.perf-work/` (disposable scratch) and `performance-results/` (retained raw
+output) are Git-ignored. Commit concise findings rather than generated reports,
+profiles or logs. The default scratch parent is `.perf-work/`. Use
 `--work-dir /path/on/your/ssd` to choose a disk. Do not use a RAM-backed `/tmp`
 when investigating disk performance. Allow roughly 12 GB of free scratch space
 for the default large fixture, including temporary index construction overhead.
