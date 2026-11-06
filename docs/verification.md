@@ -10,7 +10,7 @@ The same full suite and 100% coverage gate also pass on Python 3.14.4 with SQLit
 3.46.1, including the batched lookup query-plan and large-cluster regressions.
 The 38-mutation run used the primary Python 3.13/SQLite 3.53.1 environment.
 
-- **235 tests run**, with two existing optional-reference-corpus skips and no
+- **236 tests run**, with two existing optional-reference-corpus skips and no
   failures or errors. Generated image/database fixtures run without that corpus.
 - **100% package statements and branches**: 3,162/3,162 statements and 992/992
   branches; zero exclusions, partial branches, or missing lines. The configuration
@@ -61,6 +61,10 @@ The post-review fixes cover all five confirmed findings:
   than one SQL placeholder per member. Real SQLite tests reduce the variable
   limit to one, prove the old query fails, and check all matches, global ordering,
   representative tie rules, nested contexts, failure cleanup and caller rollback.
+  Membership subqueries preserve indexed lookups; a VM-work regression adds
+  5,001 unrelated images and 5,000 matches and confirms that a two-image cluster
+  avoids full-table scans. It fails for both former JOIN queries and passes on
+  both verified Python/SQLite runtimes while allowing only one bind variable.
 
 Other production changes remove unreachable PNG branches and a return after
 `ArgumentParser.error`, and express the existing GB size fallback with a reachable

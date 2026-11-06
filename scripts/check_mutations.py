@@ -212,8 +212,8 @@ MUTATIONS = (
     ),
     Mutation(
         "review-match-membership-both-endpoints", "review",
-        'JOIN {membership} b ON b.image_id = m.image_id_b',
-        'JOIN {membership} b ON b.image_id = m.image_id_a',
+        'AND m.image_id_b IN (SELECT image_id FROM {membership})',
+        'AND m.image_id_a IN (SELECT image_id FROM {membership})',
         "Cluster review must exclude matches with either endpoint outside the selected cluster.",
     ),
     Mutation(

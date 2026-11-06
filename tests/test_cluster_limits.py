@@ -108,6 +108,48 @@ class ClusterVariableLimitTests(unittest.TestCase):
                              [(2, 7), (1, 2), (3, 4), (1, 8), (8, 2), (3, 3)])
         self.assertEqual(self.temp_tables(), [])
 
+    def test_small_cluster_work_does_not_grow_with_unrelated_images_and_matches(self):
+        def measure(operation):
+            ticks = 0
+
+            def progress():
+                nonlocal ticks
+                ticks += 1
+                return 0
+
+            self.conn.set_progress_handler(progress, 100)
+            try:
+                result = operation()
+            finally:
+                self.conn.set_progress_handler(None, 0)
+            return result, ticks
+
+        operations = {
+            "representative": lambda: _choose_representative(self.conn, [1, 2]),
+            "matches": lambda: [dict(row) for row in _fetch_cluster_matches(self.conn, [1, 2])],
+        }
+        baseline = {name: measure(operation) for name, operation in operations.items()}
+        self.conn.executemany(
+            "INSERT INTO images(id, path, size_bytes, mtime_ns, indexed_at) VALUES (?, ?, 1, 1, 'now')",
+            ((image_id, f"unrelated-{image_id}.png") for image_id in range(1000, 6001)),
+        )
+        self.conn.executemany(
+            "INSERT INTO matches(image_id_a, image_id_b, score, decision, created_at) "
+            "VALUES (?, ?, 90, 'review', 'now')",
+            ((image_id, image_id + 1) for image_id in range(1000, 6000)),
+        )
+        self.conn.commit()
+        self.lower_limit(1)
+        for name, operation in operations.items():
+            with self.subTest(operation=name):
+                result, ticks = measure(operation)
+                expected, baseline_ticks = baseline[name]
+                self.assertEqual(result, expected)
+                # Allow fixed temp-table/planner overhead, but reject a scan of
+                # thousands of unrelated rows for every two-member cluster.
+                self.assertLessEqual(ticks, baseline_ticks + 10)
+                self.assertEqual(self.temp_tables(), [])
+
     def test_nested_membership_tables_are_independent_and_preserve_existing_temp_tables(self):
         self.conn.execute("CREATE TEMP TABLE caller_data(value)")
         self.lower_limit(1)

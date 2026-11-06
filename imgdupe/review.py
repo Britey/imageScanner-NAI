@@ -109,12 +109,13 @@ def _fetch_cluster_matches(
     if len(image_ids) < 2:
         return []
     with temporary_image_ids(conn, image_ids) as membership:
+        # Keep membership indexed instead of scanning the global score index.
         return conn.execute(
             f"""
             SELECT m.*
             FROM matches m
-            JOIN {membership} a ON a.image_id = m.image_id_a
-            JOIN {membership} b ON b.image_id = m.image_id_b
+            WHERE m.image_id_a IN (SELECT image_id FROM {membership})
+              AND m.image_id_b IN (SELECT image_id FROM {membership})
             ORDER BY m.score DESC, m.decision
             """
         ).fetchall()

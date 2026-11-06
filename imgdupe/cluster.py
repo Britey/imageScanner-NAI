@@ -211,11 +211,12 @@ def _groups_from_union_find(union_find: UnionFind) -> list[list[int]]:
 
 def _choose_representative(conn: sqlite3.Connection, members: list[int]) -> int:
     with temporary_image_ids(conn, members) as membership:
+        # IN drives primary-key probes; a JOIN can scan every image per cluster.
         rows = conn.execute(
             f"""
             SELECT i.id, i.width, i.height, i.size_bytes
             FROM images i
-            JOIN {membership} member ON member.image_id = i.id
+            WHERE i.id IN (SELECT image_id FROM {membership})
             """
         ).fetchall()
     best = max(
