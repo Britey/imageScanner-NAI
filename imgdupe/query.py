@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import html
 import heapq
-from itertools import chain
+import json
 from contextlib import contextmanager
 from uuid import uuid4
 import re
@@ -197,7 +197,7 @@ def query_prompt_tags(
         )
         SELECT i.*,ip.prompt,ip.model_type,ip.model_hash,ip.model_version,ip.configured_model,
             page.matched_count,
-            (SELECT GROUP_CONCAT(DISTINCT pt.tag) FROM {wanted} w
+            (SELECT json_group_array(DISTINCT pt.tag) FROM {wanted} w
              JOIN prompt_tags pt ON pt.image_id=i.id AND pt.tag_norm=w.tag_norm
              JOIN prompt_search s ON s.image_id=i.id WHERE {visibility}) AS matched_tags
         FROM page JOIN images i ON i.id=page.id LEFT JOIN image_prompts ip ON ip.image_id=i.id
@@ -205,7 +205,7 @@ def query_prompt_tags(
         """
         rows = conn.execute(sql, [*params, limit, max(0, offset)]).fetchall()
     return [PromptSearchResult(row, row["prompt"], int(row["matched_count"]),
-                               tuple((row["matched_tags"] or "").split(","))) for row in rows]
+                               tuple(json.loads(row["matched_tags"] or "[]"))) for row in rows]
 
 
 @contextmanager
@@ -256,17 +256,28 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                 continue
             normalized = {name: normalize_prompt_tag(sanitize_model_name(name)) for name in known}
             longest = max(map(len, normalized.values()))
-            best_end, best_names = start, []
-            for end in chain((boundary.start() for boundary in boundaries.finditer(item, start)), (len(item),)):
-                raw = normalize_prompt_tag(item[start:end])
+            # Parentheses opened inside the name belong to it, so their commas
+            # do not split the term. A candidate span may only end where the
+            # remainder starts with a term terminator (separator, OR operator,
+            # an enclosing group's ")" or the end), so nothing sticks to the
+            # placeholder and an enclosing ")" stays in the remainder.
+            best_end, best_names, depth = start, [], 0
+            boundary_iter = boundaries.finditer(item, start)
+            while True:
+                boundary = next(boundary_iter, None)
+                end = boundary.start() if boundary else len(item)
+                character = boundary.group() if boundary else ""
                 sanitized = normalize_prompt_tag(sanitize_model_name(item[start:end]))
                 if len(sanitized) > longest:
                     break
-                names = [name for name in known if name == raw or normalized[name] == sanitized]
-                if names:
-                    best_end, best_names = end, names
-                if end < len(item) and item[end] in "|｜()":
+                if not depth and character != "(":
+                    raw = normalize_prompt_tag(item[start:end])
+                    names = [name for name in known if name == raw or normalized[name] == sanitized]
+                    if names:
+                        best_end, best_names = end, names
+                if not boundary or character in "|｜" or (character == ")" and not depth):
                     break
+                depth += 1 if character == "(" else -1 if character == ")" else 0
             if best_names:
                 placeholder = f"@model:legacy-placeholder-{len(replacements)}-{uuid4().hex}"
                 replacements[placeholder] = tuple((name, True) for name in best_names)

@@ -1438,12 +1438,19 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
       const hideSuggestions = suggestionsElement => {{
         suggestionsElement.hidden = true;
         suggestionsElement.innerHTML = "";
+        delete suggestionsElement.dataset.request;
+        delete suggestionsElement.dataset.query;
         activeSuggestion = -1;
       }};
       const hideAllSuggestions = () => {{
         hideSuggestions(suggestions);
         hideSuggestions(negativeSuggestions);
       }};
+      const suggestionsCurrent = (inputElement, suggestionsElement) => (
+        !suggestionsElement.hidden
+        && suggestionsElement.dataset.request === String(suggestionRequest)
+        && suggestionsElement.dataset.query === tokenInfo(inputElement).token.trim()
+      );
       const suggestionButtons = suggestionsElement => [...suggestionsElement.querySelectorAll("button[data-tag]")];
       const setActiveSuggestion = (suggestionsElement, index) => {{
         const buttons = suggestionButtons(suggestionsElement);
@@ -1475,6 +1482,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         clearTimeout(suggestionTimer);
         suggestionController?.abort();
         ++suggestionRequest;
+        hideAllSuggestions();
         suggestionTimer = setTimeout(() => refreshSuggestions(inputElement), 180);
       }};
       const refreshSuggestions = async inputElement => {{
@@ -1504,6 +1512,8 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
              <small>${{item.count}}</small>
            </button>`
         )).join("");
+        suggestionsElement.dataset.request = String(request);
+        suggestionsElement.dataset.query = query;
         suggestionsElement.hidden = false;
         activeSuggestion = -1;
         return true;
@@ -1520,26 +1530,26 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         inputElement.addEventListener("keydown", async event => {{
           if (event.key === "ArrowDown") {{
             event.preventDefault();
-            if (suggestionsElement.hidden || !suggestionButtons(suggestionsElement).length) {{
+            if (!suggestionsCurrent(inputElement, suggestionsElement)) {{
               await refreshSuggestions(inputElement);
             }}
-            if (suggestionButtons(suggestionsElement).length) {{
+            if (suggestionsCurrent(inputElement, suggestionsElement)) {{
               setActiveSuggestion(suggestionsElement, activeSuggestion + 1);
             }}
           }} else if (event.key === "ArrowUp") {{
             event.preventDefault();
-            if (suggestionsElement.hidden || !suggestionButtons(suggestionsElement).length) {{
+            if (!suggestionsCurrent(inputElement, suggestionsElement)) {{
               await refreshSuggestions(inputElement);
             }}
             const buttons = suggestionButtons(suggestionsElement);
-            if (buttons.length) {{
+            if (suggestionsCurrent(inputElement, suggestionsElement) && buttons.length) {{
               setActiveSuggestion(
                 suggestionsElement,
                 activeSuggestion < 0 ? buttons.length - 1 : activeSuggestion - 1
               );
             }}
           }} else if (event.key === "Enter") {{
-            if (suggestionsElement.hidden) return;
+            if (!suggestionsCurrent(inputElement, suggestionsElement)) return;
             const buttons = suggestionButtons(suggestionsElement);
             if (!buttons.length) return;
             event.preventDefault();
@@ -1558,7 +1568,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
           const button = event.target.closest("button[data-tag]");
           if (button) {{
             const inputElement = suggestionsElement === negativeSuggestions ? negativePromptInput : promptInput;
-            applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
+            if (suggestionsCurrent(inputElement, suggestionsElement)) applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
           }}
         }});
       }});
