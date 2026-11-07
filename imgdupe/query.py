@@ -251,25 +251,27 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                 "SELECT DISTINCT tag_norm FROM tag_stats WHERE tag_norm>=? AND tag_norm<? AND tag_kind<>'prompt'",
                 (prefix, prefix + "\U0010ffff"),
             )]
-            if not known:
-                continue
             normalized = {name: normalize_prompt_tag(sanitize_model_name(name)) for name in known}
-            longest = max(map(len, normalized.values()))
+            longest = max(map(len, normalized.values()), default=0)
             # Parentheses opened inside the name belong to it, so their commas
             # do not split the term. A candidate span may only end where the
             # remainder starts with a term terminator (separator, OR operator,
             # an enclosing group's ")" or the end), so nothing sticks to the
             # placeholder and an enclosing ")" stays in the remainder.
-            best_end, best_names, depth = start, [], 0
+            # Protect even an unknown model's full lexical term. Otherwise a
+            # comma inside its parentheses becomes a separate prompt query.
+            best_end = _model_token_end(item, start, boundaries)
+            best_names = [normalize_prompt_tag(item[start:best_end])]
+            depth = 0
             boundary_iter = boundaries.finditer(item, start)
             while True:
                 boundary = next(boundary_iter, None)
                 end = boundary.start() if boundary else len(item)
                 character = boundary.group() if boundary else ""
-                sanitized = normalize_prompt_tag(sanitize_model_name(item[start:end]))
-                if len(sanitized) > longest:
-                    break
                 if not depth and character != "(":
+                    sanitized = normalize_prompt_tag(sanitize_model_name(item[start:end]))
+                    if len(sanitized) > longest:
+                        break
                     raw = normalize_prompt_tag(item[start:end])
                     names = [name for name in known if name == raw or normalized[name] == sanitized]
                     if names:
@@ -277,11 +279,10 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                 if not boundary or character in "|｜" or (character == ")" and not depth):
                     break
                 depth += 1 if character == "(" else -1 if character == ")" else 0
-            if best_names:
-                placeholder = f"@model:legacy-placeholder-{len(replacements)}-{uuid4().hex}"
-                replacements[placeholder] = tuple((name, True) for name in best_names)
-                fragments.extend((item[consumed:start], placeholder))
-                consumed = best_end
+            placeholder = f"@model:legacy-placeholder-{len(replacements)}-{uuid4().hex}"
+            replacements[placeholder] = tuple((name, True) for name in best_names)
+            fragments.extend((item[consumed:start], placeholder))
+            consumed = best_end
         fragments.append(item[consumed:])
         for group in _prompt_tag_groups("".join(fragments)):
             expanded = tuple(dict.fromkeys(expanded_term for term in group for expanded_term in replacements.get(term[0], (term,))))
@@ -292,6 +293,20 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
     return groups
 
 
+def _model_token_end(text: str, start: int, boundaries: re.Pattern[str]) -> int:
+    """Find an explicit separator outside the model name's own parentheses."""
+    depth = 0
+    for boundary in boundaries.finditer(text, start):
+        character = boundary.group()
+        if character == "(":
+            depth += 1
+        elif character == ")" and depth:
+            depth -= 1
+        elif not depth:
+            return boundary.start()
+    return len(text)
+
+
 def _prompt_tag_groups(
     text_or_tags: str | list[str],
 ) -> list[tuple[tuple[str, bool], ...]]:
@@ -300,7 +315,10 @@ def _prompt_tag_groups(
     seen_groups: set[frozenset[tuple[str, bool]]] = set()
     separators = str.maketrans({character: "," for character in COMMA_SEPARATORS + CJK_FULL_STOPS})
     for item in inputs:
-        for raw_group in item.translate(separators).split(","):
+        # Remove balanced structural wrappers before comma splitting separates
+        # their opening and closing characters (including embedded AND groups).
+        item = _strip_comma_group_parentheses(item.translate(separators))
+        for raw_group in item.split(","):
             group_text = _strip_whole_group_parentheses(raw_group.strip())
             terms: list[tuple[str, bool]] = []
             seen_terms: set[tuple[str, bool]] = set()
@@ -318,6 +336,26 @@ def _prompt_tag_groups(
             seen_groups.add(group_key)
             groups.append(tuple(terms))
     return groups
+
+
+def _strip_comma_group_parentheses(text: str) -> str:
+    """Unwrap comma groups, preserving parentheses inside literal tag names."""
+    openings: list[tuple[int, bool, int]] = []
+    wrappers: set[int] = set()
+    comma_count = 0
+    previous = ""
+    for index, character in enumerate(text):
+        if character == "(":
+            openings.append((index, previous in {"", ",", "|", "｜", "("}, comma_count))
+        elif character == ",":
+            comma_count += 1
+        elif character == ")" and openings:
+            start, structural, opened_at = openings.pop()
+            if structural and comma_count > opened_at:
+                wrappers.update((start, index))
+        if not character.isspace():
+            previous = character
+    return "".join(character for index, character in enumerate(text) if index not in wrappers)
 
 
 def _strip_whole_group_parentheses(text: str) -> str:

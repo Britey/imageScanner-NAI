@@ -1,5 +1,23 @@
 # Verification results
 
+## Model query review follow-up, 2026-11-08
+
+Fixed the two model-query blockers reported against PR #4 head
+`7417664fcca59abb92067b243962e34a608e5fef`. Unknown or longer parenthesized model
+names now remain single metadata terms instead of leaking inner comma fragments
+into ordinary prompt searches. Balanced structural wrappers are removed before
+comma splitting, including nested and embedded groups. Exact model-name matching
+still requires explicit separators before separate tags.
+
+The regressions reproduced failures before the fix. The final suite runs
+**349 tests**, with the same two optional reference-corpus skips, at **100%
+statements and branches**: 3,517 statements and 1,088 branches, without exclusions.
+A bounded-work regression also checks that a model term containing 1,000 inner
+comma fragments is not repeatedly normalized at every fragment.
+
+Logs are retained locally under the ignored
+`performance-results/model-query-review-2026-11-08/` directory.
+
 ## Behavioral test audit, 2026-11-08
 
 Reviewed the interrupted draft tests and every unchanged test module against the

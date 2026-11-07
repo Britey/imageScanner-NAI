@@ -276,6 +276,18 @@ MUTATIONS = (
         'const tags = await response.json();',
         "A response finishing JSON decoding after a new request must not replace current suggestions.",
     ),
+    Mutation(
+        "query-unknown-model-balanced-span", "query",
+        'best_end = _model_token_end(item, start, boundaries)',
+        'best_end = prefix_end',
+        "Unknown model names must keep balanced inner commas out of ordinary prompt terms.",
+    ),
+    Mutation(
+        "query-parenthesized-comma-groups", "query",
+        'item = _strip_comma_group_parentheses(item.translate(separators))',
+        'item = item.translate(separators)',
+        "Whole and embedded comma-group wrappers must be removed before model placeholders expand.",
+    ),
 )
 
 

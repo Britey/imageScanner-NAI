@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from unittest.mock import patch
+
+from imgdupe import query as query_module
 
 from imgdupe.db import init_db
 from imgdupe.query import query_prompt_tags
@@ -144,6 +147,75 @@ class PromptQueryGroupTests(unittest.TestCase):
         self.assertEqual(self.result_ids("(cat) | (dog)"), [])
         self.assertEqual(self.result_ids("((cat)"), [])
         self.assertEqual(self.result_ids("cat (sleeping)"), [3])
+
+
+    def test_unknown_balanced_model_names_never_turn_inner_commas_into_prompt_terms(self):
+        self.add_image(1, ('cat', 'prompt'), ('@model:Foo', 'model_identity'))
+        self.add_image(2, ('cat', 'prompt'), ('Baz)', 'prompt'), ('Qux))', 'prompt'))
+        for text in ('@model:Foo (Bar, Baz)', '@model:Foo (Bar, (Baz, Qux))',
+                     '@model:Unknown (Bar, Baz)', '@model:Foo (Bar，Baz)'):
+            with self.subTest(query=text):
+                self.assertEqual(self.result_ids(text), [])
+                self.assertEqual(self.result_ids(text, match_mode='any'), [])
+                self.assertEqual(self.result_ids('cat', negative_text_or_tags=text), [1, 2])
+        self.assertEqual(self.result_ids('@model:Foo, cat'), [1])
+
+    def test_balanced_model_with_trailing_text_remains_one_exact_term(self):
+        model = '@model:Foo (Bar Baz)'
+        self.add_image(1, ('cat', 'prompt'), (model, 'model_identity'))
+        self.add_image(2, ('cat', 'prompt'), ('Baz) cat', 'prompt'))
+        self.add_image(3, (model, 'model_identity'))
+        self.assertEqual(self.result_ids('@model:Foo (Bar, Baz)'), [1, 3])
+        self.assertEqual(self.result_ids('@model:Foo (Bar, Baz), cat'), [1])
+        text = '@model:Foo (Bar, Baz) cat'
+        self.assertEqual(self.result_ids(text), [])
+        self.assertEqual(self.result_ids(text, match_mode='any'), [])
+        self.assertEqual(self.result_ids('cat', negative_text_or_tags=text), [1, 2])
+        self.add_image(4, (model + ' cat', 'model_identity'))
+        self.assertEqual(self.result_ids(text), [4])
+
+    def test_parentheses_enclosing_model_and_comma_groups_expand_stored_names(self):
+        names = ('@model:Foo (Bar, Baz)', '@model:Foo, Bar (Baz)', '@model:sd')
+        for image_id, name in enumerate(names, 1):
+            self.add_image(image_id, ('cat', 'prompt'), (name, 'model_identity'))
+        self.add_image(4, ('cat', 'prompt'))
+        self.add_image(5, (names[0], 'model_identity'))
+        for image_id, name in enumerate(names, 1):
+            for text in (f'({name}, cat)', f'(({name}, cat))', f'(cat, ({name}))'):
+                with self.subTest(query=text):
+                    results = query_prompt_tags(self.conn, text)
+                    self.assertEqual([result.image_row['id'] for result in results], [image_id])
+                    self.assertEqual(results[0].matched_count, 2)
+                    self.assertEqual(set(results[0].matched_tags), {name, 'cat'})
+            self.assertEqual(self.result_ids('cat', negative_text_or_tags=f'({name}, absent)'),
+                             [other for other in (1, 2, 3, 4) if other != image_id])
+        self.assertEqual(self.result_ids('(cat, absent)'), [])
+
+    def test_embedded_parenthesized_comma_groups_keep_all_constraints(self):
+        self.add_image(1, ('cat', 'prompt'), ('dog', 'prompt'), ('@model:sd', 'model_type'))
+        self.add_image(2, ('cat', 'prompt'), ('@model:sd', 'model_type'))
+        self.add_image(3, ('dog', 'prompt'), ('@model:sd', 'model_type'))
+        self.add_image(4, ('cat', 'prompt'), ('dog', 'prompt'))
+        self.add_image(5, ('cat', 'prompt'))
+        for text in ('cat, (@model:sd, dog)', 'cat, ((@model:sd, dog))',
+                     '(cat, (@model:sd, dog))', '(@model:sd, dog), cat'):
+            with self.subTest(query=text):
+                self.assertEqual(self.result_ids(text), [1])
+        self.assertEqual(self.result_ids('cat', negative_text_or_tags='(@model:sd, dog)'), [5])
+
+    def test_large_balanced_model_name_does_not_resanitize_every_inner_comma(self):
+        self.add_image(1, ('@model:Foo', 'model_identity'))
+        self.add_image(2, ('term999)', 'prompt'))
+        text = '@model:Foo (' + ', '.join(f'term{index}' for index in range(1000)) + ')'
+        processed_characters = 0
+        original = query_module.sanitize_model_name
+        def measured_sanitize(value):
+            nonlocal processed_characters
+            processed_characters += len(value)
+            return original(value)
+        with patch.object(query_module, 'sanitize_model_name', measured_sanitize):
+            self.assertEqual(self.result_ids(text, match_mode='any'), [])
+        self.assertLessEqual(processed_characters, 2 * len(text) + 100)
 
 
 if __name__ == "__main__":
