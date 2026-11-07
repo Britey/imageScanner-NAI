@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from imgdupe import db, query
-from imgdupe.bands import Candidate
-from imgdupe.match import PairScore
+from imgdupe import bands, db, hashing, query
+from image_fixtures import textured
 
 
 class SearchProjectionTests(unittest.TestCase):
@@ -167,8 +167,10 @@ class SearchProjectionTests(unittest.TestCase):
             self.assertEqual({item.image_row['id'] for item in query.query_prompt_tags(self.conn,text)}, {1,2})
         self.assertEqual(query.query_prompt_tags(self.conn,'tag0',negative_text_or_tags='@model:Foo, Bar'),[])
         self.assertEqual(query.query_prompt_tags(self.conn,'@model:Foo, Bar, absent'),[])
-        self.assertEqual(query._database_tag_groups(self.conn,'tag0 | tag1, tag1 | tag0'),[(('tag0',False),('tag1',False))])
-        self.assertEqual(query._database_tag_groups(self.conn,['prefix@model:none','@model:none']),[(('prefix@model:none',False),),(('@model:none',True),)])
+        results = query.query_prompt_tags(self.conn, 'tag0 | tag1, tag1 | tag0')
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual(result.matched_count, 1)
 
     def test_single_term_matches_general_or_path_with_filters_and_pagination(self):
         for image_id in range(1, 6):
@@ -179,8 +181,10 @@ class SearchProjectionTests(unittest.TestCase):
                 options = dict(match_mode=mode,unique_prompts=unique,limit=2,offset=1,negative_text_or_tags='excluded')
                 single = query.query_prompt_tags(self.conn,'common',**options)
                 general = query.query_prompt_tags(self.conn,'common|absent',**options)
-                self.assertEqual([(dict(r.image_row),r.matched_tags) for r in single],[(dict(r.image_row),r.matched_tags) for r in general])
-        self.assertEqual(query._database_tag_groups(self.conn,['common','common']),[(('common',False),)])
+                expected = [3] if unique else [3, 2]
+                self.assertEqual([r.image_row['id'] for r in single], expected)
+                self.assertEqual([r.image_row['id'] for r in general], expected)
+                self.assertTrue(all(r.matched_tags == ('common',) for r in single + general))
 
     def test_unique_null_prompts_never_collide_with_integer_prompt_identity(self):
         self.add(-1, prompt=None)
@@ -191,9 +195,43 @@ class SearchProjectionTests(unittest.TestCase):
     def test_model_name_matching_does_not_consume_explicit_or_operator(self):
         self.add(1, ('bar',))
         self.conn.executemany("INSERT INTO prompt_tags VALUES(1,?,?,0,'model_identity')", [('@model:Foo','@model:foo'),('@model:Foo Bar','@model:foo bar')])
-        self.assertEqual(query._database_tag_groups(self.conn,'@model:Foo|bar'),[(('@model:foo',True),('bar',False))])
+        self.assertEqual([r.image_row['id'] for r in query.query_prompt_tags(self.conn, '@model:Foo|bar')], [1])
+        results = query.query_prompt_tags(self.conn, '@model:Foo|absent')
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].matched_tags, ('@model:Foo',))
         self.conn.execute("DELETE FROM prompt_tags WHERE tag_norm='@model:foo'")
         self.assertEqual(query.query_prompt_tags(self.conn,'@model:Foo'), [])
+
+    def test_legacy_model_names_scan_through_parentheses(self):
+        names = ['@model:Foo', '@model:Foo (Special)', '@model:Foo (Bar, Baz)', '@model:Foo, Bar (Baz)', '@model:Foo (a (b), c)']
+        for image_id, name in enumerate(names, 1):
+            self.add(image_id, ('cat',))
+            self.conn.execute("INSERT INTO prompt_tags VALUES(?,?,?,0,'model_identity')", (image_id, name, name.casefold()))
+        def found(text):
+            return {item.image_row['id'] for item in query.query_prompt_tags(self.conn, text)}
+        for image_id, name in enumerate(names, 1):
+            for text in (name, f'({name})', f'{name}, cat', f'cat, ({name} | absent)', f'{name} , cat'):
+                self.assertEqual(found(text), {image_id}, text)
+        self.assertEqual(found('(@model:Foo (Special)), cat'), {2})
+        self.assertEqual(found('@model:Foo (absent)'), set())
+        self.assertEqual(found('@model:Foo (Special) extra'), set())
+        self.assertEqual(found('@model:Foo (Special'), set())
+
+    def test_matched_tags_keep_commas_inside_legacy_model_names(self):
+        self.add(1, ('cat',), prompt='cat')
+        self.conn.execute("INSERT INTO prompt_tags VALUES(1,'@model:Foo, Bar','@model:foo, bar',0,'model_identity')")
+        results = query.query_prompt_tags(self.conn, 'cat, @model:Foo, Bar')
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual(sorted(result.matched_tags), ['@model:Foo, Bar', 'cat'])
+        results = query.query_prompt_tags(self.conn, 'cat', negative_text_or_tags='absent')
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual(result.matched_tags, ('cat',))
+        results = query.query_prompt_tags(self.conn, '', negative_text_or_tags='absent')
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual(result.matched_tags, ())
 
     def test_query_transactions_failure_cleanup_and_invalid_limits(self):
         self.add(1)
@@ -210,20 +248,31 @@ class SearchProjectionTests(unittest.TestCase):
         self.assertFalse(self.conn.in_transaction)
         self.assertEqual(self.conn.execute("SELECT name FROM sqlite_temp_master").fetchall(),[])
 
-    def test_image_candidates_are_batched_and_top_k_is_stable(self):
-        for image_id in range(1, 404):
-            self.add(image_id)
-            self.conn.execute("INSERT INTO hashes(image_id,phash256) VALUES(?,?)",(image_id,b'x'))
-        self.add(404)  # A stale candidate with an image but no hash row.
-        candidates = [Candidate(image_id,1,{}) for image_id in range(1,406)]
-        self.conn.commit()
-        statements=[]
-        self.conn.set_trace_callback(statements.append)
-        score = PairScore(0,0,0,0,0,None,90,'strong_duplicate')
-        with patch.object(query,'compute_image_hashes',return_value=({'sha256':b'q'},{})), patch.object(query,'find_candidates',return_value=candidates), patch.object(query,'score_hashes',return_value=score):
-            result=query.query_image(self.conn,Path('upload.png'),limit=2)
-        self.conn.set_trace_callback(None)
-        self.assertEqual([item[0]['id'] for item in result],[1,2])
-        self.assertEqual(sum('SELECT h.*' in sql for sql in statements),2)
-        self.assertEqual(sum('SELECT i.*' in sql for sql in statements),2)
+    def test_image_candidates_are_batched_and_late_best_score_displaces_an_early_tie(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "upload.png"
+            textured(12).save(path)
+            hashes, _ = hashing.compute_image_hashes(path)
+            original = hashes['phash256']
+            # All candidates share exactly twelve pHash bands. The last image
+            # is visually closer, so candidate hit order cannot supply top-k.
+            for image_id in range(1, 404):
+                self.add(image_id)
+                mask = 1 if image_id == 403 else 15
+                value = original[:24] + bytes(byte ^ mask for byte in original[24:])
+                db.replace_hashes(self.conn, image_id, {'phash256': value})
+                bands.insert_bands(self.conn, image_id, {'phash256': value})
+            self.add(404)
+            bands.insert_bands(self.conn, 404, {'phash256': original})  # stale bands without a hash row
+            self.conn.commit()
+            statements = []
+            self.conn.set_trace_callback(statements.append)
+            try:
+                result = query.query_image(self.conn, path, limit=2)
+            finally:
+                self.conn.set_trace_callback(None)
+        self.assertEqual([item[0]['id'] for item in result], [403, 1])
+        self.assertGreater(result[0][2].score, result[1][2].score)
+        self.assertEqual(sum('SELECT h.*' in sql for sql in statements), 2)
+        self.assertEqual(sum('SELECT i.*' in sql for sql in statements), 2)
         self.assertFalse(self.conn.in_transaction)

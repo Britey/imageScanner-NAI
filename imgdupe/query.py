@@ -61,8 +61,7 @@ def query_image(
             # Keep all three crop directions: whole -> crop, crop/tile -> whole
             # (the aliases above), and crop/tile -> any candidate crop region.
             crop_lookup_hashes.extend(query_crop_hashes.values())
-            if hashes.get("phash256"):
-                crop_lookup_hashes.append(hashes["phash256"])
+            crop_lookup_hashes.append(hashes["phash256"])
     candidates = find_candidates(
         conn,
         lookup_hashes,
@@ -293,15 +292,9 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
     return groups
 
 
-def _prompt_tag_norms(text_or_tags: str | list[str] | None) -> list[str]:
-    return [tag_norm for group in _prompt_tag_groups(text_or_tags) for tag_norm, _ in group]
-
-
 def _prompt_tag_groups(
-    text_or_tags: str | list[str] | None,
+    text_or_tags: str | list[str],
 ) -> list[tuple[tuple[str, bool], ...]]:
-    if text_or_tags is None:
-        return []
     inputs = [text_or_tags] if isinstance(text_or_tags, str) else text_or_tags
     groups: list[tuple[tuple[str, bool], ...]] = []
     seen_groups: set[frozenset[tuple[str, bool]]] = set()
@@ -325,19 +318,6 @@ def _prompt_tag_groups(
             seen_groups.add(group_key)
             groups.append(tuple(terms))
     return groups
-
-
-def _negative_prompt_tag_terms(
-    text_or_tags: str | list[str] | None,
-) -> list[tuple[str, bool]]:
-    terms: list[tuple[str, bool]] = []
-    seen: set[tuple[str, bool]] = set()
-    for group in _prompt_tag_groups(text_or_tags):
-        for term in group:
-            if term not in seen:
-                seen.add(term)
-                terms.append(term)
-    return terms
 
 
 def _strip_whole_group_parentheses(text: str) -> str:

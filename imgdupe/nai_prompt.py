@@ -664,7 +664,7 @@ def parse_png_itxt(data: bytes) -> tuple[str, str] | None:
 def _zlib_decompress_bounded(data: bytes) -> bytes:
     decompressor = zlib.decompressobj()
     decoded = decompressor.decompress(data, MAX_TEXT_CHUNK_BYTES + 1)
-    if decompressor.unconsumed_tail or len(decoded) > MAX_TEXT_CHUNK_BYTES:
+    if decompressor.unconsumed_tail:
         raise PromptMetadataTooLarge("prompt_metadata_too_large")
     decoded += decompressor.flush()
     if len(decoded) > MAX_TEXT_CHUNK_BYTES:
@@ -675,7 +675,7 @@ def _zlib_decompress_bounded(data: bytes) -> bytes:
 def _gzip_decompress_bounded(data: bytes) -> bytes:
     decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
     decoded = decompressor.decompress(data, MAX_TEXT_CHUNK_BYTES + 1)
-    if decompressor.unconsumed_tail or len(decoded) > MAX_TEXT_CHUNK_BYTES:
+    if decompressor.unconsumed_tail:
         raise PromptMetadataTooLarge("prompt_metadata_too_large")
     decoded += decompressor.flush()
     if len(decoded) > MAX_TEXT_CHUNK_BYTES:

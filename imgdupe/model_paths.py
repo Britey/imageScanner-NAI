@@ -193,10 +193,7 @@ def save_model_paths(path: Path | str, config: ModelPathConfig | Sequence[ModelP
         temporary_name = None
     finally:
         if temporary_name is not None:
-            try:
-                Path(temporary_name).unlink()
-            except FileNotFoundError:
-                pass
+            Path(temporary_name).unlink(missing_ok=True)
 
 
 def discover_legacy_markers(scan_roots: Iterable[Path | str]) -> tuple[ModelPathRule, ...]:

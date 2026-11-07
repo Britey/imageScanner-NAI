@@ -245,14 +245,12 @@ def _run_command(args, parser: argparse.ArgumentParser, conn) -> int:
         )
         return 0
 
-    if args.command == "failures":
-        rows = iter_failures(conn, limit=args.limit)
-        for row in rows:
-            print(f"{row['path']}\t{row['decode_error']}")
-        print(f"failures: {len(rows)}")
-        return 0
-
-    parser.error(f"unknown command {args.command}")
+    # argparse only accepts the commands handled above and this final command.
+    rows = iter_failures(conn, limit=args.limit)
+    for row in rows:
+        print(f"{row['path']}\t{row['decode_error']}")
+    print(f"failures: {len(rows)}")
+    return 0
 
 
 if __name__ == "__main__":

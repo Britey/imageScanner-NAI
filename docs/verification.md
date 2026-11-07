@@ -1,5 +1,38 @@
 # Verification results
 
+## Behavioral test audit, 2026-11-08
+
+Reviewed the interrupted draft tests and every unchanged test module against the
+intended app behavior. The [per-module audit](test-audit.md) records replacements,
+retained contracts, source simplifications and the limits of the test boundaries.
+
+The final suite runs **344 tests**, with two optional reference-corpus skips, and
+reaches **100% statements and branches**: 3,489 statements and 1,072 branches,
+with no exclusions, missing statements or partial branches. The existing 100%
+coverage gate remains in `pyproject.toml` and the manual verification workflow.
+Validation used Linux, Python 3.14.4, SQLite 3.46.1, Pillow 13.0.0, coverage.py
+7.17.2 and Node.js 24.21.0. The workflow provisions Node.js 22 for rendered
+JavaScript behavior checks; local tests require Node.js 18 or newer.
+
+All **43/43 curated semantic mutations** are rejected by assertion failures,
+with no survivors, test errors or timeouts on the final 344-test baseline. This
+includes the original 38 faults (with move ambiguity retargeted to the active
+scanner) plus five additional model-name/autocomplete faults. Cardinality
+assertions prevent missing results from becoming accidental runtime-error kills.
+This is a curated check, not an exhaustive mutation score.
+
+The TLA+ checks also pass, including the intentionally invalid negative control:
+82,416 distinct states, 111,145 generated states, depth 9. The model and its
+bounded scope are unchanged. No GitHub workflow was launched.
+
+A broken thumbnail-cache link was converted from a print-only scratch finding
+into a regression: startup failed before the cache enumeration fix and passed
+afterward. The test also checks pruning and restored eviction order.
+
+Final test, coverage, mutation and formal logs are retained locally under the
+ignored `performance-results/test-audit-2026-11-08/` directory. Earlier sections
+below describe their corresponding historical suites and source revisions.
+
 ## Performance changes, 2026-11-07
 
 The performance PR starts from main `ce47e444f5d056bc3f1e117e7cda37ffa5998020`.

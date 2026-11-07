@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-import mimetypes
 import ctypes
 import os
 import re
@@ -437,7 +436,7 @@ class WebState:
         _prune_thumbnail_cache(self.thumbs_dir, self.thumbnail_cache_limit)
         self._thumbnails: OrderedDict[Path, None] = OrderedDict()
         self._thumbnail_versions: dict[str, set[Path]] = {}
-        for path in sorted(self.thumbs_dir.glob("*.jpg"), key=lambda item: item.stat().st_mtime_ns):
+        for path in _cached_thumbnail_paths(self.thumbs_dir):
             self._remember_thumbnail(path)
         self.thumbnail_cache_count = len(self._thumbnails)
 
@@ -797,8 +796,7 @@ def _make_handler(state: WebState):
                     if additions:
                         config = build_config((*config.rules, *additions))
                         save_model_paths(DEFAULT_MODEL_PATHS_PATH, config)
-                    if not state.start_scan(request):
-                        raise RuntimeError("an index update is already running")
+                    state.start_scan(request)
                     self._redirect(f"/?lang={request.lang}#scan-index")
                 except Exception as exc:
                     self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
@@ -1016,10 +1014,6 @@ def _make_handler(state: WebState):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
-
-        def _send_file(self, path: Path, content_type: str | None = None) -> None:
-            data = path.read_bytes()
-            self._send_bytes(data, content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
 
         def _send_bytes(self, data: bytes, content_type: str) -> None:
             self.send_response(HTTPStatus.OK)
@@ -1974,16 +1968,19 @@ def _discard_thumbnail(path: Path) -> None:
         pass
 
 
+def _cached_thumbnail_paths(cache_dir: Path) -> list[Path]:
+    entries = []
+    for path in cache_dir.glob("*.jpg"):
+        try:
+            entries.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue  # A stale cache entry must not prevent the UI from starting.
+    return [path for _, path in sorted(entries, key=lambda entry: entry[0])]
+
+
 def _prune_thumbnail_cache(cache_dir: Path, limit: int) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        thumbnails = sorted(
-            cache_dir.glob("*.jpg"),
-            key=lambda path: path.stat().st_mtime_ns,
-            reverse=True,
-        )
-    except OSError:
-        return
+    thumbnails = list(reversed(_cached_thumbnail_paths(cache_dir)))
     for path in thumbnails[max(1, limit) :]:
         try:
             path.unlink()
@@ -2074,8 +2071,7 @@ def _extract_multipart(body: bytes, boundary: bytes) -> tuple[dict[str, str], by
         if not header or not content:
             continue
         header_text = header.decode("utf-8", errors="replace")
-        if content.endswith(b"\r\n"):
-            content = content[:-2]
+        content = content.removesuffix(b"\r\n")
         name = _field_name_from_header(header_text)
         if not name:
             continue

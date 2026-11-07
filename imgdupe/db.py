@@ -316,7 +316,7 @@ def decode_prompt_metadata(raw_metadata: bytes | None, codec: str | None) -> str
     if codec == "zlib+utf8":
         decompressor = zlib.decompressobj()
         decoded = decompressor.decompress(data, MAX_PROMPT_METADATA_BYTES + 1)
-        if decompressor.unconsumed_tail or len(decoded) > MAX_PROMPT_METADATA_BYTES:
+        if decompressor.unconsumed_tail:
             raise ValueError("prompt_metadata_too_large")
         decoded += decompressor.flush()
         if len(decoded) > MAX_PROMPT_METADATA_BYTES:
@@ -394,8 +394,6 @@ def checkpoint_database(conn: sqlite3.Connection, mode: str = "PASSIVE") -> tupl
         row = conn.execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
     except sqlite3.Error:
         return None
-    if row is None:
-        return None
     return int(row[0]), int(row[1]), int(row[2])
 
 
@@ -456,8 +454,6 @@ def upsert_image(
         ),
     )
     row = get_existing_image(conn, path)
-    if row is None:
-        raise RuntimeError(f"Failed to upsert image row for {path}")
     return int(row["id"])
 
 

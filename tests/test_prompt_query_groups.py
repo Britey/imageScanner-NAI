@@ -4,7 +4,7 @@ import sqlite3
 import unittest
 
 from imgdupe.db import init_db
-from imgdupe.query import _prompt_tag_groups, query_prompt_tags
+from imgdupe.query import query_prompt_tags
 
 
 class PromptQueryGroupTests(unittest.TestCase):
@@ -72,11 +72,13 @@ class PromptQueryGroupTests(unittest.TestCase):
         self.assertEqual([result.matched_count for result in results], [2, 1])
         self.assertEqual(set(results[0].matched_tags), {"a", "b", "c"})
 
-    def test_groups_and_alternatives_are_deduplicated(self) -> None:
-        self.assertEqual(
-            _prompt_tag_groups("a|a|b,b|a,c,c"),
-            [(('a', False), ('b', False)), (('c', False),)],
-        )
+    def test_duplicate_groups_and_alternatives_do_not_inflate_matches(self) -> None:
+        self.add_image(1, ("a", "prompt"), ("b", "prompt"), ("c", "prompt"))
+        self.add_image(2, ("a", "prompt"))
+        results = query_prompt_tags(self.conn, "a|a|b,b|a,c,c", match_mode="any", sort_by="name_asc")
+        self.assertEqual([result.image_row["id"] for result in results], [1, 2])
+        self.assertEqual([result.matched_count for result in results], [2, 1])
+        self.assertEqual(set(results[0].matched_tags), {"a", "b", "c"})
 
     def test_negative_terms_still_exclude_independently(self) -> None:
         self.add_image(1, ("cat", "prompt"), ("bad", "prompt"))
@@ -116,6 +118,32 @@ class PromptQueryGroupTests(unittest.TestCase):
         self.assertEqual(self.result_ids("@model:abc123"), [1])
         self.assertEqual(self.result_ids("cat", model_type="noob"), [1])
         self.assertEqual(self.result_ids("cat", model_type="sd"), [])
+
+    def test_empty_queries_and_invalid_match_modes_do_not_run_a_broad_search(self):
+        self.add_image(1, ("cat", "prompt"))
+        for text in ("", " , | ", []):
+            with self.subTest(text=text):
+                self.assertEqual(query_prompt_tags(self.conn, text), [])
+        with self.assertRaisesRegex(ValueError, "match_mode"):
+            query_prompt_tags(self.conn, "cat", match_mode="everything")
+
+    def test_list_inputs_and_literal_model_markers_preserve_tag_boundaries(self):
+        self.add_image(1, ("cat", "prompt"), ("prefix@model:literal", "prompt"))
+        self.add_image(2, ("cat", "prompt"))
+        self.assertEqual(self.result_ids(["cat", "cat"]), [1, 2])
+        self.assertEqual(self.result_ids("prefix@model:literal"), [1])
+        self.assertEqual(self.result_ids("@model:literal"), [])
+
+    def test_parentheses_around_alternatives_never_strip_independent_qualifiers(self):
+        self.add_image(1, ("cat", "prompt"))
+        self.add_image(2, ("dog", "prompt"))
+        self.add_image(3, ("cat (sleeping)", "prompt"))
+        self.assertEqual(self.result_ids("((cat | dog))"), [1, 2])
+        # These parentheses do not enclose the entire OR group and belong to
+        # the literal terms; stripping the outer characters invents matches.
+        self.assertEqual(self.result_ids("(cat) | (dog)"), [])
+        self.assertEqual(self.result_ids("((cat)"), [])
+        self.assertEqual(self.result_ids("cat (sleeping)"), [3])
 
 
 if __name__ == "__main__":

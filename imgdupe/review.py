@@ -13,8 +13,8 @@ from PIL import Image, ImageOps
 try:
     from tqdm import tqdm
 except ImportError:  # Progress output is optional for library/test environments.
-    def tqdm(iterable=None, **_kwargs):
-        return iterable if iterable is not None else ()
+    def tqdm(iterable, **_kwargs):
+        return iterable
 
 from .db import temporary_image_ids
 from .utils import human_size

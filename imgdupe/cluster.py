@@ -6,8 +6,8 @@ from dataclasses import dataclass
 try:
     from tqdm import tqdm
 except ImportError:  # Progress output is optional for library/test environments.
-    def tqdm(iterable=None, **_kwargs):
-        return iterable if iterable is not None else ()
+    def tqdm(iterable, **_kwargs):
+        return iterable
 
 from .bands import find_candidates
 from .config import ScanConfig, Thresholds
@@ -95,8 +95,6 @@ def build_clusters(
         stats.candidate_pairs += len(candidates)
         for candidate in candidates:
             other_id = candidate.image_id
-            if other_id <= image_id:
-                continue
             other_hashes = hashes_by_id.get(other_id)
             if other_hashes is None:
                 continue

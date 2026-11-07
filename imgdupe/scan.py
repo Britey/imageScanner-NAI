@@ -52,7 +52,6 @@ from .model_paths import (
     DEFAULT_MODEL_PATHS_PATH,
     ModelPathConfig,
     load_model_paths,
-    path_is_within,
     lexical_path_is_within,
 )
 from .nai_prompt import (
@@ -249,7 +248,7 @@ def _scan_tasks(conn, roots, directory_roots, classification_roots, config, mode
                 moved_id = int(existing["id"])
                 claimed_ids.add(moved_id)
         existing_id = int(existing["id"]) if existing is not None else None
-        classification_root = _scan_root_for_path(path, classification_roots, canonical=True)
+        classification_root = _scan_root_for_path(path, classification_roots)
         model_rule = resolve_rule(path)
         classification_status = "configured" if model_rule is not None else "unconfigured"
         configured_model = model_rule.label if model_rule is not None else None
@@ -324,11 +323,8 @@ def _scan_tasks(conn, roots, directory_roots, classification_roots, config, mode
         )
 
 
-def _scan_root_for_path(path: Path, roots: list[Path], *, canonical: bool = False) -> Path:
-    if not canonical:
-        path = path.resolve(strict=False)
-        roots = [root.resolve(strict=False) if root.is_dir() else root.resolve(strict=False).parent
-                 for root in roots]
+def _scan_root_for_path(path: Path, roots: list[Path]) -> Path:
+    """Choose a classification root from the scanner's canonical directory paths."""
     candidates = [root for root in roots if lexical_path_is_within(path, root)]
     return max(candidates, key=lambda item: len(item.parts)) if candidates else path.parent
 
@@ -520,10 +516,6 @@ def _store_result(
 ) -> None:
     indexed_at = utc_now_sql()
     if result.date_only:
-        if result.existing_image_id is None:
-            stats.failed += 1
-            _commit_batch_if_needed(conn, config, stats)
-            return
         if result.moved:
             update_image_path(
                 conn,
@@ -548,10 +540,6 @@ def _store_result(
         return
 
     if result.prompt_only:
-        if result.existing_image_id is None:
-            stats.failed += 1
-            _commit_batch_if_needed(conn, config, stats)
-            return
         if result.moved:
             update_image_path(
                 conn,
@@ -829,63 +817,6 @@ def _optional_int(value) -> int | None:
     return int(value) if value is not None else None
 
 
-def _missing_hash_candidates(
-    conn: sqlite3.Connection,
-    *,
-    known_paths: set[str] | None = None,
-    roots: list[Path] | None = None,
-) -> dict[int, dict[bytes, list[int]]]:
-    rows = conn.execute(
-        """
-        SELECT id, path, size_bytes, sha256
-        FROM images
-        WHERE sha256 IS NOT NULL
-        """
-    ).fetchall()
-    directory_roots = (
-        [root.resolve(strict=False) for root in (roots or []) if root.is_dir()]
-        if known_paths is not None
-        else []
-    )
-    candidates: dict[int, dict[bytes, list[int]]] = {}
-    for row in rows:
-        row_path = Path(row["path"])
-        if known_paths is None:
-            if not _path_is_missing(row_path):
-                continue
-        else:
-            if not any(path_is_within(row_path, root) for root in directory_roots):
-                continue
-            if str(row_path) in known_paths or not _path_is_missing(row_path):
-                continue
-        hashes_by_size = candidates.setdefault(int(row["size_bytes"]), {})
-        hashes_by_size.setdefault(row["sha256"], []).append(int(row["id"]))
-    return candidates
-
-
-def _claim_moved_image(
-    path: Path,
-    size_bytes: int,
-    candidates: dict[int, dict[bytes, list[int]]],
-    *,
-    precomputed_hashes: dict[Path, bytes] | None = None,
-) -> int | None:
-    hashes_by_size = candidates.get(size_bytes)
-    if not hashes_by_size:
-        return None
-    sha256 = sha256_file(path)
-    if precomputed_hashes is not None:
-        precomputed_hashes[path] = sha256
-    image_ids = hashes_by_size.get(sha256, [])
-    if len(image_ids) != 1:
-        return None
-    image_id = image_ids[0]
-    del hashes_by_size[sha256]
-    if not hashes_by_size:
-        del candidates[size_bytes]
-    return image_id
-
-
 def _delete_missing_images(conn: sqlite3.Connection) -> int:
     deleted = 0
     iterator = iter(_image_batches(conn))
@@ -931,14 +862,13 @@ def _store_prompt(
 
     def add_tag(tag: str, kind: str) -> None:
         normalized = normalize_prompt_tag(tag)
-        if not normalized:
-            return
+        # Parsed prompt tags are already nonempty and deduplicated. Only the
+        # generated model tags can collide with those tags or with each other.
         if normalized in seen_tags:
-            if kind != "prompt":
-                for index, existing in enumerate(tag_rows):
-                    if existing[1] == normalized and existing[2] == "prompt":
-                        tag_rows[index] = (tag, normalized, kind)
-                        break
+            for index, existing in enumerate(tag_rows):
+                if existing[1] == normalized and existing[2] == "prompt":
+                    tag_rows[index] = (tag, normalized, kind)
+                    break
             return
         seen_tags.add(normalized)
         tag_rows.append((tag, normalized, kind))

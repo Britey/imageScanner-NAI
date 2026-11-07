@@ -52,7 +52,7 @@ MUTATIONS = (
     ),
     Mutation(
         "web-upload-trailing-crlf", "web",
-        'content = content[:-2]', 'content = content',
+        'content = content.removesuffix(b"\\r\\n")', 'content = content',
         "Multipart framing CRLF must be removed without altering uploaded image bytes.",
     ),
     Mutation(
@@ -99,7 +99,7 @@ MUTATIONS = (
     ),
     Mutation(
         "scan-ambiguous-move", "scan",
-        'if len(image_ids) != 1:', 'if len(image_ids) < 1:',
+        'if found is not None:', 'if False and found is not None:',
         "Identical missing files are ambiguous and must not be claimed as one moved image.",
     ),
     Mutation(
@@ -245,6 +245,36 @@ MUTATIONS = (
         'return max(matches, key=lambda rule: (_path_depth(rule.path), rule.rule_id))',
         'return min(matches, key=lambda rule: (_path_depth(rule.path), rule.rule_id))',
         "The deepest matching model-path rule overrides its ancestor rules.",
+    ),
+    Mutation(
+        "query-model-parentheses-boundary", "query",
+        'character in "|｜" or (character == ")" and not depth)',
+        'character in "|｜()" or (character == ")" and not depth)',
+        "Legacy model names containing their own parentheses must remain one searchable term.",
+    ),
+    Mutation(
+        "query-matched-tags-lossless", "query",
+        'tuple(json.loads(row["matched_tags"] or "[]"))',
+        'tuple(",".join(json.loads(row["matched_tags"] or "[]")).split(","))',
+        "Matched metadata tags containing commas must survive result serialization intact.",
+    ),
+    Mutation(
+        "web-autocomplete-debounce-invalidation", "web",
+        '++suggestionRequest;\n        hideAllSuggestions();\n        suggestionTimer =',
+        '++suggestionRequest;\n        suggestionTimer =',
+        "Typing must hide stale selectable suggestions during the debounce delay.",
+    ),
+    Mutation(
+        "web-autocomplete-rendered-input-binding", "web",
+        'id="prompt-tags-input" name="tags"',
+        'id="renamed-prompt-input" name="tags"',
+        "Autocomplete must bind to the actual input rendered in the page.",
+    ),
+    Mutation(
+        "web-autocomplete-json-response-race", "web",
+        'const tags = await response.json();\n        if (request !== suggestionRequest || activePromptInput !== inputElement) return false;',
+        'const tags = await response.json();',
+        "A response finishing JSON decoding after a new request must not replace current suggestions.",
     ),
 )
 

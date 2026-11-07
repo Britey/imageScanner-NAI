@@ -39,13 +39,22 @@ python -m coverage report
 python scripts/check_mutations.py
 ```
 
-Coverage requires **100% of all `imgdupe` statements and branches**, without
-source exclusions. Tests use generated images, temporary SQLite databases,
-real background scans and HTTP request handlers, plus controlled failure and
-platform API boundaries. Two optional tests skip when the uncommitted reference
-image corpus is absent. Native Windows calls are mocked on Linux; coverage is
-not a claim of native Windows integration testing. The coverage gate is verified
-on Linux with Python 3.13 and 3.14 (SQLite 3.53.1 and 3.46.1).
+Install Node.js 18 or later for the rendered JavaScript behavior tests (the manual
+workflow installs Node.js 22). The suite fails with an installation hint when Node
+is missing.
+
+Coverage requires **100% of `imgdupe` statements and branches**, without
+exclusions. Every test must also establish an observable behavior or a meaningful
+safety/performance bound. Tests use generated asymmetric images, temporary SQLite databases, real background scans and HTTP handlers, plus
+controlled failure and platform API boundaries. Autocomplete checks execute the
+rendered production JavaScript with its actual control bindings, deterministic
+timers and out-of-order fetch completions. This small DOM boundary does not replace
+browser layout or native clipboard testing. Two optional tests skip when the
+uncommitted reference image corpus is absent. Native Windows APIs are simulated
+on Linux; these checks do not establish native Windows integration.
+
+See the [test audit](docs/test-audit.md) for retained coverage, replacements and
+known limits. Earlier verification results describe their historical suites.
 
 The mutation runner makes isolated temporary copies and deliberately introduces
 realistic semantic defects. Every mutant must trigger an assertion failure;
