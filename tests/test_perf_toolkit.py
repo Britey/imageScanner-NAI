@@ -12,11 +12,12 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from imgdupe.bands import GRID_HASH_TYPES, WHOLE_HASH_TYPES, split_bands
 from imgdupe.db import decode_prompt_metadata, init_db
 from imgdupe.query import query_prompt_tags
-from scripts.perf_toolkit import experiments
+from scripts.perf_toolkit import experiments, webbench
 from scripts.perf_toolkit.fixture import MARKER_KIND, MARKER_NAME, generate_fixture
 from scripts.perf_toolkit.runner import (
     OWNER_FILE,
@@ -106,6 +107,48 @@ class PerformanceFixtureTests(unittest.TestCase):
 
 
 class PerformanceRunnerSafetyTests(unittest.TestCase):
+    def test_web_benchmark_rejects_directory_output_before_touching_fixture_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / 'fixture'
+            with contextlib.redirect_stdout(io.StringIO()):
+                manifest = generate_fixture(fixture, 2, metadata_bytes=0)
+            cache = Path(manifest['db_path']).with_suffix('.sqlite.thumb-cache')
+            cache.mkdir()
+            sentinel = cache / 'retained.jpg'
+            sentinel.write_bytes(b'cached thumbnail must survive')
+            output = root / 'directory-output'
+            output.mkdir()
+            outputs = [output, cache]
+            if os.name == 'posix':
+                link = root / 'directory-link'
+                link.symlink_to(output, target_is_directory=True)
+                outputs.append(link)
+            for target in outputs:
+                with self.subTest(output=target.name):
+                    with patch.object(webbench, 'Server', side_effect=AssertionError('server must not start')) as server:
+                        error = None
+                        try:
+                            webbench.run_benchmark(fixture / 'fixture.json', target, repeats=1)
+                        except Exception as exc:
+                            error = exc
+                        self.assertIsInstance(error, ValueError)
+                        self.assertIn('output path must be a file', str(error))
+                        server.assert_not_called()
+                    result = subprocess.run(
+                        [sys.executable, '-m', 'scripts.perf_toolkit.webbench', '--fixture',
+                         str(fixture / 'fixture.json'), '--output', str(target), '--repeats', '1'],
+                        cwd=Path(__file__).resolve().parents[1], text=True, capture_output=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn('output path must be a file', result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertEqual(sentinel.read_bytes(), b'cached thumbnail must survive')
+                    self.assertEqual(list(cache.iterdir()), [sentinel])
+                    self.assertTrue(target.is_dir())
+            self.assertEqual(list(output.iterdir()), [])
+
     def test_file_output_is_rejected_before_fixture_work_and_preserves_existing_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -235,6 +235,43 @@ class PromptQueryGroupTests(unittest.TestCase):
         self.add_image(5, ('@model:Foo, Bar extra', 'model_identity'))
         self.assertEqual(self.result_ids('@model:Foo, Bar extra'), [5])
 
+    def test_extended_model_qualifiers_do_not_become_prompt_constraints(self):
+        self.add_image(1, ('cat', 'prompt'), ('@model:Foo Bar (Baz)', 'model_identity'))
+        self.add_image(2, ('cat', 'prompt'), ('@model:Foo', 'model_identity'))
+        self.add_image(3, ('cat', 'prompt'), ('bar (baz', 'prompt'), ('qux)', 'prompt'))
+        self.add_image(4, ('cat', 'prompt'), ('@model:Foo', 'model_identity'),
+                          ('bar (baz', 'prompt'), ('qux)', 'prompt'))
+        self.add_image(5, ('cat', 'prompt'))
+        for text in ('@model:Foo, Bar (Baz, Qux)', '@model:Foo，Bar (Baz，Qux)',
+                     '@model:Foo, Bar (Baz, Qux) extra'):
+            with self.subTest(query=text):
+                self.assertEqual(self.result_ids(text), [])
+                self.assertEqual(self.result_ids(text, match_mode='any'), [])
+                self.assertEqual(self.result_ids('cat', negative_text_or_tags=text), [1, 2, 3, 4, 5])
+        self.assertEqual(self.result_ids('@model:Foo, Bar (Baz)'), [1])
+        self.add_image(6, ('@model:Foo, Bar (Baz, Qux)', 'model_identity'))
+        self.assertEqual(self.result_ids('@model:Foo, Bar (Baz, Qux)'), [6])
+
+    def test_pipes_inside_model_parentheses_always_start_an_or_alternative(self):
+        self.add_image(1, ('cat', 'prompt'), ('@model:Foo (Bar)', 'model_identity'))
+        self.add_image(2, ('cat', 'prompt'), ('qux) extra', 'prompt'))
+        self.add_image(3, ('cat', 'prompt'), ('@model:Foo (Bar|Qux) extra', 'model_identity'))
+        self.add_image(4, ('cat', 'prompt'), ('@model:Foo', 'model_identity'))
+        self.add_image(5, ('cat', 'prompt'))
+        for pipe in ('|', '｜'):
+            for prefix in ('@model:Foo (Bar', '@model:Foo (Bar, Baz'):
+                text = f'{prefix}{pipe}Qux) extra'
+                with self.subTest(query=text):
+                    self.assertEqual(self.result_ids(text), [2])
+                    self.assertEqual(self.result_ids(text, match_mode='any'), [2])
+                    self.assertEqual(self.result_ids('cat', negative_text_or_tags=text), [1, 3, 4, 5])
+        self.add_image(6, ('@model:Foo (Bar', 'model_identity'))
+        for pipe in ('|', '｜'):
+            results = query_prompt_tags(self.conn, f'@model:Foo (Bar{pipe}Qux) extra', sort_by='name_asc')
+            self.assertEqual([result.image_row['id'] for result in results], [2, 6])
+            self.assertEqual([result.matched_count for result in results], [1, 1])
+            self.assertEqual([result.matched_tags for result in results], [('qux) extra',), ('@model:Foo (Bar',)])
+
     def test_unfinished_legacy_model_continuations_keep_inner_commas_in_metadata(self):
         self.add_image(1, ('cat', 'prompt'), ('@model:Foo, Bar', 'model_identity'))
         self.add_image(2, ('cat', 'prompt'), ('@model:Foo', 'model_identity'))

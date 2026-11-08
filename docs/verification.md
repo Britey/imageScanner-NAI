@@ -1,5 +1,30 @@
 # Verification results
 
+## Extended qualifiers and inner OR operators, 2026-11-09
+
+Fixed the two query blockers reported against PR #5 head `f8f4684`. An unmatched
+extension before a stored model qualifier's closing parenthesis stays in one
+metadata term instead of becoming comma-separated prompt constraints. Both `|`
+and `｜` end the initial model span at any parenthesis depth, so the following
+text remains an independent OR alternative even without a stored left-hand name.
+
+The web benchmark now rejects existing non-file output paths before loading its
+fixture, creating output directories, deleting thumbnails or starting a server.
+API and CLI regressions preserve a real generated fixture's cached thumbnails
+when output is a directory, the cache itself, or a symlink to a directory. CLI
+validation returns usage error 2 without a traceback.
+
+The new regressions fail before their fixes and pass afterward. The full suite
+runs **364 tests**, with two optional corpus skips, at **100% statements and
+branches**: 3,535 statements and 1,100 branches, without exclusions. Two new
+semantic mutations restore the qualifier and inner-pipe bugs; the curated set
+now contains 55 faults. All **10/10 relevant model-query mutations** are rejected
+by assertions on the 364-test baseline, with no survivors, test errors or
+timeouts. The previous full 52-fault result remains recorded below.
+
+Logs are retained locally under the ignored
+`performance-results/qualified-model-review-2026-11-09/` directory.
+
 ## Unfinished legacy model query follow-up, 2026-11-08
 
 Fixed the re-review blocker against PR #5 head `9ad5190`. The legacy model-name

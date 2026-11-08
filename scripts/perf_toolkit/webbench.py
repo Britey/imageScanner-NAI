@@ -235,12 +235,19 @@ def _parallel_requests(server: Server, paths: list[str], timeout: float, concurr
     return rows, time.perf_counter() - begin
 
 
+def validate_output_file(output: Path) -> Path:
+    output = output.resolve()
+    if output.exists() and not output.is_file():
+        raise ValueError("output path must be a file")
+    return output
+
+
 def run_benchmark(fixture_path: Path, output: Path, *, repeats: int = 3,
                   timeout: float = 90, server_profile: Path | None = None) -> dict:
+    output = validate_output_file(output)
     manifest = load_fixture(fixture_path)
     db = Path(manifest["db_path"])
     cache = db.with_suffix(db.suffix + ".thumb-cache")
-    output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     result = {"schema_version": 1, "kind": "real_http_webui", "fixture": str(fixture_path.resolve()),
               "image_count": manifest["image_count"], "repeats": repeats, "request_timeout_seconds": timeout,
@@ -394,6 +401,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if not args.output:
             parser.error("--output is required unless --serve-worker is selected")
+        try:
+            args.output = validate_output_file(args.output)
+        except ValueError as error:
+            parser.error(str(error))
         run_benchmark(args.fixture, args.output, repeats=args.repeats, timeout=args.timeout,
                       server_profile=args.server_profile)
     return 0

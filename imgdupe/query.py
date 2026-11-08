@@ -281,12 +281,14 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                     if names:
                         best_end, best_names = end, names
                     elif atom_end == prefix_end and best_end == atom_end and end > atom_end and any(
-                        sanitized.startswith(name)
+                        sanitized.startswith(name.rstrip(") "))
                         for name in normalized.values() if len(name) > len(prefix)
                     ):
                         # An overlong continuation of a legacy comma name is
-                        # one unmatched metadata term, not its short prefix
-                        # plus an unrelated prompt term. A name already finished
+                        # one unmatched metadata term, including extra content
+                        # inserted before a stored qualifier's closing ")".
+                        # Do not search its short prefix plus unrelated prompt
+                        # terms. A name already finished
                         # beyond the first comma retains subsequent AND groups.
                         best_end, best_names = end, [raw]
                     if len(sanitized) > longest:
@@ -322,10 +324,12 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
 
 
 def _model_token_end(text: str, start: int, boundaries: re.Pattern[str]) -> int:
-    """Find an explicit separator outside the model name's own parentheses."""
+    """Keep qualifier commas inside the name; OR ends it at any depth."""
     depth = 0
     for boundary in boundaries.finditer(text, start):
         character = boundary.group()
+        if character in "|｜":
+            return boundary.start()
         if character == "(":
             depth += 1
         elif character == ")" and depth:

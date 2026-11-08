@@ -301,6 +301,18 @@ MUTATIONS = (
         'EOF and OR inside parentheses must resolve the final legacy model span without leaking inner comma fragments.',
     ),
     Mutation(
+        'query-extended-model-qualifier', 'query',
+        'sanitized.startswith(name.rstrip(") "))',
+        'sanitized.startswith(name)',
+        'An unmatched extension inside a stored model qualifier must remain metadata, not comma-separated prompt constraints.',
+    ),
+    Mutation(
+        'query-model-inner-pipe', 'query',
+        'if character in "|｜":\n            return boundary.start()',
+        'if character in "|｜" and not depth:\n            return boundary.start()',
+        'Both pipe operators must end the initial model span at every parenthesis depth.',
+    ),
+    Mutation(
         'query-closed-group-suffix-boundary', 'query',
         'separators.add(index)',
         'wrappers.add(index)',
