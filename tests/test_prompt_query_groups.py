@@ -235,6 +235,34 @@ class PromptQueryGroupTests(unittest.TestCase):
         self.add_image(5, ('@model:Foo, Bar extra', 'model_identity'))
         self.assertEqual(self.result_ids('@model:Foo, Bar extra'), [5])
 
+    def test_unfinished_legacy_model_continuations_keep_inner_commas_in_metadata(self):
+        self.add_image(1, ('cat', 'prompt'), ('@model:Foo, Bar', 'model_identity'))
+        self.add_image(2, ('cat', 'prompt'), ('@model:Foo', 'model_identity'))
+        self.add_image(3, ('cat', 'prompt'), ('bar (baz extra', 'prompt'),
+                          ('bar (baz', 'prompt'), ('qux extra', 'prompt'))
+        self.add_image(4, ('cat', 'prompt'), ('qux) extra', 'prompt'))
+        self.add_image(5, ('cat', 'prompt'))
+        cases = (
+            ('@model:Foo, Bar (Baz extra', []),
+            ('@model:Foo, Bar (Baz, Qux extra', []),
+            ('@model:Foo，Bar (Baz，Qux extra', []),
+            ('@model:Foo, Bar ((Baz, Qux extra', []),
+            ('@model:Foo, Bar (Baz|Qux) extra', [4]),
+            ('@model:Foo, Bar (Baz｜Qux) extra', [4]),
+        )
+        for text, expected in cases:
+            with self.subTest(query=text):
+                self.assertEqual(self.result_ids(text), expected)
+                self.assertEqual(self.result_ids(text, match_mode='any'), expected)
+                self.assertEqual(self.result_ids('cat', negative_text_or_tags=text),
+                                 [image_id for image_id in range(1, 6) if image_id not in expected])
+        # A fully stored unfinished name still matches exactly; explicit AND
+        # groups and ordinary OR alternatives retain their existing meaning.
+        self.add_image(6, ('@model:Foo, Bar (Baz extra', 'model_identity'))
+        self.assertEqual(self.result_ids(cases[0][0]), [6])
+        self.assertEqual(self.result_ids('@model:Foo, Bar, cat'), [1])
+        self.assertEqual(self.result_ids('@model:Foo | qux) extra'), [2, 4])
+
     def test_closed_model_groups_finish_before_the_following_prompt_term(self):
         self.add_image(1, ('cat', 'prompt'), ('extra', 'prompt'), ('@model:sd', 'model_type'))
         self.add_image(2, ('cat', 'prompt'), ('@model:sd', 'model_type'))

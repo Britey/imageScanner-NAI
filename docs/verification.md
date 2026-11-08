@@ -1,5 +1,25 @@
 # Verification results
 
+## Unfinished legacy model query follow-up, 2026-11-08
+
+Fixed the re-review blocker against PR #5 head `9ad5190`. The legacy model-name
+scan now checks its final span at EOF or an explicit OR operator even while
+parentheses remain open. An extended comma-containing name cannot fall back to
+a short model prefix and leak its remaining comma fragments into prompt terms.
+Explicit OR alternatives and fully stored unfinished names retain exact matches.
+
+The regression fails before the fix and passes afterward for the reported cases,
+nested parentheses and fullwidth separators, including negative and match-any
+searches. The full suite runs **361 tests**, with two optional corpus skips, at
+**100% statements and branches**: 3,533 statements and 1,098 branches, without
+exclusions. A new curated mutation restores the faulty stopping-point check;
+all **8/8 relevant model-query mutations** are rejected by assertions on the
+361-test baseline, with no survivors, test errors or timeouts. The mutation set
+now contains 53 faults; the previous full 52-fault run remains recorded below.
+
+Validation logs are retained locally under the ignored
+`performance-results/model-stop-review-2026-11-08/` directory.
+
 ## Independent-review fixes, 2026-11-08
 
 Fixed the follow-up model-query blockers and autocomplete dismissal race, plus

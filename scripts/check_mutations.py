@@ -295,6 +295,12 @@ MUTATIONS = (
         'An extended legacy comma model name must remain one metadata term instead of leaking prompt terms or a short model prefix.',
     ),
     Mutation(
+        'query-unfinished-legacy-model-stop', 'query',
+        'if stopping or (not depth and character != "("):',
+        'if not depth and character != "(":',
+        'EOF and OR inside parentheses must resolve the final legacy model span without leaking inner comma fragments.',
+    ),
+    Mutation(
         'query-closed-group-suffix-boundary', 'query',
         'separators.add(index)',
         'wrappers.add(index)',

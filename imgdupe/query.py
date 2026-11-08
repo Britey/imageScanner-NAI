@@ -270,7 +270,11 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                 boundary = next(boundary_iter, None)
                 end = boundary.start() if boundary else len(item)
                 character = boundary.group() if boundary else ""
-                if not depth and character != "(":
+                stopping = not boundary or character in "|｜" or (character == ")" and not depth)
+                # EOF and OR finish the scan even inside an unfinished name.
+                # Resolve that final span before falling back to a short model
+                # prefix and exposing its comma-separated continuation as tags.
+                if stopping or (not depth and character != "("):
                     sanitized = normalize_prompt_tag(sanitize_model_name(item[start:end]))
                     raw = normalize_prompt_tag(item[start:end])
                     names = [name for name in known if name == raw or normalized[name] == sanitized]
@@ -287,7 +291,7 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                         best_end, best_names = end, [raw]
                     if len(sanitized) > longest:
                         break
-                if not boundary or character in "|｜" or (character == ")" and not depth):
+                if stopping:
                     break
                 depth += 1 if character == "(" else -1 if character == ")" else 0
             placeholder = f"@model:legacy-placeholder-{len(replacements)}-{uuid4().hex}"
