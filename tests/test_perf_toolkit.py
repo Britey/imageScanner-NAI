@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -15,6 +16,7 @@ import unittest
 from imgdupe.bands import GRID_HASH_TYPES, WHOLE_HASH_TYPES, split_bands
 from imgdupe.db import decode_prompt_metadata, init_db
 from imgdupe.query import query_prompt_tags
+from scripts.perf_toolkit import experiments
 from scripts.perf_toolkit.fixture import MARKER_KIND, MARKER_NAME, generate_fixture
 from scripts.perf_toolkit.runner import (
     OWNER_FILE,
@@ -104,6 +106,56 @@ class PerformanceFixtureTests(unittest.TestCase):
 
 
 class PerformanceRunnerSafetyTests(unittest.TestCase):
+    def test_file_output_is_rejected_before_fixture_work_and_preserves_existing_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "existing-results"
+            target.write_bytes(b"retained user data")
+            outputs = [target]
+            if os.name == "posix":
+                link = root / "output-link"
+                link.symlink_to(target)
+                outputs.append(link)
+            for output in outputs:
+                with self.subTest(output=output.name):
+                    self.assert_rejected_output(root, output, "must be a directory")
+                    with self.assertRaisesRegex(ValueError, "must be a directory"):
+                        experiments.run(root / "not-generated" / "fixture.json", output)
+                    self.assertEqual(target.read_bytes(), b"retained user data")
+                    self.assertFalse((root / "scratch").exists())
+            self.assertEqual({path.name for path in root.iterdir()}, {path.name for path in outputs})
+
+    def test_nonempty_output_directory_is_rejected_without_touching_its_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "results"
+            output.mkdir()
+            sentinel = output / "report.html"
+            sentinel.write_bytes(b"previous report")
+            self.assert_rejected_output(root, output, "must be new or empty")
+            with self.assertRaisesRegex(ValueError, "must be new or empty"):
+                experiments.run(root / "not-generated" / "fixture.json", output)
+            self.assertEqual(sentinel.read_bytes(), b"previous report")
+            self.assertEqual(list(output.iterdir()), [sentinel])
+            self.assertFalse((root / "scratch").exists())
+
+    def assert_rejected_output(self, root, output, message):
+        commands = (
+            [sys.executable, "-m", "scripts.perf_toolkit.runner", "--sizes", "2", "--repeats", "1",
+             "--cases", "stats", "--skip-web", "--skip-diagnostics", "--work-dir", str(root / "scratch"),
+             "--output", str(output)],
+            [sys.executable, "-m", "scripts.perf_toolkit.experiments", "--fixture",
+             str(root / "not-generated" / "fixture.json"), "--output", str(output)],
+        )
+        for command in commands:
+            with self.subTest(command=command[2]):
+                result = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.stdout, "")
+
     def test_cleanup_requires_correct_token_and_exact_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)

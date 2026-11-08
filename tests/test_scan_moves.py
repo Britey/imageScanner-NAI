@@ -18,6 +18,7 @@ from imgdupe import db, scan
 from imgdupe.config import ScanConfig
 from imgdupe.hashing import sha256_file
 from imgdupe.model_paths import ModelPathConfig, make_rule
+from imgdupe.query import query_prompt_tags
 
 
 def write_image(path: Path, seed: int = 0, size: tuple[int, int] = (80, 80)) -> Path:
@@ -126,6 +127,85 @@ class MovedFileTests(ScanTestCase):
         self.assertEqual(tuple(prompt), (image_id, "noob", str(self.root)))
         tags = [row[0] for row in self.conn.execute("SELECT tag FROM prompt_tags")]
         self.assertIn("@model:noob", tags)
+
+    def test_moves_refresh_folder_and_file_labels_without_prompt_indexing(self):
+        labelled = self.root / "noob"
+        labelled.mkdir()
+        folder_rule = make_rule(labelled, "Noob")
+        file_rule = make_rule(labelled / "single.png", "One file")
+        configuration = ModelPathConfig((folder_rule, file_rule))
+        original = self.image("plain/original.png")
+        plain = original.parent
+        metadata = PngInfo()
+        metadata.add_text("parameters", "cat, blue hair\nNegative prompt: dog\n"
+                          "Steps: 20, Model: Custom SD, Model hash: ABC123")
+        with Image.open(original) as image:
+            pixels = image.copy()
+        pixels.save(original, pnginfo=metadata)
+        self.scan(plain, labelled, model_paths=configuration, crop_index=True)
+        image_id = self.row(original)["id"]
+        before = dict(self.conn.execute("SELECT * FROM image_prompts WHERE image_id=?", (image_id,)).fetchone())
+        path_fields = {"configured_model", "model_config_root", "model_config_rule_id",
+                       "classification_root", "classification_status"}
+        unchanged_prompt = {key: value for key, value in before.items() if key not in path_fields}
+        hashes = tuple(db.fetch_hash_row(self.conn, image_id))
+        crop_hashes = db.fetch_crop_hashes(self.conn, image_id)
+        tags = [tuple(row) for row in self.conn.execute(
+            "SELECT * FROM prompt_tags WHERE image_id=? AND tag_kind NOT IN ('model_type','model_config') "
+            "ORDER BY position", (image_id,))]
+        current = original
+        previous_label = "sd"
+        for destination, rule in ((labelled / "inside.png", folder_rule),
+                                  (labelled / "single.png", file_rule),
+                                  (labelled / "inside.png", folder_rule),
+                                  (plain / "final.png", None)):
+            current.rename(destination)
+            with patch.object(scan, "compute_image_hashes", side_effect=AssertionError("rehashed")), \
+                    patch.object(scan, "extract_nai_prompt", side_effect=AssertionError("reparsed")):
+                stats = self.scan(plain, labelled, model_paths=configuration, prompt_index=False)
+            self.assertEqual((stats.indexed, stats.moved, stats.failed), (1, 1, 0))
+            self.assertEqual(self.row(destination)["id"], image_id)
+            self.assertIsNone(self.row(current))
+            prompt = dict(self.conn.execute(
+                "SELECT * FROM image_prompts WHERE image_id=?", (image_id,)).fetchone())
+            self.assertEqual({key: value for key, value in prompt.items() if key not in path_fields}, unchanged_prompt)
+            self.assertEqual({key: prompt[key] for key in path_fields}, {
+                "configured_model": rule.label if rule else None,
+                "model_config_root": str(rule.path) if rule else None,
+                "model_config_rule_id": rule.rule_id if rule else None,
+                "classification_root": str(destination.parent),
+                "classification_status": "configured" if rule else "unconfigured",
+            })
+            self.assertEqual(tuple(db.fetch_hash_row(self.conn, image_id)), hashes)
+            self.assertEqual(db.fetch_crop_hashes(self.conn, image_id), crop_hashes)
+            self.assertEqual([tuple(row) for row in self.conn.execute(
+                "SELECT * FROM prompt_tags WHERE image_id=? AND tag_kind NOT IN ('model_type','model_config') "
+                "ORDER BY position", (image_id,))], tags)
+            label = rule.label if rule else "sd"
+            self.assertEqual([result.image_row["id"] for result in
+                              query_prompt_tags(self.conn, f"cat, @model:{label}")], [image_id])
+            self.assertEqual(query_prompt_tags(self.conn, f"@model:{previous_label}"), [])
+            self.assertEqual(db.fetch_model_options(self.conn), [(label, label.upper() if label == "sd" else label)])
+            current, previous_label = destination, label
+
+    def test_move_without_prompt_indexing_does_not_create_prompt_metadata(self):
+        labelled = self.root / "noob"
+        labelled.mkdir()
+        configuration = ModelPathConfig((make_rule(labelled, "Noob"),))
+        original = self.image("original.png")
+        self.scan(model_paths=configuration, prompt_index=False)
+        image_id = self.row(original)["id"]
+        destination = labelled / "moved.png"
+        original.rename(destination)
+
+        with patch.object(scan, "compute_image_hashes", side_effect=AssertionError("rehashed")), \
+                patch.object(scan, "extract_nai_prompt", side_effect=AssertionError("reparsed")):
+            stats = self.scan(model_paths=configuration, prompt_index=False)
+
+        self.assertEqual((stats.indexed, stats.moved, stats.failed), (1, 1, 0))
+        self.assertEqual(self.row(destination)["id"], image_id)
+        self.assertEqual(self.count("image_prompts"), 0)
+        self.assertEqual(self.count("prompt_tags"), 0)
 
     def test_moved_file_missing_crop_hashes_is_rehashed_under_its_original_id(self):
         path = self.image("image.png")

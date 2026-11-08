@@ -238,6 +238,7 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
     boundaries = re.compile(f"[{separator_chars}]")
     for item in inputs:
         replacements: dict[str, tuple[tuple[str, bool], ...]] = {}
+        literal_models: dict[str, str] = {}
         fragments: list[str] = []
         consumed = 0
         for match in re.finditer(r"(?i)@model:", item):
@@ -261,6 +262,7 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
             # Protect even an unknown model's full lexical term. Otherwise a
             # comma inside its parentheses becomes a separate prompt query.
             best_end = _model_token_end(item, start, boundaries)
+            atom_end = best_end
             best_names = [normalize_prompt_tag(item[start:best_end])]
             depth = 0
             boundary_iter = boundaries.finditer(item, start)
@@ -270,22 +272,44 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                 character = boundary.group() if boundary else ""
                 if not depth and character != "(":
                     sanitized = normalize_prompt_tag(sanitize_model_name(item[start:end]))
-                    if len(sanitized) > longest:
-                        break
                     raw = normalize_prompt_tag(item[start:end])
                     names = [name for name in known if name == raw or normalized[name] == sanitized]
                     if names:
                         best_end, best_names = end, names
+                    elif atom_end == prefix_end and best_end == atom_end and end > atom_end and any(
+                        sanitized.startswith(name)
+                        for name in normalized.values() if len(name) > len(prefix)
+                    ):
+                        # An overlong continuation of a legacy comma name is
+                        # one unmatched metadata term, not its short prefix
+                        # plus an unrelated prompt term. A name already finished
+                        # beyond the first comma retains subsequent AND groups.
+                        best_end, best_names = end, [raw]
+                    if len(sanitized) > longest:
+                        break
                 if not boundary or character in "|｜" or (character == ")" and not depth):
                     break
                 depth += 1 if character == "(" else -1 if character == ")" else 0
             placeholder = f"@model:legacy-placeholder-{len(replacements)}-{uuid4().hex}"
             replacements[placeholder] = tuple((name, True) for name in best_names)
+            literal_models[placeholder] = normalize_prompt_tag(item[start:best_end])
             fragments.extend((item[consumed:start], placeholder))
             consumed = best_end
         fragments.append(item[consumed:])
-        for group in _prompt_tag_groups("".join(fragments)):
-            expanded = tuple(dict.fromkeys(expanded_term for term in group for expanded_term in replacements.get(term[0], (term,))))
+        protected = re.compile("|".join(map(re.escape, replacements))) if replacements else None
+        for group in _prompt_tag_groups("".join(fragments), protected=protected):
+            expanded_terms: list[tuple[str, bool]] = []
+            for normalized_term, metadata_only in group:
+                if normalized_term in replacements:
+                    expanded_terms.extend(replacements[normalized_term])
+                else:
+                    # Only complete tokens expand as metadata alternatives.
+                    # A marker embedded in a literal qualifier is restored to
+                    # the user's text, so internal markers never reach SQL.
+                    if protected is not None:
+                        normalized_term = protected.sub(lambda match: literal_models[match.group()], normalized_term)
+                    expanded_terms.append((normalized_term, metadata_only))
+            expanded = tuple(dict.fromkeys(expanded_terms))
             key = frozenset(expanded)
             if key not in seen_groups:
                 groups.append(expanded)
@@ -308,7 +332,7 @@ def _model_token_end(text: str, start: int, boundaries: re.Pattern[str]) -> int:
 
 
 def _prompt_tag_groups(
-    text_or_tags: str | list[str],
+    text_or_tags: str | list[str], *, protected: re.Pattern[str] | None = None,
 ) -> list[tuple[tuple[str, bool], ...]]:
     inputs = [text_or_tags] if isinstance(text_or_tags, str) else text_or_tags
     groups: list[tuple[tuple[str, bool], ...]] = []
@@ -317,9 +341,9 @@ def _prompt_tag_groups(
     for item in inputs:
         # Remove balanced structural wrappers before comma splitting separates
         # their opening and closing characters (including embedded AND groups).
-        item = _strip_comma_group_parentheses(item.translate(separators))
+        item = _strip_query_group_parentheses(item.translate(separators), protected)
         for raw_group in item.split(","):
-            group_text = _strip_whole_group_parentheses(raw_group.strip())
+            group_text = raw_group.strip()
             terms: list[tuple[str, bool]] = []
             seen_terms: set[tuple[str, bool]] = set()
             for raw_term in re.split(r"[|｜]", group_text):
@@ -338,42 +362,43 @@ def _prompt_tag_groups(
     return groups
 
 
-def _strip_comma_group_parentheses(text: str) -> str:
-    """Unwrap comma groups, preserving parentheses inside literal tag names."""
-    openings: list[tuple[int, bool, int]] = []
+def _strip_query_group_parentheses(text: str, protected: re.Pattern[str] | None) -> str:
+    """Unwrap structural groups and finish them before following plain terms."""
+    openings: list[tuple[int, bool]] = []
     wrappers: set[int] = set()
-    comma_count = 0
+    separators: set[int] = set()
+    model_ends = {match.end() - 1 for match in protected.finditer(text)} if protected is not None else set()
     previous = ""
+    model_tail = False
     for index, character in enumerate(text):
         if character == "(":
-            openings.append((index, previous in {"", ",", "|", "｜", "("}, comma_count))
-        elif character == ",":
-            comma_count += 1
-        elif character == ")" and openings:
-            start, structural, opened_at = openings.pop()
-            if structural and comma_count > opened_at:
-                wrappers.update((start, index))
+            structural = previous in {"", ",", "|", "｜", "("} and (not openings or openings[-1][1])
+            openings.append((index, structural))
+        elif character == ")":
+            if openings:
+                start, structural = openings.pop()
+                if structural:
+                    wrappers.update((start, index))
+                else:
+                    model_tail = False
+            elif model_tail:
+                wrappers.add(index)
+            if index in wrappers:
+                following = index + 1
+                while following < len(text) and text[following].isspace():
+                    following += 1
+                if following < len(text) and text[following] not in ",|｜)":
+                    separators.add(index)
+        if index in model_ends:
+            model_tail = True
+        elif character != ")" and not character.isspace():
+            model_tail = False
         if not character.isspace():
-            previous = character
-    return "".join(character for index, character in enumerate(text) if index not in wrappers)
-
-
-def _strip_whole_group_parentheses(text: str) -> str:
-    while len(text) >= 2 and text[0] == "(" and text[-1] == ")":
-        depth = 0
-        encloses_whole_group = True
-        for index, character in enumerate(text):
-            if character == "(":
-                depth += 1
-            elif character == ")":
-                depth -= 1
-                if depth < 0 or (depth == 0 and index != len(text) - 1):
-                    encloses_whole_group = False
-                    break
-        if not encloses_whole_group or depth != 0:
-            break
-        text = text[1:-1].strip()
-    return text
+            previous = "," if index in separators else character
+    return "".join(
+        "," if index in separators else "" if index in wrappers else character
+        for index, character in enumerate(text)
+    )
 
 
 def _prompt_sort_order(sort_by: str, *, table_alias: str) -> str:

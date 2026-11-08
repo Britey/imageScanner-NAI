@@ -83,7 +83,7 @@ def write_reports(summary: dict, output: Path) -> None:
     evidence = html.escape(summary["environment"]["commit"][:12])
     document = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ImageScanner performance measurements</title><style>
-:root{color-scheme:light dark;--background:#fff;--foreground:#18212f;--muted-foreground:#64748b;--border:#cbd5e1;--chart-1:#277da8;--chart-2:#d27520;--font-sans:system-ui,sans-serif;--radius:8px}
+:root{color-scheme:light dark;--background:#fff;--foreground:#18212f;--muted-foreground:#64748b;--border:#cbd5e1;--chart-1:#277da8;--chart-2:#d27520;--chart-3:#3a8f5c;--chart-4:#a65cb5;--chart-5:#c84b61;--chart-6:#8a741c;--font-sans:system-ui,sans-serif;--radius:8px}
 @media(prefers-color-scheme:dark){:root{--foreground:#e5e7eb;--muted-foreground:#94a3b8;--border:#475569}}
 body{font:14px/1.5 var(--font-sans);color:var(--foreground);margin:0}main{max-width:1000px;margin:auto}h1{font-size:22px}p{color:var(--muted-foreground)}
 .controls{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}select{font:inherit;padding:5px}svg{display:block;width:100%;height:490px}text{fill:var(--foreground);font-family:var(--font-sans)}

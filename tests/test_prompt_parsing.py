@@ -378,6 +378,20 @@ class NovelAIPromptSyntaxTests(unittest.TestCase):
         self.assertEqual(parse_novelai_prompt("cat:1|dog:0", model_type="nai3"), ["cat"])
         self.assertEqual(parse_novelai_prompt("cat:1|dog:0.01", model_type="nai3"), ["cat", "dog"])
 
+    def test_nai3_mix_excludes_unicode_negative_and_zero_weights(self) -> None:
+        for weight in ("－1", "−1", "－１", "−１．５", "０", "０．０"):
+            with self.subTest(weight=weight):
+                self.assertEqual(
+                    parse_novelai_prompt(f"cat:1|dog:{weight}|bird:1", model_type="nai3"),
+                    ["cat", "bird"],
+                )
+
+    def test_nai3_mix_normalizes_only_numeric_weights_preserving_tag_text(self) -> None:
+        self.assertEqual(
+            parse_novelai_prompt("－１ cats:+１．５|−２ birds:０．０１|series１|style:−noir", model_type="nai3"),
+            ["－１ cats", "−２ birds", "series１", "style:−noir"],
+        )
+
     def test_pipe_fallback_and_cjk_separators(self) -> None:
         tags = parse_novelai_prompt("||red|blue|| hair｜green，青い目。solo、白髪；帽子")
         self.assertEqual(tags, ["red", "blue", "hair", "green", "青い目", "solo", "白髪", "帽子"])

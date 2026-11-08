@@ -1,5 +1,33 @@
 # Verification results
 
+## Independent-review fixes, 2026-11-08
+
+Fixed the follow-up model-query blockers and autocomplete dismissal race, plus
+the four validated findings from the SWE-2 Flash review experiment. Extended
+legacy comma names remain one metadata term; structural closing parentheses
+finish model terms before following text or groups. Internal markers expand only
+as complete tokens and are restored inside literal prompt qualifiers. Escape and
+outside clicks cancel debounce, abort fetches and invalidate late JSON responses.
+
+NAI3 mix weights recognize Unicode minus and fullwidth number/decimal syntax
+without changing literal tag text. Moved images reconcile existing path-derived
+labels during the first scan with prompt extraction disabled, preserving prompt
+content, other tags and hashes. Benchmark charts define all six cycled colors;
+both benchmark CLIs reject file output paths with usage error 2 before fixture
+or output changes.
+
+The full suite runs **360 tests**, with the same two optional reference-corpus
+skips, and reaches **100% statements and branches**: 3,532 statements and 1,098
+branches, without exclusions. Regression cases failed before their fixes, then
+passed. The curated mutation set now contains 52 faults, including the new parser,
+dismissal, move-label and Unicode-weight regressions. The manual workflow keeps
+the 100% gate and has a 30-minute budget for the expanded full-suite mutation run.
+No GitHub workflow was launched.
+
+Logs are retained locally under the ignored
+`performance-results/independent-review-fixes-2026-11-08/` directory. Historical
+review and experiment reports describe the snapshots they originally tested.
+
 ## Model query review follow-up, 2026-11-08
 
 Fixed the two model-query blockers reported against PR #4 head

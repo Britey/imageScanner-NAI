@@ -175,7 +175,7 @@ Useful prompt-indexing scan options:
 
 - `--reindex-prompts`: re-read prompt metadata for unchanged files.
 - `--stealth-prompt`: also try NovelAI alpha-channel stealth metadata for PNGs.
-- `--no-prompt-index`: skip prompt extraction and only update the image hash index.
+- `--no-prompt-index`: skip prompt extraction; moved images still refresh existing path-derived model labels.
 
 Then start the web UI:
 
@@ -312,8 +312,9 @@ In positive searches, `a | b, c` means `(a OR b) AND c`; therefore `a,c`,
 Balanced parentheses can wrap comma-separated constraints, for example
 `(@model:Foo (Bar, Baz), cat)` or `cat, (@model:sd, dog)`. Parentheses and commas
 inside a model name remain part of that model term even when the name is not in
-the index. Use an explicit separator before another tag: a trailing space and
-`cat` without a comma are still part of the model name.
+the index. Within an ungrouped model term, a trailing space and `cat` without a
+comma are still part of the model name. Closing a structural group finishes the
+term: `(cat, @model:sd) extra` is equivalent to `cat, @model:sd, extra`.
 
 ## Similar Image Groups
 

@@ -11,15 +11,13 @@ from pathlib import Path
 import sqlite3
 import sys
 
-from .runner import evict_fixture_pages, run_command, summarize_samples, write_json
+from .runner import evict_fixture_pages, run_command, summarize_samples, validate_output_directory, write_json
 from .webbench import Server, load_fixture, request
 
 
 def run(fixture_path: Path, output: Path, timeout: float = 90, repeats: int = 3) -> dict:
+    output = validate_output_directory(output)
     manifest = load_fixture(fixture_path)
-    output = output.resolve()
-    if output.exists() and any(output.iterdir()):
-        raise ValueError("experiment output must be new or empty")
     output.mkdir(parents=True, exist_ok=True)
     results = {"fixture": manifest, "experiments": {}, "notes": [
         "All samples run sequentially after the main benchmark and browser server have stopped.",
@@ -144,7 +142,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.timeout <= 0 or args.repeats < 1:
         parser.error("timeout and repeats must be positive")
-    run(args.fixture, args.output, args.timeout, args.repeats)
+    try:
+        output = validate_output_directory(args.output)
+    except ValueError as exc:
+        parser.error(str(exc))
+    run(args.fixture, output, args.timeout, args.repeats)
     return 0
 
 

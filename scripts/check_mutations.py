@@ -122,7 +122,7 @@ MUTATIONS = (
     ),
     Mutation(
         "parser-zero-mix-weight", "nai_prompt",
-        'if float(weight) <= 0:', 'if float(weight) < 0:',
+        'if float(weight.translate(NUMERIC_TRANSLATION)) <= 0:', 'if float(weight.translate(NUMERIC_TRANSLATION)) < 0:',
         "Zero-weight NovelAI segments must not enter the searchable positive prompt.",
     ),
     Mutation(
@@ -284,10 +284,53 @@ MUTATIONS = (
     ),
     Mutation(
         "query-parenthesized-comma-groups", "query",
-        'item = _strip_comma_group_parentheses(item.translate(separators))',
+        'item = _strip_query_group_parentheses(item.translate(separators), protected)',
         'item = item.translate(separators)',
         "Whole and embedded comma-group wrappers must be removed before model placeholders expand.",
     ),
+    Mutation(
+        'query-overlong-legacy-comma-span', 'query',
+        'elif atom_end == prefix_end and best_end == atom_end and end > atom_end and any(',
+        'elif False and atom_end == prefix_end and best_end == atom_end and end > atom_end and any(',
+        'An extended legacy comma model name must remain one metadata term instead of leaking prompt terms or a short model prefix.',
+    ),
+    Mutation(
+        'query-closed-group-suffix-boundary', 'query',
+        'separators.add(index)',
+        'wrappers.add(index)',
+        'Text following a closed model group must form its own term rather than attach to an internal marker.',
+    ),
+    Mutation(
+        'query-literal-marker-restoration', 'query',
+        'protected.sub(lambda match: literal_models[match.group()], normalized_term)',
+        'normalized_term',
+        'Internal markers inside literal qualifiers must restore the typed text instead of becoming database search terms.',
+    ),
+    Mutation(
+        'web-escape-cancels-suggestions', 'web',
+        'event.key === "Escape") {{\n            dismissSuggestions();',
+        'event.key === "Escape") {{\n            hideSuggestions(suggestionsElement);',
+        'Escape must cancel debounce/fetch and invalidate late JSON, not just hide the current menu.',
+    ),
+    Mutation(
+        'web-outside-click-cancels-suggestions', 'web',
+        'if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) dismissSuggestions();',
+        'if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) hideAllSuggestions();',
+        'Clicking outside must cancel pending suggestion work so dismissed results cannot reopen.',
+    ),
+    Mutation(
+        'scan-move-refreshes-path-label', 'scan',
+        'if result.moved and not config.prompt_index:',
+        'if False and result.moved and not config.prompt_index:',
+        'A moved image must reflect destination path labels immediately even when prompt extraction is disabled.',
+    ),
+    Mutation(
+        'parser-nai3-unicode-mix-weight', 'nai_prompt',
+        'TRAILING_MIX_WEIGHT = re.compile(r"(?s)^(.*?):([+\\-－−]?\\d+(?:[.．]\\d+)?)\\s*$")',
+        'TRAILING_MIX_WEIGHT = re.compile(r"(?s)^(.*?):([+\\-]?\\d+(?:\\.\\d+)?)\\s*$")',
+        'Unicode minus and decimal weight syntax must exclude negative/zero NAI3 mix segments without altering literal tag text.',
+    ),
+
 )
 
 

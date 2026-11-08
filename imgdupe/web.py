@@ -1472,6 +1472,12 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
       }};
       let suggestionTimer;
       let suggestionController;
+      const dismissSuggestions = () => {{
+        clearTimeout(suggestionTimer);
+        suggestionController?.abort();
+        ++suggestionRequest;
+        hideAllSuggestions();
+      }};
       const scheduleSuggestions = inputElement => {{
         clearTimeout(suggestionTimer);
         suggestionController?.abort();
@@ -1550,7 +1556,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
             const button = buttons[activeSuggestion >= 0 ? activeSuggestion : 0];
             if (button) applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
           }} else if (event.key === "Escape") {{
-            hideSuggestions(suggestionsElement);
+            dismissSuggestions();
           }}
         }});
       }};
@@ -1567,7 +1573,7 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         }});
       }});
       document.addEventListener("click", event => {{
-        if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) hideAllSuggestions();
+        if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) dismissSuggestions();
       }});
     </script>
     """

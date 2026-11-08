@@ -39,6 +39,17 @@ def write_json(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
+def validate_output_directory(output: Path) -> Path:
+    """Check a destination before creating output or disposable fixtures."""
+    output = output.resolve()
+    if output.exists():
+        if not output.is_dir():
+            raise ValueError("output path must be a directory")
+        if any(output.iterdir()):
+            raise ValueError("output directory must be new or empty")
+    return output
+
+
 def make_workspace(parent: Path) -> tuple[Path, str]:
     parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
@@ -201,9 +212,10 @@ def main(argv: list[str] | None = None) -> int:
     from .workloads import CASES
     if not cases or any(name not in CASES for name in cases):
         parser.error("unknown/empty --cases; see scripts.perf_toolkit.workloads --help")
-    output = args.output.resolve()
-    if output.exists() and any(output.iterdir()):
-        parser.error("output directory must be new or empty")
+    try:
+        output = validate_output_directory(args.output)
+    except ValueError as exc:
+        parser.error(str(exc))
     output.mkdir(parents=True, exist_ok=True)
     workspace, token = make_workspace(args.work_dir)
     summary = {"environment": environment_info(), "configuration": vars(args) | {"output": str(output),

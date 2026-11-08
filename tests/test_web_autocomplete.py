@@ -23,4 +23,4 @@ class AutocompleteTests(WebTestCase):
             input=payload, text=True, capture_output=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.count('PASS '), 7, result.stdout)
+        self.assertEqual(result.stdout.count('PASS '), 10, result.stdout)

@@ -50,7 +50,7 @@ MODEL_NAME_PATTERN = re.compile(
 )
 SOURCE_HASH_PATTERN = re.compile(r"(?i)([0-9a-f]{6,})\s*$")
 NUMBER_PATTERN = re.compile(r"^[+\-]?\d+(?:\.\d+)?$")
-TRAILING_MIX_WEIGHT = re.compile(r"(?s)^(.*?):([+\-]?\d+(?:\.\d+)?)\s*$")
+TRAILING_MIX_WEIGHT = re.compile(r"(?s)^(.*?):([+\-－−]?\d+(?:[.．]\d+)?)\s*$")
 
 SYNTAX_TRANSLATION = str.maketrans(
     {
@@ -381,7 +381,7 @@ def _filter_nai3_mix_segments(text: str) -> str:
         match = TRAILING_MIX_WEIGHT.match(segment)
         if match:
             segment, weight = match.groups()
-            if float(weight) <= 0:
+            if float(weight.translate(NUMERIC_TRANSLATION)) <= 0:
                 continue
         kept.append(segment)
     return ",".join(kept)

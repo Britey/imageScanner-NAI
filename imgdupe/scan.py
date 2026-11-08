@@ -168,7 +168,7 @@ def scan_roots(
         )
         iterator = tqdm(results, desc="Hashing images", unit="image")
         for result in iterator:
-            _store_result(conn, result, config, stats)
+            _store_result(conn, result, config, stats, model_paths)
             claimed_ids.discard(result.existing_image_id)
     else:
         with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
@@ -200,7 +200,7 @@ def scan_roots(
                 completed, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for future in completed:
                     result = future.result()
-                    _store_result(conn, result, config, stats)
+                    _store_result(conn, result, config, stats, model_paths)
                     claimed_ids.discard(result.existing_image_id)
                     progress.update(1)
                 while len(pending) < max_pending and submit_next():
@@ -513,8 +513,16 @@ def _store_result(
     result: ScanResult,
     config: ScanConfig,
     stats: ScanStats,
+    model_paths: ModelPathConfig,
 ) -> None:
     indexed_at = utc_now_sql()
+    if result.moved and not config.prompt_index:
+        # A proven move changes path-derived labels even when prompt parsing is
+        # disabled. Reconcile the saved prompt row using the destination path,
+        # leaving its extracted metadata and other tags intact.
+        _refresh_model_batch(conn, [{"id": result.existing_image_id, "path": str(result.path)}], model_paths)
+        conn.execute("UPDATE image_prompts SET classification_root=? WHERE image_id=?",
+                     (result.classification_root, result.existing_image_id))
     if result.date_only:
         if result.moved:
             update_image_path(

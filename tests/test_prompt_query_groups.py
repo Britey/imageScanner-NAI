@@ -142,9 +142,9 @@ class PromptQueryGroupTests(unittest.TestCase):
         self.add_image(2, ("dog", "prompt"))
         self.add_image(3, ("cat (sleeping)", "prompt"))
         self.assertEqual(self.result_ids("((cat | dog))"), [1, 2])
-        # These parentheses do not enclose the entire OR group and belong to
-        # the literal terms; stripping the outer characters invents matches.
-        self.assertEqual(self.result_ids("(cat) | (dog)"), [])
+        # Structural wrappers can enclose each alternative independently;
+        # parentheses inside a literal qualifier remain part of the tag.
+        self.assertEqual(self.result_ids("(cat) | (dog)"), [1, 2])
         self.assertEqual(self.result_ids("((cat)"), [])
         self.assertEqual(self.result_ids("cat (sleeping)"), [3])
 
@@ -216,6 +216,60 @@ class PromptQueryGroupTests(unittest.TestCase):
         with patch.object(query_module, 'sanitize_model_name', measured_sanitize):
             self.assertEqual(self.result_ids(text, match_mode='any'), [])
         self.assertLessEqual(processed_characters, 2 * len(text) + 100)
+
+
+    def test_overlong_legacy_comma_names_do_not_leak_prompt_terms(self):
+        self.add_image(1, ('cat', 'prompt'), ('@model:Foo, Bar', 'model_identity'))
+        self.add_image(2, ('cat', 'prompt'), ('bar extra', 'prompt'), ('bar (baz) extra', 'prompt'),
+                          ('bar-v2', 'prompt'), ('bar (baz)extra', 'prompt'))
+        self.add_image(3, ('cat', 'prompt'), ('dog', 'prompt'), ('@model:Foo', 'model_identity'))
+        self.add_image(4, ('cat', 'prompt'), ('@model:Foo, Bar (Baz)', 'model_identity'))
+        for text in ('@model:Foo, Bar extra', '@model:Foo, Bar (Baz) extra', '@model:Foo，Bar extra',
+                     '@model:Foo, Bar-v2', '@model:Foo, Bar (Baz)extra'):
+            with self.subTest(query=text):
+                self.assertEqual(self.result_ids(text), [])
+                self.assertEqual(self.result_ids(text, match_mode='any'), [])
+                self.assertEqual(self.result_ids('cat', negative_text_or_tags=text), [1, 2, 3, 4])
+        self.assertEqual(self.result_ids('@model:Foo, dog'), [3])
+        self.assertEqual(self.result_ids('@model:Foo, Bar, cat'), [1])
+        self.add_image(5, ('@model:Foo, Bar extra', 'model_identity'))
+        self.assertEqual(self.result_ids('@model:Foo, Bar extra'), [5])
+
+    def test_closed_model_groups_finish_before_the_following_prompt_term(self):
+        self.add_image(1, ('cat', 'prompt'), ('extra', 'prompt'), ('@model:sd', 'model_type'))
+        self.add_image(2, ('cat', 'prompt'), ('@model:sd', 'model_type'))
+        self.add_image(3, ('cat', 'prompt'), ('extra', 'prompt'))
+        self.add_image(4, ('cat', 'prompt'))
+        for text in ('(cat, @model:sd) extra', 'cat, (@model:sd) extra',
+                     '(cat, (@model:sd)) extra', 'cat, (@model:sd))extra',
+                     '(cat, @model:sd) (extra)', '(cat, @model:sd)(extra)',
+                     'cat, (@model:sd) ((extra))'):
+            with self.subTest(query=text):
+                results = query_prompt_tags(self.conn, text)
+                self.assertEqual([result.image_row['id'] for result in results], [1])
+                self.assertEqual(results[0].matched_count, 3)
+                self.assertEqual(set(results[0].matched_tags), {'cat', 'extra', '@model:sd'})
+        self.assertEqual(self.result_ids('(@model:sd) | extra'), [1, 2, 3])
+        self.assertEqual(self.result_ids('cat', negative_text_or_tags='(@model:sd) extra'), [4])
+
+    def test_model_qualifier_and_stray_closer_do_not_stick_to_internal_tokens(self):
+        name = '@model:NovelAI Diffusion V4.5 Full (Curated)'
+        self.add_image(1, ('1girl', 'prompt'), ('extra', 'prompt'), (name, 'model_identity'))
+        self.add_image(2, ('1girl', 'prompt'), (name, 'model_identity'))
+        self.add_image(3, ('extra', 'prompt'), ('@model:Foo, Bar', 'model_identity'))
+        self.assertEqual(self.result_ids(f'1girl, ({name}) extra'), [1])
+        self.assertEqual(self.result_ids('@model:Foo, Bar)'), [3])
+        self.assertEqual(self.result_ids('@model:Foo, Bar) extra'), [3])
+
+    def test_only_complete_protected_tokens_expand_as_metadata(self):
+        literal = 'cat (@model:sd) extra'
+        self.add_image(1, (literal, 'prompt'))
+        self.add_image(2, ('cat', 'prompt'), ('extra', 'prompt'), ('@model:sd', 'model_type'))
+        self.add_image(3, ('cat ((sleeping))', 'prompt'))
+        self.add_image(4, ('cat)', 'prompt'))
+        self.assertEqual(self.result_ids(literal), [1])
+        self.assertEqual(self.result_ids('cat ((sleeping))'), [3])
+        self.assertEqual(self.result_ids('cat)'), [4])
 
 
 if __name__ == "__main__":

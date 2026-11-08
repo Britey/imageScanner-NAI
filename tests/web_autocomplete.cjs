@@ -182,6 +182,44 @@ const scenarios = {
     finish([{tag: 'cat', count: 99}]); await settled();
     assert.deepEqual(h.menu.buttons.map(button => button.dataset.tag), ['dog']);
   },
+  async dismiss_during_debounce_prevents_a_late_request() {
+    for (const kind of ['escape', 'outside']) {
+      const h = setup();
+      await h.type(h.input, 'ca');
+      if (kind === 'escape') await h.input.fire('keydown', {key: 'Escape'});
+      else await h.document.fire('click', {target: {closest: () => null}});
+      await h.timers();
+      assert.equal(h.pending.length, 0, `${kind} left a debounce request scheduled`);
+      assert.equal(h.menu.hidden, true);
+      await h.suggest(h.input, 'dog', ['dog']);
+      assert.equal(h.menu.hidden, false, 'typing after dismissal must still work');
+    }
+  },
+  async dismiss_aborts_fetch_and_ignores_its_completion() {
+    for (const kind of ['escape', 'outside']) {
+      const h = setup();
+      await h.type(h.negative, 'bl'); await h.timers();
+      const pending = h.pending.at(-1);
+      if (kind === 'escape') await h.negative.fire('keydown', {key: 'Escape'});
+      else await h.document.fire('click', {target: {closest: () => null}});
+      assert.equal(pending.signal.aborted, true, `${kind} did not abort fetch`);
+      pending.respond([{tag: 'blurry', count: 1}]); await settled();
+      assert.equal(h.negativeMenu.hidden, true);
+      assert.equal(h.menu.hidden, true);
+    }
+  },
+  async dismiss_ignores_an_already_decoding_json_response() {
+    for (const kind of ['escape', 'outside']) {
+      const h = setup();
+      await h.type(h.input, 'ca'); await h.timers();
+      const finish = h.pending.at(-1).respondDeferredJSON(); await settled();
+      if (kind === 'escape') await h.input.fire('keydown', {key: 'Escape'});
+      else await h.document.fire('click', {target: {closest: () => null}});
+      finish([{tag: 'cat', count: 1}]); await settled();
+      assert.equal(h.menu.hidden, true, `${kind} allowed old JSON to reopen the menu`);
+      assert.equal(h.menu.buttons.length, 0);
+    }
+  },
   async disabled_empty_and_failed_suggestions_leave_no_selectable_results() {
     const h = setup();
     await h.suggest(h.input, 'ca', ['cat']);
