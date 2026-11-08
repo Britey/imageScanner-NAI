@@ -238,12 +238,16 @@ class PromptQueryGroupTests(unittest.TestCase):
     def test_extended_model_qualifiers_do_not_become_prompt_constraints(self):
         self.add_image(1, ('cat', 'prompt'), ('@model:Foo Bar (Baz)', 'model_identity'))
         self.add_image(2, ('cat', 'prompt'), ('@model:Foo', 'model_identity'))
-        self.add_image(3, ('cat', 'prompt'), ('bar (baz', 'prompt'), ('qux)', 'prompt'))
+        self.add_image(3, ('cat', 'prompt'), ('bar (baz', 'prompt'), ('qux)', 'prompt'),
+                          ('bar ((baz', 'prompt'), ('qux))', 'prompt'))
         self.add_image(4, ('cat', 'prompt'), ('@model:Foo', 'model_identity'),
-                          ('bar (baz', 'prompt'), ('qux)', 'prompt'))
+                          ('bar (baz', 'prompt'), ('qux)', 'prompt'),
+                          ('bar ((baz', 'prompt'), ('qux))', 'prompt'))
         self.add_image(5, ('cat', 'prompt'))
         for text in ('@model:Foo, Bar (Baz, Qux)', '@model:Foo，Bar (Baz，Qux)',
-                     '@model:Foo, Bar (Baz, Qux) extra'):
+                     '@model:Foo, Bar (Baz, Qux) extra',
+                     '@model:Foo, Bar ((Baz, Qux))', '@model:Foo, Bar (((Baz, Qux)))',
+                     '@model:Foo, Bar ( ( Baz, Qux ) )', '@model:Foo，Bar ((Baz，Qux))'):
             with self.subTest(query=text):
                 self.assertEqual(self.result_ids(text), [])
                 self.assertEqual(self.result_ids(text, match_mode='any'), [])
@@ -251,6 +255,36 @@ class PromptQueryGroupTests(unittest.TestCase):
         self.assertEqual(self.result_ids('@model:Foo, Bar (Baz)'), [1])
         self.add_image(6, ('@model:Foo, Bar (Baz, Qux)', 'model_identity'))
         self.assertEqual(self.result_ids('@model:Foo, Bar (Baz, Qux)'), [6])
+        self.assertEqual(self.result_ids('@model:Foo, Bar ((Baz, Qux))'), [])
+        self.add_image(7, ('@model:Foo, Bar ((Baz, Qux))', 'model_identity'))
+        self.assertEqual(self.result_ids('@model:Foo, Bar ((Baz, Qux))'), [7])
+
+    def test_outer_groups_keep_model_parentheses_cut_by_inner_pipes_literal(self):
+        self.add_image(1, ('cat', 'prompt'), ('@model:Foo (Bar', 'model_identity'))
+        self.add_image(2, ('cat', 'prompt'), ('qux)', 'prompt'))
+        self.add_image(3, ('cat', 'prompt'), ('qux) extra', 'prompt'))
+        self.add_image(4, ('cat', 'prompt'), ('qux', 'prompt'), ('extra)', 'prompt'), ('cat)', 'prompt'))
+        self.add_image(5, ('qux)', 'prompt'))
+        self.add_image(6, ('cat', 'prompt'), ('@model:Foo ((Bar', 'model_identity'))
+        self.add_image(7, ('cat', 'prompt'), ('qux))', 'prompt'))
+        self.add_image(8, ('cat', 'prompt'), ('qux)) extra', 'prompt'))
+        self.add_image(9, ('cat', 'prompt'))
+        cat_ids = {1, 2, 3, 4, 6, 7, 8, 9}
+        for pipe in ('|', '｜'):
+            for depth, all_ids, extra_ids in ((1, [1, 2], [1, 3]), (2, [6, 7], [6, 8])):
+                model = '@model:Foo ' + '(' * depth + 'Bar'
+                right = 'Qux' + ')' * depth
+                for wrappers in range(1, 4):
+                    comma_query = '(' * wrappers + f'{model}{pipe}{right}, cat' + ')' * wrappers
+                    extra_query = '(' * wrappers + f'{model}{pipe}{right} extra' + ')' * wrappers
+                    with self.subTest(pipe=pipe, depth=depth, wrappers=wrappers):
+                        self.assertEqual(self.result_ids(comma_query), all_ids)
+                        any_ids = cat_ids | ({5} if depth == 1 else set())
+                        self.assertEqual(set(self.result_ids(comma_query, match_mode='any')), any_ids)
+                        self.assertEqual(self.result_ids(extra_query), extra_ids)
+                        self.assertEqual(self.result_ids(extra_query, match_mode='any'), extra_ids)
+                        self.assertEqual(set(self.result_ids('cat', negative_text_or_tags=extra_query)),
+                                         cat_ids - set(extra_ids))
 
     def test_pipes_inside_model_parentheses_always_start_an_or_alternative(self):
         self.add_image(1, ('cat', 'prompt'), ('@model:Foo (Bar)', 'model_identity'))

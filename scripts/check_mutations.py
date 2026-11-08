@@ -284,14 +284,14 @@ MUTATIONS = (
     ),
     Mutation(
         "query-parenthesized-comma-groups", "query",
-        'item = _strip_query_group_parentheses(item.translate(separators), protected)',
+        'item = _strip_query_group_parentheses(item.translate(separators), protected, model_depths)',
         'item = item.translate(separators)',
         "Whole and embedded comma-group wrappers must be removed before model placeholders expand.",
     ),
     Mutation(
         'query-overlong-legacy-comma-span', 'query',
-        'elif atom_end == prefix_end and best_end == atom_end and end > atom_end and any(',
-        'elif False and atom_end == prefix_end and best_end == atom_end and end > atom_end and any(',
+        'elif (atom_end == prefix_end and best_end == atom_end and end > atom_end',
+        'elif (False and atom_end == prefix_end and best_end == atom_end and end > atom_end',
         'An extended legacy comma model name must remain one metadata term instead of leaking prompt terms or a short model prefix.',
     ),
     Mutation(
@@ -302,9 +302,21 @@ MUTATIONS = (
     ),
     Mutation(
         'query-extended-model-qualifier', 'query',
-        'sanitized.startswith(name.rstrip(") "))',
-        'sanitized.startswith(name)',
+        r'return re.sub(r"(?:\(\s*)+", "(", name.rstrip(") "))',
+        r'return re.sub(r"(?:\(\s*)+", "(", name)',
         'An unmatched extension inside a stored model qualifier must remain metadata, not comma-separated prompt constraints.',
+    ),
+    Mutation(
+        'query-nested-model-qualifier', 'query',
+        r'return re.sub(r"(?:\(\s*)+", "(", name.rstrip(") "))',
+        'return name.rstrip(") ")',
+        'Extra nested model qualifier openers must not expose inner comma fragments as prompt constraints.',
+    ),
+    Mutation(
+        'query-inner-pipe-parenthesis-context', 'query',
+        'openings.extend((-1, False) for _ in range(model_ends[index]))',
+        'openings.extend((-1, False) for _ in range(0))',
+        'Model parentheses cut by an inner pipe must consume their own literal closers before an enclosing group closes.',
     ),
     Mutation(
         'query-model-inner-pipe', 'query',

@@ -1,5 +1,27 @@
 # Verification results
 
+## Grouped inner OR and nested qualifiers, 2026-11-09
+
+Addressed both blockers in the latest review of PR #5 head `a1691ea`. Protected
+model spans now carry their unmatched parenthesis depth into group processing.
+Closers after an inner pipe remain literal text until those model openers are
+balanced; enclosing structural query groups then close on their own parentheses.
+Continuation matching also compares qualifier prefixes with redundant nested
+openers normalized, without changing exact matches for fully stored names.
+
+The regressions fail before the fixes and pass afterward. Cases cover both pipe
+operators, one to three enclosing groups, one or two model-parenthesis levels,
+negative and match-any searches, and nested/spaced/fullwidth comma continuations.
+The full suite runs **365 tests**, with two optional corpus skips, at **100%
+statements and branches**: 3,540 statements and 1,100 branches, without exclusions.
+Two new semantic faults restore the reported bugs; the curated set contains 57
+faults. All **12/12 relevant model-query mutations** are rejected by assertions
+on the 365-test baseline, with no survivors, test errors or timeouts. The prior
+full 52-fault result remains recorded below.
+
+Logs are retained locally under the ignored
+`performance-results/model-context-review-2026-11-09/` directory.
+
 ## Extended qualifiers and inner OR operators, 2026-11-09
 
 Fixed the two query blockers reported against PR #5 head `f8f4684`. An unmatched

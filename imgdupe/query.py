@@ -253,6 +253,9 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                 (prefix, prefix + "\U0010ffff"),
             )]
             normalized = {name: normalize_prompt_tag(sanitize_model_name(name)) for name in known}
+            continuation_prefixes = tuple(
+                _model_continuation_key(name) for name in normalized.values() if len(name) > len(prefix)
+            )
             longest = max(map(len, normalized.values()), default=0)
             # Parentheses opened inside the name belong to it, so their commas
             # do not split the term. A candidate span may only end where the
@@ -280,13 +283,12 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                     names = [name for name in known if name == raw or normalized[name] == sanitized]
                     if names:
                         best_end, best_names = end, names
-                    elif atom_end == prefix_end and best_end == atom_end and end > atom_end and any(
-                        sanitized.startswith(name.rstrip(") "))
-                        for name in normalized.values() if len(name) > len(prefix)
-                    ):
+                    elif (atom_end == prefix_end and best_end == atom_end and end > atom_end
+                          and _model_continuation_key(sanitized).startswith(continuation_prefixes)):
                         # An overlong continuation of a legacy comma name is
                         # one unmatched metadata term, including extra content
-                        # inserted before a stored qualifier's closing ")".
+                        # inserted before a stored qualifier's closing ")" or
+                        # extra nested opening parentheses around its text.
                         # Do not search its short prefix plus unrelated prompt
                         # terms. A name already finished
                         # beyond the first comma retains subsequent AND groups.
@@ -303,7 +305,8 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
             consumed = best_end
         fragments.append(item[consumed:])
         protected = re.compile("|".join(map(re.escape, replacements))) if replacements else None
-        for group in _prompt_tag_groups("".join(fragments), protected=protected):
+        model_depths = {marker: name.count("(") - name.count(")") for marker, name in literal_models.items()}
+        for group in _prompt_tag_groups("".join(fragments), protected=protected, model_depths=model_depths):
             expanded_terms: list[tuple[str, bool]] = []
             for normalized_term, metadata_only in group:
                 if normalized_term in replacements:
@@ -321,6 +324,11 @@ def _database_tag_groups(conn: sqlite3.Connection, text_or_tags: str | list[str]
                 groups.append(expanded)
                 seen_groups.add(key)
     return groups
+
+
+def _model_continuation_key(name: str) -> str:
+    """Compare unfinished qualifiers without counting redundant nested openers."""
+    return re.sub(r"(?:\(\s*)+", "(", name.rstrip(") "))
 
 
 def _model_token_end(text: str, start: int, boundaries: re.Pattern[str]) -> int:
@@ -341,6 +349,7 @@ def _model_token_end(text: str, start: int, boundaries: re.Pattern[str]) -> int:
 
 def _prompt_tag_groups(
     text_or_tags: str | list[str], *, protected: re.Pattern[str] | None = None,
+    model_depths: dict[str, int] | None = None,
 ) -> list[tuple[tuple[str, bool], ...]]:
     inputs = [text_or_tags] if isinstance(text_or_tags, str) else text_or_tags
     groups: list[tuple[tuple[str, bool], ...]] = []
@@ -349,7 +358,7 @@ def _prompt_tag_groups(
     for item in inputs:
         # Remove balanced structural wrappers before comma splitting separates
         # their opening and closing characters (including embedded AND groups).
-        item = _strip_query_group_parentheses(item.translate(separators), protected)
+        item = _strip_query_group_parentheses(item.translate(separators), protected, model_depths)
         for raw_group in item.split(","):
             group_text = raw_group.strip()
             terms: list[tuple[str, bool]] = []
@@ -370,12 +379,17 @@ def _prompt_tag_groups(
     return groups
 
 
-def _strip_query_group_parentheses(text: str, protected: re.Pattern[str] | None) -> str:
+def _strip_query_group_parentheses(
+    text: str, protected: re.Pattern[str] | None, model_depths: dict[str, int] | None = None,
+) -> str:
     """Unwrap structural groups and finish them before following plain terms."""
     openings: list[tuple[int, bool]] = []
     wrappers: set[int] = set()
     separators: set[int] = set()
-    model_ends = {match.end() - 1 for match in protected.finditer(text)} if protected is not None else set()
+    model_ends = {
+        match.end() - 1: (model_depths or {}).get(match.group(), 0)
+        for match in protected.finditer(text)
+    } if protected is not None else {}
     previous = ""
     model_tail = False
     for index, character in enumerate(text):
@@ -398,6 +412,10 @@ def _strip_query_group_parentheses(text: str, protected: re.Pattern[str] | None)
                 if following < len(text) and text[following] not in ",|｜)":
                     separators.add(index)
         if index in model_ends:
+            # A model opener hidden by its marker still owns its closing ")"
+            # after an inner pipe. Keep those closers literal instead of letting
+            # them close structural groups surrounding the model alternatives.
+            openings.extend((-1, False) for _ in range(model_ends[index]))
             model_tail = True
         elif character != ")" and not character.isspace():
             model_tail = False

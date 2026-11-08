@@ -310,6 +310,7 @@ In positive searches, `a | b, c` means `(a OR b) AND c`; therefore `a,c`,
 `b,c`, and `a,b,c` match, while `a,b` does not. Full-width `｜` is also accepted.
 Both pipes always start OR alternatives, including inside model parentheses:
 `@model:Foo (Bar|Qux) extra` searches for `@model:Foo (Bar` OR `Qux) extra`.
+Wrapping that query as `(@model:Foo (Bar|Qux) extra)` preserves those alternatives.
 
 Balanced parentheses can wrap comma-separated constraints, for example
 `(@model:Foo (Bar, Baz), cat)` or `cat, (@model:sd, dog)`. Parentheses and commas
