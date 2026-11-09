@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .config import Thresholds
 from .hashing import hamming_bytes
@@ -43,7 +44,8 @@ def score_hashes(
     crop_hashes_b: dict[str, bytes] | None = None,
     query_crop_hashes: dict[str, bytes] | None = None,
     thresholds: Thresholds | None = None,
-) -> PairScore:
+    minimum_score: float | None = None,
+) -> PairScore | None:
     thresholds = thresholds or Thresholds()
     if sha_equal:
         return PairScore(None, None, None, 9, 0, 0, 100.0, "exact_duplicate")
@@ -51,13 +53,6 @@ def score_hashes(
     dhash = _distance_or_none(hashes_a, hashes_b, "dhash256")
     phash = _distance_or_none(hashes_a, hashes_b, "phash256")
     whash = _distance_or_none(hashes_a, hashes_b, "whash256")
-    grid_matches, grid_min = grid_score(
-        hashes_a,
-        hashes_b,
-        cell_threshold=thresholds.grid_cell,
-    )
-    crop_min = crop_score(hashes_a, hashes_b, crop_hashes_b or {}, query_crop_hashes or {})
-
     score = 0.0
     if phash is not None:
         score += max(0.0, 35.0 * (1.0 - phash / 48.0))
@@ -65,6 +60,16 @@ def score_hashes(
         score += max(0.0, 25.0 * (1.0 - whash / 48.0))
     if dhash is not None:
         score += max(0.0, 20.0 * (1.0 - dhash / 48.0))
+    # Even nine perfect cells contribute at most 20 points. Use the same
+    # rounding as the final filter: a score just below the boundary can round
+    # up to it. Crop evidence has a separate contribution and disables pruning.
+    if minimum_score is not None and not crop_hashes_b and not query_crop_hashes:
+        if round(score + 20.0, 2) < minimum_score:
+            return None
+    grid_matches, grid_min = grid_score(
+        hashes_a, hashes_b, cell_threshold=thresholds.grid_cell,
+    )
+    crop_min = crop_score(hashes_a, hashes_b, crop_hashes_b or {}, query_crop_hashes or {})
     score += 20.0 * (grid_matches / 9.0)
     if crop_min is not None:
         score = max(score, max(0.0, 90.0 * (1.0 - crop_min / 48.0)))
@@ -88,27 +93,34 @@ def crop_score(
 ) -> int | None:
     query_phash = query_hashes.get("phash256")
     candidate_phash = candidate_hashes.get("phash256")
-    distances = []
-    if query_phash is not None:
-        distances.extend(
-            hamming_bytes(query_phash, crop_hash)
-            for crop_hash in candidate_crop_hashes.values()
-            if len(crop_hash) == len(query_phash)
-        )
-    if candidate_phash is not None:
-        distances.extend(
-            hamming_bytes(crop_hash, candidate_phash)
-            for crop_hash in query_crop_hashes.values()
-            if len(crop_hash) == len(candidate_phash)
-        )
-    if query_crop_hashes and candidate_crop_hashes:
-        distances.extend(
-            hamming_bytes(query_crop, candidate_crop)
-            for query_crop in query_crop_hashes.values()
-            for candidate_crop in candidate_crop_hashes.values()
-            if len(query_crop) == len(candidate_crop)
-        )
-    return min(distances) if distances else None
+    query_crops = frozenset(query_crop_hashes.values())
+    candidate_crops = frozenset(candidate_crop_hashes.values())
+    if query_crops & candidate_crops or query_phash in candidate_crops or candidate_phash in query_crops:
+        return 0
+    # Convert each distinct hash once, rather than twice per Cartesian-product
+    # comparison, and keep only the running minimum (no Q*C distance list).
+    minimum = None
+    pairs = (
+        (_crop_integers(frozenset(() if query_phash is None else (query_phash,))), _crop_integers(candidate_crops)),
+        (_crop_integers(query_crops), _crop_integers(frozenset(() if candidate_phash is None else (candidate_phash,)))),
+        (_crop_integers(query_crops), _crop_integers(candidate_crops)),
+    )
+    for left, right in pairs:
+        for length, values in left.items():
+            for a in values:
+                for b in right.get(length, ()):
+                    distance = (a ^ b).bit_count()
+                    if minimum is None or distance < minimum:
+                        minimum = distance
+    return minimum
+
+
+@lru_cache(maxsize=256)
+def _crop_integers(values: frozenset[bytes]) -> dict[int, tuple[int, ...]]:
+    grouped: dict[int, list[int]] = {}
+    for value in values:
+        grouped.setdefault(len(value), []).append(int.from_bytes(value, "big"))
+    return {length: tuple(items) for length, items in grouped.items()}
 
 
 def classify(

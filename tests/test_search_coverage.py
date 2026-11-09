@@ -1,332 +1,221 @@
-"""Behavioral coverage for perceptual hashing, candidate lookup and scoring."""
+"""Image search and review exports, using real images, hashes and SQLite."""
 from __future__ import annotations
 
-import hashlib
-import importlib.util
 import builtins
-import sqlite3
+import importlib.util
+import json
 import sys
+import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import imagehash
-import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
-from imgdupe import bands, hashing, match, cluster, query, review
-from imgdupe.config import ScanConfig, Thresholds
-from imgdupe.db import init_db, upsert_image, replace_hashes, replace_crop_hashes, set_crop_index_state
+from image_fixtures import textured
+from imgdupe import bands, cluster, hashing, query, review
+from imgdupe.db import init_db, replace_hashes, upsert_image
 
 
-class SearchDatabaseCase(unittest.TestCase):
+class ImageLibraryCase(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         init_db(self.conn)
         self.addCleanup(self.conn.close)
+        source = textured(1)
+        self.original = self.add_image("original.png", source)
+        copy_path = self.root / "copy&.png"
+        shutil.copyfile(self.original[1], copy_path)
+        self.exact = self.index(copy_path)
+        self.near = self.add_image("reencoded.jpg", source, quality=70)
+        self.review = self.add_image("bright.png", ImageEnhance.Brightness(source).enhance(2).filter(ImageFilter.GaussianBlur(1)))
+        self.unrelated = self.add_image("unrelated.png", textured(2))
 
-    def add_image(self, name, *, hashes=None, sha=None, size=(128, 96)):
+    def add_image(self, name, image, **save_options):
         path = self.root / name
-        Image.new("RGB", size, "red").save(path)
+        image.save(path, **save_options)
+        return self.index(path)
+
+    def index(self, path):
+        hashes, metadata = hashing.compute_image_hashes(path)
         image_id = upsert_image(self.conn, path=path, size_bytes=path.stat().st_size,
-                                mtime_ns=1, indexed_at="now", width=size[0], height=size[1],
-                                image_format="PNG", sha256=sha or hashing.sha256_file(path))
-        if hashes is not None:
-            replace_hashes(self.conn, image_id, hashes)
-            bands.insert_bands(self.conn, image_id, hashes)
+                                mtime_ns=path.stat().st_mtime_ns, indexed_at="now",
+                                width=metadata["width"], height=metadata["height"],
+                                image_format=metadata["format"], sha256=hashes["sha256"])
+        replace_hashes(self.conn, image_id, hashes)
+        bands.insert_bands(self.conn, image_id, hashes)
         return image_id, path
 
-
-class HashingTests(SearchDatabaseCase):
-    def test_digest_and_bit_packing(self):
-        data = self.root / "chunks"
-        data.write_bytes(b"abcdefg")
-        self.assertEqual(hashing.sha256_file(data, chunk_size=2), hashlib.sha256(b"abcdefg").digest())
-        self.assertEqual(hashing.imagehash_to_bytes(imagehash.ImageHash(np.array([[1, 0, 1], [0, 1, 0]], bool))), b"*")
-        self.assertEqual(hashing.hamming_bytes(b"\x00\xff", b"\xff\x0f"), 12)
-        with self.assertRaisesRegex(ValueError, "lengths 1 and 2"):
-            hashing.hamming_bytes(b"a", b"ab")
-
-    def test_transparency_is_composited_onto_white_and_source_format_preserved(self):
-        for mode in ("RGBA", "LA", "P", "RGB"):
-            with self.subTest(mode=mode):
-                path = self.root / f"{mode}.png"
-                image = Image.new(mode, (32, 32))
-                if mode == "P":
-                    image.info["transparency"] = 0
-                image.save(path)
-                normalized = hashing.load_normalized(path)
-                self.assertEqual(normalized.mode, "RGB")
-                self.assertEqual(normalized.info["source_format"], "PNG")
-                self.assertEqual(normalized.getpixel((0, 0)), (0, 0, 0) if mode == "RGB" else (255, 255, 255))
-        path = self.root / "palette-opaque.png"
-        Image.new("P", (32, 32)).save(path)
-        self.assertEqual(hashing.load_normalized(path).getpixel((0, 0)), (0, 0, 0))
-        for dimensions in ((31, 32), (32, 31)):
-            Image.new("RGB", dimensions).save(path)
-            with self.assertRaisesRegex(hashing.ImageTooSmallError, "too small"):
-                hashing.load_normalized(path)
-
-    def test_exif_orientation_changes_dimensions(self):
-        path = self.root / "oriented.jpg"
-        image = Image.new("RGB", (80, 40))
-        exif = Image.Exif()
-        exif[274] = 6
-        image.save(path, exif=exif)
-        self.assertEqual(hashing.load_normalized(path).size, (40, 80))
-
-    def test_region_hashes_and_small_image_cutoff(self):
-        large = Image.new("RGB", (128, 128), "blue")
-        small = Image.new("RGB", (16, 16), "blue")
-        boxes = hashing.crop_region_boxes(128, 128)
-        self.assertEqual(boxes["top_25"], (0, 0, 128, 32))
-        self.assertEqual(boxes["bottom_right_quarter"], (64, 64, 128, 128))
-        self.assertEqual(boxes["center_50"], (32, 32, 96, 96))
-        self.assertEqual(hashing._center_box(1, 1, .1), (0, 0, 1, 1))
-        self.assertEqual(len(hashing.grid_hashes(large)), 9)
-        self.assertEqual(set(hashing.crop_region_hashes(large)), set(boxes))
-        self.assertEqual(hashing.crop_region_hashes(small), {})
-        self.assertEqual(hashing.tile_hashes(small), {})
-        self.assertEqual(len(hashing.tile_hashes(large)), sum(x * y for x, y in hashing.TRYHARD_TILE_LAYOUTS))
-        query_hashes = hashing.tryhard_query_hashes(large)
-        self.assertIn("crop:center_50", query_hashes)
-        self.assertIn("tile:1x1_0_0", query_hashes)
-        self.assertTrue(all(len(value) == 32 for value in query_hashes.values()))
-
-    def test_compute_hashes_and_reuse_digest(self):
-        _, path = self.add_image("hash.png")
-        hashes, metadata = hashing.compute_image_hashes(path)
-        self.assertEqual(hashes["sha256"], hashing.sha256_file(path))
-        self.assertEqual(set(hashes), {"sha256", *bands.WHOLE_HASH_TYPES, *bands.GRID_HASH_TYPES})
-        self.assertEqual(metadata, {"width": 128, "height": 96, "format": "PNG"})
-        with patch.object(hashing, "sha256_file", side_effect=AssertionError("must reuse precomputed digest")):
-            cropped, _ = hashing.compute_image_hashes(path, include_crop_regions=True, precomputed_sha256=b"digest")
-        self.assertEqual(cropped["sha256"], b"digest")
-        self.assertIn("crop:center_50", cropped)
+    def search(self, **options):
+        return query.query_image(self.conn, self.original[1], **options)
 
 
-class BandTests(SearchDatabaseCase):
-    def test_band_splitting_ignores_incomplete_tail(self):
-        self.assertEqual(list(bands.split_bands(b"abcde")), [(0, b"ab"), (1, b"cd")])
-        self.assertEqual(list(bands.split_bands(b"")), [])
-        self.assertEqual(list(bands.split_bands(b"abc", 1)), [(0, b"a"), (1, b"b"), (2, b"c")])
+class ImageSearchTests(ImageLibraryCase):
+    def test_reencoded_copy_ranks_above_changed_image_and_unrelated_is_rejected(self):
+        results = self.search()
+        self.assertEqual([row["id"] for row, _, _ in results], [self.exact[0], self.near[0], self.review[0]])
+        self.assertEqual([score.decision for _, _, score in results],
+                         ["exact_duplicate", "strong_duplicate", "review"])
+        scores = [score.score for _, _, score in results]
+        self.assertEqual(scores[0], 100)
+        self.assertGreater(scores[0], scores[1])
+        self.assertGreater(scores[1], scores[2])
+        self.assertNotIn(self.original[0], [row["id"] for row, _, _ in results])
+        self.assertNotIn(self.unrelated[0], [row["id"] for row, _, _ in results])
 
-    def test_candidate_thresholds_aliases_exclusion_and_order(self):
-        complete = {"phash256": b"abcdefgh", "grid0": b"12", "crop:center_50": b"34"}
-        a, _ = self.add_image("a.png", hashes=complete)
-        b, _ = self.add_image("b.png", hashes={"phash256": b"abcd"})
-        c, _ = self.add_image("c.png", hashes={"phash256": b"ab"})
-        d, _ = self.add_image("d.png", hashes={"grid0": b"12"})
-        e, _ = self.add_image("e.png", hashes={"crop:center_50": b"34"})
-        lookup = {"phash256:query_crop:0": b"abcdefgh", "grid0": b"12", "crop:center_50": b"34", "nonsense": b"xx", "whash256": b""}
-        result = bands.find_candidates(self.conn, lookup)
-        self.assertEqual([(row.image_id, row.total_hits) for row in result], [(a, 6), (b, 2), (d, 1), (e, 1)])
-        self.assertEqual(result[0].hits_by_type, {"phash256": 4, "grid0": 1, "crop:center_50": 1})
-        self.assertNotIn(c, [row.image_id for row in result])
-        self.assertNotIn(a, [row.image_id for row in bands.find_candidates(self.conn, lookup, exclude_image_id=a)])
-        before = self.conn.execute("SELECT COUNT(*) FROM hash_bands").fetchone()[0]
-        bands.insert_bands(self.conn, a, complete)
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM hash_bands").fetchone()[0], before)
+    def test_limit_and_score_cutoff_keep_best_matches_and_hide_exact_keeps_visual_copy(self):
+        self.assertEqual([row["id"] for row, _, _ in self.search(limit=2)], [self.exact[0], self.near[0]])
+        self.assertEqual([row["id"] for row, _, _ in self.search(include_exact=False, min_score=55)], [self.near[0]])
+        score = self.search()[1][2].score
+        self.assertEqual([row["id"] for row, _, _ in self.search(min_score=score)], [self.exact[0], self.near[0]])
+        self.assertEqual([row["id"] for row, _, _ in self.search(min_score=score + .01)], [self.exact[0]])
+        self.assertEqual(self.search(min_score=101), [])
+        with self.assertRaisesRegex(ValueError, "limit must be positive"):
+            self.search(limit=0)
 
+    def test_external_upload_has_same_results_plus_indexed_original(self):
+        external = self.root / "upload.png"
+        shutil.copyfile(self.original[1], external)
+        results = query.query_image(self.conn, external)
+        self.assertEqual({row["id"] for row, _, _ in results},
+                         {self.original[0], self.exact[0], self.near[0], self.review[0]})
+        self.assertEqual([score.decision for _, _, score in results[:2]], ["exact_duplicate", "exact_duplicate"])
+        self.assertEqual(query.query_image(self.conn, external, include_exact=False), self.search(include_exact=False))
 
-class ScoringTests(unittest.TestCase):
-    def test_grid_distance_includes_only_common_cells(self):
-        self.assertEqual(match.grid_score({}, {}, cell_threshold=1), (0, None))
-        self.assertEqual(match.grid_score({"grid0": b"\0", "grid1": b"\0", "grid2": b"\xff"}, {"grid0": b"\0", "grid1": b"\xff", "grid3": b"\0"}, cell_threshold=2), (1, 0))
-
-    def test_crop_comparisons_ignore_mismatched_lengths(self):
-        self.assertIsNone(match.crop_score({}, {}, {}, {}))
-        self.assertIsNone(match.crop_score({"phash256": b"a"}, {"phash256": b"b"}, {"wrong": b"xx"}, {"wrong": b"yyy"}))
-        self.assertEqual(match.crop_score({"phash256": b"\0"}, {"phash256": b"\xff"}, {"a": b"\1", "wrong": b"xx"}, {"b": b"\3", "wrong": b"yyy"}), 1)
-        self.assertEqual(match.crop_score({}, {}, {"a": b"\0"}, {"b": b"\xff"}), 8)
-        # Isolate tile-to-whole matching so other comparisons cannot hide a regression.
-        self.assertEqual(match.crop_score({}, {"phash256": b"\xff"}, {}, {"tile": b"\xfe"}), 1)
-
-    def test_score_exact_partial_and_rejected_matches(self):
-        exact = match.score_hashes({}, {}, sha_equal=True)
-        self.assertEqual((exact.score, exact.decision), (100, "exact_duplicate"))
-        hashes = {key: bytes(32) for key in bands.WHOLE_HASH_TYPES}
-        hashes.update({key: bytes(8) for key in bands.GRID_HASH_TYPES})
-        identical = match.score_hashes(hashes, hashes)
-        self.assertEqual((identical.score, identical.decision), (100, "strong_duplicate"))
-        self.assertEqual(match.score_hashes({}, {}).decision, "reject")
-        far = {key: b"\xff" * len(value) for key, value in hashes.items()}
-        self.assertEqual(match.score_hashes(hashes, far).score, 0)
-        crop = match.score_hashes({"phash256": bytes(32)}, {}, crop_hashes_b={"center": bytes(32)})
-        self.assertEqual((crop.score, crop.crop_min_dist), (90, 0))
-        self.assertIsNone(match._distance_or_none({}, {"x": b"a"}, "x"))
-        self.assertIsNone(match._distance_or_none({"x": b"a"}, {}, "x"))
-
-    def test_each_classification_signal_and_threshold(self):
-        base = dict(score=0, dhash=None, phash=None, whash=None, grid_matches=0, crop_min=None, thresholds=Thresholds())
-        cases = [("strong_duplicate", {"phash": 16}), ("strong_duplicate", {"phash": 24, "whash": 24}),
-                 ("strong_duplicate", {"grid_matches": 7}), ("strong_duplicate", {"crop_min": 16}), ("strong_duplicate", {"score": 85}),
-                 ("probable_duplicate", {"phash": 32, "whash": 32}), ("probable_duplicate", {"grid_matches": 5}),
-                 ("probable_duplicate", {"crop_min": 32}), ("probable_duplicate", {"score": 70}),
-                 ("review", {"phash": 40}), ("review", {"whash": 40}), ("review", {"grid_matches": 4}),
-                 ("review", {"crop_min": 40}), ("review", {"score": 55}), ("reject", {})]
-        for expected, changes in cases:
-            with self.subTest(changes=changes):
-                self.assertEqual(match.classify(**(base | changes)), expected)
-        self.assertTrue(match._lte(3, 3))
-        self.assertFalse(match._lte(4, 3))
-        self.assertFalse(match._lte(None, 3))
-
-
-class ClusterTests(SearchDatabaseCase):
-    def test_union_by_rank_and_compression(self):
-        uf = cluster.UnionFind(list(range(1, 8)))
-        uf.union(1, 2)  # equal ranks
-        uf.union(1, 3)  # left rank wins
-        uf.union(4, 1)  # right rank wins
-        uf.union(5, 6)
-        uf.union(5, 7)
-        uf.union(1, 5)
-        uf.union(2, 6)  # already connected
-        self.assertEqual({uf.find(i) for i in range(1, 8)}, {uf.find(1)})
-        self.assertEqual(cluster._groups_from_union_find(uf), [list(range(1, 8))])
-
-    def test_real_clusters_choose_largest_representative_and_review_pages(self):
-        hashes = {key: bytes(32) for key in bands.WHOLE_HASH_TYPES}
-        a, pa = self.add_image("a&.png", hashes=hashes, sha=b"same", size=(64, 64))
-        b, pb = self.add_image("b.png", hashes=hashes, sha=b"same", size=(128, 96))
-        c, _ = self.add_image("c.png", hashes={"phash256": b"\xff" * 32}, sha=b"different")
-        stats = cluster.build_clusters(self.conn)
-        self.assertEqual((stats.images, stats.scored_pairs, stats.stored_matches, stats.clusters, stats.clustered_images), (3, 1, 1, 1, 2))
-        self.assertEqual(self.conn.execute("SELECT image_id FROM clusters WHERE representative=1").fetchone()[0], b)
-        first = review.generate_review(self.conn, self.root / "review", thumbnail_size=48)
-        self.assertEqual((first.clusters, first.images, first.thumbnails), (1, 2, 2))
-        payload = __import__("json").loads((first.out_dir / "clusters.json").read_text())["clusters"][0]
-        self.assertEqual(payload["representative"], str(pb))
-        self.assertEqual(payload["matches"][0]["decision"], "exact_duplicate")
-        self.assertIn("a&amp;.png", (first.out_dir / "cluster_000001.html").read_text())
-        self.assertIn("cluster_000001.html", (first.out_dir / "index.html").read_text())
-        pa.unlink()
-        second = review.generate_review(self.conn, first.out_dir, thumbnail_size=48)
-        self.assertEqual(second.thumbnails, 1)
-        cluster.build_clusters(self.conn, min_score=101)
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0], 0)
-        empty = review.generate_review(self.conn, self.root / "empty")
-        self.assertEqual((empty.images, empty.clusters), (0, 0))
-
-    def test_rejected_review_and_missing_hash_candidates(self):
-        a, _ = self.add_image("a.png", hashes={"phash256": b"same"}, sha=b"a")
-        b, _ = self.add_image("b.png", hashes={"phash256": b"same"}, sha=b"b")
-        c, _ = self.add_image("c.png", hashes={"phash256": b"same"}, sha=b"c")
-        d, _ = self.add_image("d.png", hashes={"phash256": b"same"}, sha=b"d")
-        loaded = cluster._load_hashes(self.conn, [{"id": a}, {"id": 999}])
-        self.assertEqual(set(loaded), {a})
-        def candidates(_conn, _hashes, **kwargs):
-            return [bands.Candidate(i, 2, {}) for i in (a, b, c, d, 999)]
-        rejected = match.PairScore(200, 200, 200, 0, None, None, 0, "reject")
-        low = match.PairScore(30, 30, 30, 0, None, None, 60, "probable_duplicate")
-        review_pair = match.PairScore(30, 30, 30, 0, None, None, 80, "review")
-        with patch.object(cluster, "_load_hashes", return_value={a: {}, b: {}, c: {}}), patch.object(cluster, "find_candidates", side_effect=candidates), patch.object(cluster, "score_hashes", side_effect=[rejected, low, review_pair]):
-            stats = cluster.build_clusters(self.conn)
-        self.assertEqual((stats.scored_pairs, stats.stored_matches, stats.clusters), (3, 1, 0))
-        self.assertEqual(self.conn.execute("SELECT decision FROM matches").fetchone()[0], "review")
-        # Updating a pair in reverse order must replace the same canonical record.
-        cluster._store_match(self.conn, c, b, low, "later")
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0], 1)
-        self.assertEqual(self.conn.execute("SELECT score FROM matches").fetchone()[0], 60)
-
-    def test_review_empty_and_incomplete_display_records(self):
-        self.assertEqual(review._fetch_cluster_matches(self.conn, []), [])
-        self.assertIsNone(review._representative_path([]))
-        self.assertEqual(review._representative_path([{"path": "fallback", "representative": 0}]), "fallback")
-        self.assertEqual(review._representative_path([{"path": "a", "representative": 0}, {"path": "b", "representative": 1}]), "b")
-        row = dict(id=1, path="x", representative=0, width=None, height=None, size_bytes=0, format=None, mtime_ns=0)
-        self.assertEqual(review._image_json(row, "thumb")["dimensions"], "")
-        review._write_index_page(self.root / "empty-cluster.html", [{"cluster_id": 1, "count": 0, "images": [], "representative": None}])
-        self.assertIn('src=""', (self.root / "empty-cluster.html").read_text())
-
-
-class QueryTests(SearchDatabaseCase):
-    def test_real_image_search_exact_filter_limit_and_tryhard(self):
-        a, pa = self.add_image("a.png")
-        hashes, _ = hashing.compute_image_hashes(pa, include_crop_regions=True)
-        replace_hashes(self.conn, a, hashes)
-        replace_crop_hashes(self.conn, a, hashes)
-        bands.insert_bands(self.conn, a, hashes)
-        b, pb = self.add_image("b.png", hashes=hashes)
-        replace_crop_hashes(self.conn, b, hashes)
-        found = query.query_image(self.conn, pa)
-        self.assertEqual([item[0]["id"] for item in found], [b])
-        self.assertEqual(found[0][2].decision, "exact_duplicate")
-        self.assertEqual(query.query_image(self.conn, pa, include_exact=False), [])
-        self.assertEqual([item[0]["id"] for item in query.query_image(self.conn, pa, min_score=100)], [b])
-        self.assertEqual(query.query_image(self.conn, pa, min_score=101), [])
-        self.assertEqual(query.query_image(self.conn, pa, limit=0), [])
-        self.assertEqual(query.query_image(self.conn, pb, tryhard=True)[0][0]["id"], a)
-        set_crop_index_state(self.conn, "ready")
-        self.assertEqual(query.query_image(self.conn, pa, tryhard=True)[0][0]["id"], b)
-        external = self.root / "not-indexed.png"
-        Image.new("RGB", (128, 96), "red").save(external)
-        self.assertEqual(len(query.query_image(self.conn, external, limit=1)), 1)
+    def test_query_html_contains_real_result_links_decisions_and_escaped_names(self):
         out = self.root / "nested" / "query.html"
-        query.write_query_html(out, pa, found)
+        query.write_query_html(out, self.original[1], self.search())
         html = out.read_text()
-        self.assertIn(pb.as_uri(), html)
-        self.assertIn("100.00", html)
+        self.assertIn(self.exact[1].as_uri().replace("&", "&amp;"), html)
+        self.assertIn("copy&amp;.png", html)
         self.assertIn("exact_duplicate", html)
-        query.write_query_html(out, pa, [])
+        self.assertIn("strong_duplicate", html)
+        query.write_query_html(out, self.original[1], [])
         self.assertIn("<tbody></tbody>", out.read_text())
 
-    def test_stale_candidates_are_skipped_and_rejects_filtered(self):
-        a, pa = self.add_image("a.png", hashes={"phash256": bytes(32)}, sha=b"a")
-        b, pb = self.add_image("b.png", hashes={"phash256": bytes(32)}, sha=b"b")
-        candidates = [bands.Candidate(999, 2, {}), bands.Candidate(998, 2, {}), bands.Candidate(b, 2, {})]
-        actual = query.fetch_hash_row
-        def fetch(conn, image_id):
-            return actual(conn, b if image_id == 998 else image_id)
-        rejected = match.PairScore(None, None, None, 0, None, None, 0, "reject")
-        with patch.object(query, "find_candidates", return_value=candidates), patch.object(query, "fetch_hash_row", side_effect=fetch), patch.object(query, "score_hashes", return_value=rejected):
-            self.assertEqual(query.query_image(self.conn, pa), [])
-        # A partial hash result without pHash is valid: tryhard still searches tiles.
-        set_crop_index_state(self.conn, "ready")
-        with patch.object(query, "compute_image_hashes", return_value=({"sha256": b"q"}, {})), patch.object(query, "find_candidates", return_value=[]):
-            self.assertEqual(query.query_image(self.conn, pa, tryhard=True), [])
 
-    def test_prompt_query_validation_group_normalization_and_parens(self):
-        self.assertEqual(query.query_prompt_tags(self.conn, ""), [])
-        with self.assertRaisesRegex(ValueError, "match_mode"):
-            query.query_prompt_tags(self.conn, "cat", match_mode="bad")
-        self.assertEqual(query._prompt_tag_norms(["cat | dog", "cat | dog", "cat | cat", "", "@model:sd"]), ["cat", "dog", "cat", "@model:sd"])
-        self.assertEqual(query._negative_prompt_tag_terms("cat | dog, cat"), [("cat", False), ("dog", False)])
-        self.assertEqual(query._prompt_tag_groups(None), [])
-        cases = {"((cat | dog))": "cat | dog", "(cat) | (dog)": "(cat) | (dog)", "(cat))": "(cat))", "((cat)": "((cat)", "(cat))(dog)": "(cat))(dog)"}
-        for text, expected in cases.items():
-            self.assertEqual(query._strip_whole_group_parentheses(text), expected)
+class ClusterReviewTests(ImageLibraryCase):
+    def test_real_clusters_keep_review_only_pairs_out_and_export_full_membership(self):
+        stats = cluster.build_clusters(self.conn, min_score=0)
+        members = {row["image_id"] for row in self.conn.execute("SELECT image_id FROM clusters")}
+        self.assertEqual(members, {self.original[0], self.exact[0], self.near[0]})
+        self.assertEqual((stats.images, stats.clusters, stats.clustered_images), (5, 1, 3))
+        self.assertTrue(self.conn.execute("SELECT 1 FROM matches WHERE decision='review'").fetchone())
+        representative = max((self.original, self.exact, self.near),
+                             key=lambda item: (item[1].stat().st_size, -item[0]))
+        self.assertEqual(self.conn.execute("SELECT image_id FROM clusters WHERE representative=1").fetchone()[0], representative[0])
+        exported = review.generate_review(self.conn, self.root / "review", thumbnail_size=48)
+        self.assertEqual((exported.clusters, exported.images, exported.thumbnails), (1, 3, 3))
+        [group] = json.loads((exported.out_dir / "clusters.json").read_text())["clusters"]
+        self.assertEqual({image["id"] for image in group["images"]}, members)
+        self.assertEqual(group["representative"], str(representative[1]))
+        self.assertEqual(len(group["matches"]), 3)
+        page = (exported.out_dir / "cluster_000001.html").read_text()
+        self.assertIn("copy&amp;.png", page)
+        self.assertIn("cluster_000001.html", (exported.out_dir / "index.html").read_text())
+        for image in group["images"]:
+            with Image.open(exported.out_dir / image["thumbnail"]) as thumb:
+                self.assertLessEqual(max(thumb.size), 48)
 
-    def test_prompt_negative_only_and_model_filter(self):
-        a, _ = self.add_image("a.png")
-        self.conn.execute("INSERT INTO image_prompts(image_id, prompt, prompt_indexed_at, model_type) VALUES (?, 'cat', 'now', 'sd')", (a,))
-        self.conn.executemany("INSERT INTO prompt_tags(image_id, tag, tag_norm, position, tag_kind) VALUES (?, ?, ?, 0, ?)", [(a, "cat", "cat", "prompt"), (a, "@model:sd", "@model:sd", "model_type")])
-        results = query.query_prompt_tags(self.conn, "", negative_text_or_tags="dog", model_type="SD", unique_prompts=True)
-        self.assertEqual([item.image_row["id"] for item in results], [a])
-        self.assertEqual(query.query_prompt_tags(self.conn, "cat", model_type="nai3"), [])
-        any_results = query.query_prompt_tags(self.conn, "cat | dog, mouse", match_mode="any")
-        self.assertEqual([(item.image_row["id"], item.matched_count) for item in any_results], [(a, 1)])
-        self.assertEqual(query.query_prompt_tags(self.conn, "", negative_text_or_tags="cat"), [])
+    def test_rebuild_replaces_old_groups_and_review_handles_missing_source_files(self):
+        cluster.build_clusters(self.conn)
+        self.exact[1].unlink()
+        stats = review.generate_review(self.conn, self.root / "review", thumbnail_size=48)
+        self.assertEqual((stats.images, stats.thumbnails), (3, 2))
+        cluster.build_clusters(self.conn, min_score=101)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0], 0)
+        empty = review.generate_review(self.conn, self.root / "empty")
+        self.assertEqual((empty.images, empty.clusters, empty.thumbnails), (0, 0, 0))
+        self.assertEqual(json.loads((empty.out_dir / "clusters.json").read_text()), {"clusters": []})
+
+    def test_transitive_matches_form_one_group_without_a_direct_match_for_every_pair(self):
+        # A controlled hash chain isolates transitive membership from image-hash
+        # sensitivity: A-B and B-C each share two bands; A-C share none.
+        self.conn.execute("DELETE FROM images")
+        hashes = (b"aaaabbbb", b"aaaacccc", b"ddddcccc")
+        ids = []
+        for index, phash in enumerate(hashes):
+            image_id, _ = self.add_image(f"chain-{index}.png", textured(index + 10))
+            self.conn.execute("DELETE FROM hash_bands WHERE image_id=?", (image_id,))
+            replace_hashes(self.conn, image_id, {"phash256": phash})
+            bands.insert_bands(self.conn, image_id, {"phash256": phash})
+            ids.append(image_id)
+        stats = cluster.build_clusters(self.conn, min_score=0)
+        self.assertEqual((stats.clusters, stats.clustered_images), (1, 3))
+        self.assertEqual([(row["image_id_a"], row["image_id_b"]) for row in self.conn.execute("SELECT * FROM matches ORDER BY image_id_a,image_id_b")],
+                         [(ids[0], ids[1]), (ids[1], ids[2])])
 
 
-class OptionalProgressTests(unittest.TestCase):
-    def test_clustering_and_review_work_without_tqdm(self):
+class ClusterBoundaryTests(ImageLibraryCase):
+    def test_filtered_images_with_bands_are_not_pulled_back_into_groups(self):
+        self.conn.execute("UPDATE images SET decode_error='damaged' WHERE id=?", (self.exact[0],))
+        self.conn.execute("UPDATE images SET missing_at='now' WHERE id=?", (self.near[0],))
+        stats = cluster.build_clusters(self.conn)
+        self.assertEqual((stats.images, stats.clusters, stats.stored_matches), (3, 0, 0))
+
+    def test_hash_removed_by_another_connection_between_reads_is_skipped(self):
+        path = self.root / "concurrent.sqlite"
+        self.conn.commit()
+        with sqlite3.connect(path) as initial:
+            self.conn.backup(initial)
+        reader = sqlite3.connect(path)
+        reader.row_factory = sqlite3.Row
+        writer = sqlite3.connect(path)
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        read_images = cluster._iter_indexed_images
+        def read_then_remove(conn):
+            rows = read_images(conn)
+            writer.execute("DELETE FROM hashes WHERE image_id=?", (self.original[0],))
+            writer.commit()
+            return rows
+        with patch.object(cluster, "_iter_indexed_images", side_effect=read_then_remove):
+            stats = cluster.build_clusters(reader)
+        self.assertEqual((stats.images, stats.clusters, stats.clustered_images), (5, 1, 2))
+        self.assertEqual({row[0] for row in reader.execute("SELECT image_id FROM clusters")},
+                         {self.exact[0], self.near[0]})
+
+    def test_clusters_merge_components_when_first_edge_points_into_larger_component(self):
+        union = cluster.UnionFind([1, 2, 3, 4, 5, 6])
+        # UnionFind's public contract is connectivity irrespective of edge
+        # direction/order, including a smaller component merged into a larger.
+        for left, right in ((1, 2), (3, 4), (1, 3), (5, 6), (5, 1), (6, 2)):
+            union.union(left, right)
+        self.assertEqual(len({union.find(image_id) for image_id in range(1, 7)}), 1)
+
+    def test_export_without_representative_flag_uses_first_sorted_image(self):
+        cluster.build_clusters(self.conn)
+        self.conn.execute("UPDATE clusters SET representative=0")
+        self.conn.commit()
+        export = review.generate_review(self.conn, self.root / "legacy-review", thumbnail_size=48)
+        [group] = json.loads((export.out_dir / "clusters.json").read_text())["clusters"]
+        self.assertEqual(group["representative"], group["images"][0]["path"])
+        self.assertEqual(len(group["images"]), 3)
+
+    def test_cluster_and_export_work_when_optional_progress_package_is_unavailable(self):
         original_import = builtins.__import__
-        def importing(name, *args, **kwargs):
+        def without_progress(name, *args, **kwargs):
             if name == "tqdm":
-                raise ImportError("optional progress display unavailable")
+                raise ImportError("progress unavailable")
             return original_import(name, *args, **kwargs)
-        for original in (cluster, review):
-            name = f"imgdupe._coverage_optional_{original.__name__.rsplit('.', 1)[1]}"
-            spec = importlib.util.spec_from_file_location(name, original.__file__)
-            module = importlib.util.module_from_spec(spec)
-            with patch.dict(sys.modules, {name: module}), patch("builtins.__import__", side_effect=importing):
-                spec.loader.exec_module(module)
-                self.assertEqual(module.tqdm([1, 2]), [1, 2])
-                self.assertEqual(module.tqdm(), ())
+        loaded = []
+        with patch("builtins.__import__", side_effect=without_progress):
+            for original in (cluster, review):
+                name = "imgdupe._optional_" + original.__name__.rsplit(".", 1)[1]
+                spec = importlib.util.spec_from_file_location(name, original.__file__)
+                module = importlib.util.module_from_spec(spec)
+                with patch.dict(sys.modules, {name: module}):
+                    spec.loader.exec_module(module)
+                loaded.append(module)
+        stats = loaded[0].build_clusters(self.conn)
+        export = loaded[1].generate_review(self.conn, self.root / "without-progress", thumbnail_size=48)
+        self.assertEqual((stats.clusters, stats.clustered_images), (1, 3))
+        self.assertEqual((export.clusters, export.images, export.thumbnails), (1, 3, 3))
+        self.assertTrue((export.out_dir / "cluster_000001.html").exists())

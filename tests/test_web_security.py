@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
 from imgdupe import web
-from test_web_coverage import WebFixture
+from web_handler_fixture import WebFixture
 
 
 class Forms(HTMLParser):

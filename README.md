@@ -39,13 +39,22 @@ python -m coverage report
 python scripts/check_mutations.py
 ```
 
-Coverage requires **100% of all `imgdupe` statements and branches**, without
-source exclusions. Tests use generated images, temporary SQLite databases,
-real background scans and HTTP request handlers, plus controlled failure and
-platform API boundaries. Two optional tests skip when the uncommitted reference
-image corpus is absent. Native Windows calls are mocked on Linux; coverage is
-not a claim of native Windows integration testing. The coverage gate is verified
-on Linux with Python 3.13 and 3.14 (SQLite 3.53.1 and 3.46.1).
+Install Node.js 18 or later for the rendered JavaScript behavior tests (the manual
+workflow installs Node.js 22). The suite fails with an installation hint when Node
+is missing.
+
+Coverage requires **100% of `imgdupe` statements and branches**, without
+exclusions. Every test must also establish an observable behavior or a meaningful
+safety/performance bound. Tests use generated asymmetric images, temporary SQLite databases, real background scans and HTTP handlers, plus
+controlled failure and platform API boundaries. Autocomplete checks execute the
+rendered production JavaScript with its actual control bindings, deterministic
+timers and out-of-order fetch completions. This small DOM boundary does not replace
+browser layout or native clipboard testing. Two optional tests skip when the
+uncommitted reference image corpus is absent. Native Windows APIs are simulated
+on Linux; these checks do not establish native Windows integration.
+
+See the [test audit](docs/test-audit.md) for retained coverage, replacements and
+known limits. Earlier verification results describe their historical suites.
 
 The mutation runner makes isolated temporary copies and deliberately introduces
 realistic semantic defects. Every mutant must trigger an assertion failure;
@@ -60,6 +69,11 @@ The GitHub **Manual verification** workflow runs these checks only through
 `workflow_dispatch` from the Actions UI or `gh workflow run`; pushing commits or
 opening a pull request does not start CI.
 See the [recorded local verification results](docs/verification.md).
+
+For reproducible multi-gigabyte SQLite, HTTP, and browser performance testing,
+see the [performance testing toolkit](docs/performance-testing.md). It generates
+owned synthetic fixtures, retains timings/profiles, and removes disposable
+databases after the run. See the [implemented improvements and measured tradeoffs](docs/performance-improvements.md).
 
 ## Installation
 
@@ -161,7 +175,7 @@ Useful prompt-indexing scan options:
 
 - `--reindex-prompts`: re-read prompt metadata for unchanged files.
 - `--stealth-prompt`: also try NovelAI alpha-channel stealth metadata for PNGs.
-- `--no-prompt-index`: skip prompt extraction and only update the image hash index.
+- `--no-prompt-index`: skip prompt extraction; moved images still refresh existing path-derived model labels.
 
 Then start the web UI:
 
@@ -294,6 +308,16 @@ reindexing the database.
 
 In positive searches, `a | b, c` means `(a OR b) AND c`; therefore `a,c`,
 `b,c`, and `a,b,c` match, while `a,b` does not. Full-width `｜` is also accepted.
+Both pipes always start OR alternatives, including inside model parentheses:
+`@model:Foo (Bar|Qux) extra` searches for `@model:Foo (Bar` OR `Qux) extra`.
+Wrapping that query as `(@model:Foo (Bar|Qux) extra)` preserves those alternatives.
+
+Balanced parentheses can wrap comma-separated constraints, for example
+`(@model:Foo (Bar, Baz), cat)` or `cat, (@model:sd, dog)`. Parentheses and commas
+inside a model name remain part of that model term even when the name is not in
+the index. Within an ungrouped model term, a trailing space and `cat` without a
+comma are still part of the model name. Closing a structural group finishes the
+term: `(cat, @model:sd) extra` is equivalent to `cat, @model:sd, extra`.
 
 ## Similar Image Groups
 

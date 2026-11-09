@@ -1,259 +1,401 @@
-"""Scan lifecycle, moves, failures, and optional dependency behavior."""
+"""Incremental scan lifecycle: indexing, failures, crop state and timestamps."""
 
 from __future__ import annotations
 
 import builtins
-import dataclasses
+from contextlib import closing
+import os
+import json
+import uuid
 import runpy
-import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 from imgdupe import db, scan
 from imgdupe.config import ScanConfig
+from imgdupe.failures import iter_failures
 from imgdupe.model_paths import ModelPathConfig, make_rule
-from imgdupe.nai_prompt import PromptResult
+from imgdupe.query import query_prompt_tags
 
 
-class ScanCoverageTests(unittest.TestCase):
+def write_image(path: Path, seed: int = 0, size: tuple[int, int] = (80, 80)) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = size
+    pixels = bytes((x * (seed + 3) + y * (seed + 7) + channel * 50 + seed * 31) % 256
+                   for y in range(height) for x in range(width) for channel in range(3))
+    Image.frombytes("RGB", size, pixels).save(path)
+    return path
+
+
+class ScanTestCase(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.conn = sqlite3.connect(":memory:")
-        self.conn.row_factory = sqlite3.Row
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.root = self.base / "images"
+        self.root.mkdir()
+        self.conn = db.connect(self.base / "index.sqlite")
         db.init_db(self.conn)
         self.addCleanup(self.conn.close)
 
-    def image(self, name="image.png", size=(80, 80)):
-        path = self.root / name
-        Image.new("RGB", size, "red").save(path)
-        return path
+    def image(self, name, seed=0, size=(80, 80)):
+        return write_image(self.root / name, seed, size)
 
-    def record(self, path, **changes):
-        values = dict(path=path, size_bytes=1, mtime_ns=1, indexed_at="now")
-        values.update(changes)
-        return db.upsert_image(self.conn, **values)
+    def scan(self, *roots, model_paths=None, **options):
+        return scan.scan_roots(self.conn, list(roots) or [self.root],
+                               config=ScanConfig(workers=1, **options),
+                               model_paths=model_paths or ModelPathConfig())
 
-    def task(self, path, **changes):
-        values = dict(path=path, size_bytes=1, mtime_ns=1, created_ns=2, modified_ns=3,
-                      had_existing_hashes=False, prompt_only=False, date_only=False,
-                      existing_image_id=None, classification_root=str(self.root),
-                      configured_model=None, model_config_root=None, model_config_rule_id=None,
-                      classification_status="unconfigured")
-        values.update(changes)
-        return scan.ScanTask(**values)
+    def row(self, path):
+        return db.get_existing_image(self.conn, path)
 
-    def result(self, path, **changes):
-        task_fields = dataclasses.asdict(self.task(path))
-        task_fields.pop("precomputed_sha256")
-        values = dict(task_fields, width=80, height=80, image_format="PNG", sha256=b"sha",
-                      hashes={"phash256": b"\0" * 32}, decode_error=None, moved=False,
-                      prompt_result=None)
-        values.update(changes)
-        return scan.ScanResult(**values)
+    def count(self, table, where="1", parameters=()):
+        return self.conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", parameters).fetchone()[0]
 
-    def run_scan(self, paths, **changes):
-        return scan.scan_roots(self.conn, paths, config=ScanConfig(workers=1, **changes),
-                               model_paths=ModelPathConfig())
+    def counts(self, stats):
+        return {key: value for key, value in vars(stats).items() if value}
 
-    def test_real_hash_scan_refresh_dates_crop_state_and_delete_missing(self):
-        path = self.image()
-        stats = self.run_scan([self.root], crop_index=True)
-        self.assertEqual((stats.indexed, stats.failed), (1, 0))
-        self.assertEqual(db.get_crop_index_state(self.conn), "ready")
-        self.assertTrue(db.fetch_crop_hashes(self.conn, 1))
-        self.conn.execute("UPDATE images SET created_ns = NULL, modified_ns = NULL")
-        stats = self.run_scan([path], prompt_index=False)
-        self.assertEqual(stats.indexed, 1)
-        self.assertIsNotNone(self.conn.execute("SELECT modified_ns FROM images").fetchone()[0])
-        path.unlink()
-        stats = self.run_scan([self.root], delete_missing=True)
-        self.assertEqual(stats.deleted, 1)
-        self.assertEqual(self.conn.execute("SELECT count(*) FROM images").fetchone()[0], 0)
 
-    def test_parallel_futures_are_collected_and_replenished(self):
-        for index in range(7):
-            self.image(f"{index}.png")
-        # Thread futures obey the same executor/wait contract while keeping
-        # worker execution visible to the coverage collector.
-        with patch.object(scan, "ProcessPoolExecutor", wraps=ThreadPoolExecutor) as executor:
-            stats = scan.scan_roots(self.conn, [self.root], config=ScanConfig(workers=2, delete_missing=True),
-                                    model_paths=ModelPathConfig())
-        executor.assert_called_once_with(max_workers=2)
-        self.assertEqual((stats.seen, stats.indexed, stats.failed), (7, 7, 0))
-        self.assertEqual(self.conn.execute("SELECT count(*) FROM hashes").fetchone()[0], 7)
+class ScanLifecycleTests(ScanTestCase):
+    def test_incremental_scan_indexes_new_skips_unchanged_and_rehashes_modified(self):
+        first = self.image("first.png", 1)
+        second = self.image("nested/second.png", 2)
+        stats = self.scan()
+        self.assertEqual(self.counts(stats), {"seen": 2, "queued": 2, "indexed": 2})
+        self.assertEqual(self.count("hashes"), 2)
+        for path in (first, second):
+            stat = os.stat(path)
+            row = self.row(path)
+            self.assertEqual((row["width"], row["height"], row["format"]), (80, 80, "PNG"))
+            self.assertEqual(row["sha256"], scan.sha256_file(path))
+            self.assertEqual(row["modified_ns"], stat.st_mtime_ns)
+            self.assertEqual(row["created_ns"], getattr(stat, "st_birthtime_ns", stat.st_ctime_ns))
+        original_id = self.row(first)["id"]
 
-    def test_real_process_workers_return_serializable_results(self):
-        self.image("first.png")
-        self.image("second.png")
-        stats = scan.scan_roots(self.conn, [self.root], config=ScanConfig(workers=2, prompt_index=False),
-                                model_paths=ModelPathConfig())
-        self.assertEqual((stats.indexed, stats.failed), (2, 0))
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM hashes").fetchone()[0], 2)
+        with patch.object(scan, "compute_image_hashes", side_effect=AssertionError("rehashed")):
+            self.assertEqual(self.counts(self.scan()), {"seen": 2, "skipped": 2})
 
-    def test_stat_failure_and_moved_hash_failure_do_not_stop_scan(self):
-        bad = Mock(spec=Path)
-        bad.stat.side_effect = OSError("disappeared")
-        with patch.object(scan, "iter_image_paths", return_value=[bad]):
-            stats = self.run_scan([])
-        self.assertEqual((stats.seen, stats.failed), (1, 1))
-        path = self.image()
-        self.record(self.root / "old.png", size_bytes=path.stat().st_size, sha256=b"old")
-        with patch.object(scan, "_claim_moved_image", side_effect=OSError("unreadable")):
-            stats = self.run_scan([self.root])
-        self.assertEqual((stats.seen, stats.failed, stats.queued), (1, 1, 0))
-        stats = self.run_scan([self.root])
-        self.assertEqual((stats.indexed, stats.moved), (1, 0))
+        write_image(first, 9, (96, 80))
+        stats = self.scan()
+        self.assertEqual(self.counts(stats), {"seen": 2, "queued": 1, "indexed": 1, "skipped": 1})
+        row = self.row(first)
+        self.assertEqual((row["id"], row["width"], row["sha256"]),
+                         (original_id, 96, scan.sha256_file(first)))
+        self.assertEqual(self.count("images"), 2)
 
-    def test_renamed_image_preserves_id_for_date_and_prompt_updates(self):
-        path = self.image()
-        self.run_scan([self.root])
-        image_id = self.conn.execute("SELECT id FROM images").fetchone()[0]
-        moved = self.root / "moved.png"
-        path.rename(moved)
-        stats = self.run_scan([self.root])
-        self.assertEqual((stats.indexed, stats.moved), (1, 1))
-        self.assertEqual(db.get_existing_image(self.conn, moved)["id"], image_id)
-        final = self.root / "final.png"
-        moved.rename(final)
-        stats = self.run_scan([self.root], reindex_prompts=True)
-        self.assertEqual((stats.indexed, stats.moved), (1, 1))
-        self.assertEqual(db.get_existing_image(self.conn, final)["id"], image_id)
+    def test_platform_birthtime_is_preferred_for_creation_dates(self):
+        path = self.image("image.png")
+        real_stat = Path.stat
 
-    def test_scan_root_resolution_and_stat_dates(self):
-        path = self.image()
-        unrelated = self.root / "other"
-        unrelated.mkdir()
-        self.assertEqual(scan._scan_root_for_path(path, [unrelated]), self.root)
-        self.assertEqual(scan._scan_root_for_path(path, [self.root, path]), self.root)
-        self.assertEqual(scan._created_ns_from_stat(SimpleNamespace(st_birthtime_ns=7)), 7)
-        self.assertEqual(scan._created_ns_from_stat(SimpleNamespace(st_ctime_ns=8)), 8)
-        self.assertIsNone(scan._created_ns_from_stat(SimpleNamespace()))
-        self.assertIsNone(scan._optional_int(None))
+        class BirthtimeStat:
+            def __init__(self, result):
+                self._result = result
+                self.st_birthtime_ns = 123_456_789
 
-    def test_crop_state_interruption_and_incomplete_index(self):
-        image_id = self.record(self.root / "large.png", width=80, height=80)
-        db.replace_hashes(self.conn, image_id, {"phash256": b"\0" * 32})
-        for state, requested, expected in (("building", False, "incomplete"),
-                                           ("ready", False, "incomplete"),
-                                           ("ready", True, "incomplete"),
-                                           ("disabled", False, "disabled")):
-            db.set_crop_index_state(self.conn, state)
-            scan._finish_crop_index_state(self.conn, requested)
-            self.assertEqual(db.get_crop_index_state(self.conn), expected)
-        db.replace_crop_hashes(self.conn, image_id, {"crop:center_50": b"crop"})
-        db.set_crop_index_state(self.conn, "ready")
-        scan._finish_crop_index_state(self.conn, False)
-        self.assertEqual(db.get_crop_index_state(self.conn), "ready")
+            def __getattr__(self, name):
+                return getattr(self._result, name)
 
-    def test_refresh_assignments_updates_only_configuration_when_category_matches(self):
-        path = self.image()
-        rule = make_rule(self.root, "sd")
-        image_id = self.record(path)
-        db.replace_prompt(self.conn, image_id, prompt="cat", metadata_source=None, prompt_error=None,
-                          indexed_at="now", configured_model="sd", model_type="sd",
-                          tags=[("@model:sd", "@model:sd", "model_config")])
-        rows = self.conn.execute("SELECT * FROM images").fetchall()
-        scan._refresh_model_config_assignments(self.conn, rows, ModelPathConfig((rule,)))
-        self.assertEqual(self.conn.execute("SELECT model_config_root FROM image_prompts").fetchone()[0], str(self.root))
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prompt_tags").fetchone()[0], 1)
-        # Two images in one directory exercise the directory rule cache.
-        self.record(self.root / "without-prompt.png")
-        second = self.record(self.root / "second.png")
-        db.replace_prompt(self.conn, second, prompt="dog", metadata_source=None, prompt_error=None,
-                          indexed_at="now", model_type="sd", tags=[])
-        rows = self.conn.execute("SELECT * FROM images").fetchall()
-        scan._refresh_model_config_assignments(self.conn, rows, ModelPathConfig((rule,)))
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM image_prompts").fetchone()[0], 2)
+        with patch.object(Path, "stat", lambda item, *args, **kwargs: BirthtimeStat(real_stat(item, *args, **kwargs))):
+            self.scan()
+        self.assertEqual(self.row(path)["created_ns"], 123_456_789)
 
-    def test_store_missing_ids_counts_failure_without_touching_database(self):
-        for flags in ({"date_only": True}, {"prompt_only": True}):
-            stats = scan.ScanStats()
-            scan._store_result(self.conn, self.result(self.root / "missing.png", **flags),
-                               ScanConfig(batch_size=1), stats)
-            self.assertEqual((stats.indexed, stats.failed), (0, 1))
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0], 0)
+    def test_timestamp_backfill_keeps_hashes_and_prompt_metadata(self):
+        path = self.image("image.png")
+        self.scan()
+        image_id = self.row(path)["id"]
+        hashes = tuple(db.fetch_hash_row(self.conn, image_id))
+        prompt = tuple(self.conn.execute("SELECT * FROM image_prompts").fetchone())
+        stat = os.stat(path)
+        for created, modified in ((None, None), (1, stat.st_mtime_ns), (stat.st_ctime_ns, 1)):
+            self.conn.execute("UPDATE images SET created_ns=?, modified_ns=?", (created, modified))
+            self.conn.commit()
+            with patch.object(scan, "compute_image_hashes", side_effect=AssertionError("rehashed")), \
+                    patch.object(scan, "extract_nai_prompt", side_effect=AssertionError("reparsed")):
+                stats = self.scan()
+            self.assertEqual(self.counts(stats), {"seen": 1, "queued": 1, "indexed": 1})
+            row = self.row(path)
+            self.assertEqual((row["created_ns"], row["modified_ns"]), (stat.st_ctime_ns, stat.st_mtime_ns))
+        self.assertEqual(tuple(db.fetch_hash_row(self.conn, image_id)), hashes)
+        self.assertEqual(tuple(self.conn.execute("SELECT * FROM image_prompts").fetchone()), prompt)
 
-    def test_store_full_success_and_decode_failure_for_existing_moves(self):
-        image_id = self.record(self.root / "old.png")
-        stats = scan.ScanStats()
-        result = self.result(self.root / "new.png", existing_image_id=image_id, moved=True,
-                             had_existing_hashes=True)
-        scan._store_result(self.conn, result, ScanConfig(prompt_index=False, batch_size=0), stats)
-        self.assertEqual((stats.indexed, stats.moved), (1, 1))
-        self.assertIsNotNone(db.fetch_hash_row(self.conn, image_id))
-        failed = dataclasses.replace(result, path=self.root / "failed.png", decode_error="broken", hashes={})
-        scan._store_result(self.conn, failed, ScanConfig(prompt_index=False), stats)
-        self.assertEqual((stats.failed, stats.moved), (1, 2))
+    def test_corrupt_file_is_reported_and_not_decoded_again_until_it_changes(self):
+        path = self.root / "broken.png"
+        path.write_bytes(b"broken forever")
+        stats = self.scan()
+        self.assertEqual(self.counts(stats), {"seen": 1, "queued": 1, "failed": 1})
+        row = self.row(path)
+        self.assertTrue(row["decode_error"].startswith("UnidentifiedImageError:"))
+        self.assertEqual(row["sha256"], scan.sha256_file(path))
+        [failure] = iter_failures(self.conn)
+        self.assertEqual(failure["path"], str(path))
+        self.assertTrue(failure["decode_error"].startswith(row["decode_error"]))
+
+        with patch.object(scan, "compute_image_hashes", side_effect=AssertionError("decoded twice")):
+            self.assertEqual(self.counts(self.scan(crop_index=True)), {"seen": 1, "skipped": 1})
+            refreshed = self.scan(reindex_prompts=True)
+        self.assertEqual(self.counts(refreshed), {"seen": 1, "queued": 1, "indexed": 1})
+        self.assertEqual(self.row(path)["decode_error"], row["decode_error"])
+
+        path.write_bytes(b"different broken contents")
+        self.assertEqual(self.scan().failed, 1)
+        self.assertEqual(self.count("images"), 1)
+
+    def test_image_overwritten_with_corrupt_bytes_drops_stale_hashes(self):
+        path = self.image("image.png")
+        self.scan(crop_index=True)
+        image_id = self.row(path)["id"]
+        self.assertGreater(self.count("hash_bands", "image_id=?", (image_id,)), 0)
+        self.assertGreater(self.count("crop_hashes", "image_id=?", (image_id,)), 0)
+        path.write_bytes(b"truncated download")
+        stats = self.scan(prompt_index=False)
+        self.assertEqual(self.counts(stats), {"seen": 1, "queued": 1, "failed": 1})
+        row = self.row(path)
+        self.assertEqual(row["id"], image_id)
+        self.assertIsNotNone(row["decode_error"])
         self.assertIsNone(db.fetch_hash_row(self.conn, image_id))
-        self.assertEqual(db.get_existing_image(self.conn, failed.path)["decode_error"], "broken")
-        # A newly encountered corrupt file records its own failure and prompt status.
-        scan._store_result(self.conn, self.result(self.root / "corrupt.png", decode_error="bad", hashes={}),
-                           ScanConfig(), stats)
-        self.assertEqual(stats.failed, 2)
+        self.assertEqual(self.count("hash_bands", "image_id=?", (image_id,)), 0)
+        self.assertEqual(self.count("crop_hashes", "image_id=?", (image_id,)), 0)
+        self.assertEqual(db.fetch_stats(self.conn)["hashed"], 0)
 
-    def test_hash_task_errors_keep_precomputed_sha_or_handle_missing_file(self):
-        path = self.root / "bad.png"
-        path.write_bytes(b"not an image")
-        result = scan._hash_task(self.task(path, precomputed_sha256=b"cached"), 32, 32, False, False, False)
-        self.assertEqual(result.sha256, b"cached")
-        self.assertIn("UnidentifiedImageError", result.decode_error)
-        result = scan._hash_task(self.task(path), 32, 32, False, False, False)
-        self.assertIsNotNone(result.sha256)
-        path.unlink()
-        result = scan._hash_task(self.task(path), 32, 32, False, False, False)
-        self.assertIsNone(result.sha256)
-        self.assertIn("FileNotFoundError", result.decode_error)
+    def test_too_small_failure_retries_only_when_new_minimums_allow_it(self):
+        path = self.image("small.png", size=(40, 40))
+        self.assertEqual(self.scan(min_width=64, min_height=64).failed, 1)
+        self.assertEqual(self.row(path)["decode_error"], "ImageTooSmallError: image is too small: 40x40")
+        with patch.object(scan, "compute_image_hashes", side_effect=AssertionError("still too small")):
+            self.assertEqual(self.scan(min_width=32, min_height=64).skipped, 1)
+        self.assertEqual(self.scan(min_width=32, min_height=32).indexed, 1)
+        self.assertEqual(self.count("hashes"), 1)
+        self.assertIsNone(self.row(path)["decode_error"])
 
-    def test_moved_candidates_respect_roots_known_paths_and_ambiguity(self):
-        path = self.image()
-        present = self.record(path, size_bytes=2, sha256=b"present")
-        missing = self.record(self.root / "missing.png", size_bytes=2, sha256=b"missing")
-        outside = self.record(self.root.parent / "elsewhere.png", size_bytes=3, sha256=b"outside")
-        candidates = scan._missing_hash_candidates(self.conn)
-        self.assertEqual(candidates, {2: {b"missing": [missing]}, 3: {b"outside": [outside]}})
-        self.assertEqual(scan._missing_hash_candidates(self.conn, known_paths={str(path)}, roots=[self.root]),
-                         {2: {b"missing": [missing]}})
-        self.assertIsNone(scan._claim_moved_image(path, 99, candidates))
-        with patch.object(scan, "sha256_file", return_value=b"missing"):
-            cache = {}
-            ambiguous = {2: {b"missing": [present, missing]}}
-            self.assertIsNone(scan._claim_moved_image(path, 2, ambiguous, precomputed_hashes=cache))
-            self.assertEqual(cache[path], b"missing")
-            unique = {2: {b"missing": [missing], b"other": [outside]}}
-            self.assertEqual(scan._claim_moved_image(path, 2, unique), missing)
-            self.assertEqual(unique, {2: {b"other": [outside]}})
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: -1)() == 0, "root ignores file permissions")
+    def test_unreadable_file_is_retried_after_access_returns(self):
+        path = self.image("locked.png")
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o644)
+        stats = self.scan()
+        self.assertEqual(self.counts(stats), {"seen": 1, "queued": 1, "failed": 1})
+        row = self.row(path)
+        self.assertTrue(row["decode_error"].startswith("PermissionError:"))
+        self.assertIsNone(row["sha256"])
+        path.chmod(0o644)
+        stats = self.scan()
+        self.assertEqual(self.counts(stats), {"seen": 1, "queued": 1, "indexed": 1})
+        row = self.row(path)
+        self.assertIsNone(row["decode_error"])
+        self.assertEqual(row["sha256"], scan.sha256_file(path))
+        self.assertEqual(list(iter_failures(self.conn)), [])
 
-    def test_store_prompt_category_conflicts_and_metadata_limit(self):
-        image_id = self.record(self.root / "image.png")
-        parsed = PromptResult("cat", "test", None, model_type="sd", model_hash="ABCDEF",
-                              model_identity="custom", tags=("", "cat", "cat", "@model:sd", "@model:custom abcdef"),
-                              raw_metadata="small")
-        result = self.result(self.root / "image.png", prompt_result=parsed)
-        scan._store_prompt(self.conn, image_id, result, "now")
-        row = self.conn.execute("SELECT * FROM image_prompts").fetchone()
-        self.assertEqual(row["model_identity"], "custom abcdef")
-        rows = self.conn.execute("SELECT tag_kind FROM prompt_tags ORDER BY position").fetchall()
-        self.assertEqual([row[0] for row in rows], ["prompt", "model_type", "model_identity", "model_hash"])
-        # Reusing a model identity/hash is deduplicated without creating a
-        # second metadata tag, including when the earlier tag was not a prompt.
-        parsed = dataclasses.replace(parsed, model_hash="sd", model_identity="sd", tags=("cat",))
-        scan._store_prompt(self.conn, image_id, dataclasses.replace(result, prompt_result=parsed), "later")
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prompt_tags WHERE tag_norm='@model:sd'").fetchone()[0], 1)
-        with patch.object(scan, "encode_prompt_metadata", side_effect=ValueError("too big")):
-            scan._store_prompt(self.conn, image_id, result, "later")
-        row = self.conn.execute("SELECT prompt_status, prompt_error, raw_metadata FROM image_prompts").fetchone()
-        self.assertEqual(tuple(row), ("prompt_metadata_too_large", "prompt_metadata_too_large", None))
-        minimal = PromptResult("cat", "test", None, tags=("cat",))
-        scan._store_prompt(self.conn, image_id, dataclasses.replace(result, prompt_result=minimal), "minimal")
-        self.assertIsNone(self.conn.execute("SELECT model_identity FROM image_prompts").fetchone()[0])
+    def test_vanished_file_between_listing_and_stat_is_counted_as_failure(self):
+        kept = self.image("kept.png")
+        vanished = self.root / "vanished.png"
+        with patch.object(scan, "iter_image_paths", return_value=[vanished, kept]):
+            stats = self.scan()
+        self.assertEqual(self.counts(stats), {"seen": 2, "queued": 1, "indexed": 1, "failed": 1})
+        self.assertIsNone(self.row(vanished))
+
+    def test_delete_missing_removes_only_records_and_related_rows(self):
+        gone = self.image("gone.png", 1)
+        kept = self.image("kept.png", 2)
+        nested = self.image("folder/nested.png", 3)
+        self.scan()
+        ids = {path: self.row(path)["id"] for path in (gone, kept, nested)}
+        self.conn.execute("INSERT INTO matches(image_id_a,image_id_b,score,decision,created_at) "
+                          "VALUES(?,?,90,'strong_duplicate','now')", (ids[gone], ids[kept]))
+        self.conn.executemany("INSERT INTO clusters VALUES(1,?,?)", ((ids[gone], 1), (ids[kept], 0)))
+        self.conn.commit()
+        gone.unlink()
+        nested.unlink()
+        (self.root / "folder").rmdir()
+        (self.root / "folder").write_text("a file replaced the folder")
+
+        self.assertEqual(self.scan().deleted, 0)
+        self.assertEqual(self.count("images"), 3)
+        stats = self.scan(delete_missing=True)
+        self.assertEqual(stats.deleted, 2)
+        self.assertEqual([row[0] for row in self.conn.execute("SELECT path FROM images")], [str(kept)])
+        self.assertEqual((self.count("matches"), self.count("clusters"), self.count("hashes")), (0, 0, 1))
+        self.assertTrue(kept.exists())
+        self.assertEqual(db.fetch_stats(self.conn)["indexed"], 1)
+
+    def test_crop_index_state_tracks_completeness_across_scans(self):
+        large = self.image("a/large.png", 1)
+        self.image("a/small.png", 2, (40, 40))
+        self.scan()
+        self.assertEqual(db.get_crop_index_state(self.conn), "disabled")
+        self.assertEqual(self.count("crop_hashes"), 0)
+
+        stats = self.scan(crop_index=True)
+        self.assertEqual(self.counts(stats), {"seen": 2, "queued": 1, "indexed": 1, "skipped": 1})
+        self.assertEqual(db.get_crop_index_state(self.conn), "ready")
+        self.assertEqual(db.fetch_stats(self.conn)["crop_ready"], 1)
+        self.assertIn("crop:center_50", db.fetch_crop_hashes(self.conn, self.row(large)["id"]))
+        self.assertEqual(self.counts(self.scan(crop_index=True)), {"seen": 2, "skipped": 2})
+        self.scan()
+        self.assertEqual(db.get_crop_index_state(self.conn), "ready")
+
+        added = self.image("b/added.png", 3)
+        self.scan()
+        self.assertEqual(db.get_crop_index_state(self.conn), "incomplete")
+        self.assertFalse(db.is_crop_index_ready(self.conn))
+        self.scan(self.root / "a", crop_index=True)
+        self.assertEqual(db.get_crop_index_state(self.conn), "incomplete")
+        self.scan(crop_index=True)
+        self.assertEqual(db.get_crop_index_state(self.conn), "ready")
+        self.assertTrue(db.fetch_crop_hashes(self.conn, self.row(added)["id"]))
+
+        db.set_crop_index_state(self.conn, "building")
+        self.conn.commit()
+        self.scan()
+        self.assertEqual(db.get_crop_index_state(self.conn), "incomplete")
+
+    def test_prompt_index_can_be_skipped_and_backfilled_without_rehashing(self):
+        path = self.image("image.png")
+        self.scan(prompt_index=False)
+        self.assertEqual(self.count("hashes"), 1)
+        self.assertEqual(self.count("image_prompts"), 0)
+        with patch.object(scan, "compute_image_hashes", side_effect=AssertionError("rehashed")):
+            self.assertEqual(self.counts(self.scan(prompt_index=False)), {"seen": 1, "skipped": 1})
+            stats = self.scan()
+        self.assertEqual(self.counts(stats), {"seen": 1, "queued": 1, "indexed": 1})
+        prompt = self.conn.execute("SELECT model_type, prompt_error FROM image_prompts WHERE image_id=?",
+                                   (self.row(path)["id"],)).fetchone()
+        self.assertEqual(tuple(prompt), ("no_metadata", "no_metadata"))
+
+    def test_exact_file_model_rule_does_not_label_its_sibling(self):
+        first = self.image("first.png", 1)
+        second = self.image("second.png", 2)
+        configuration = ModelPathConfig((make_rule(first, "Only first"),))
+
+        stats = self.scan(model_paths=configuration)
+
+        self.assertEqual((stats.indexed, stats.failed), (2, 0))
+        labels = dict(self.conn.execute(
+            "SELECT i.path,ip.configured_model FROM images i JOIN image_prompts ip ON ip.image_id=i.id"))
+        self.assertEqual(labels, {str(first): "Only first", str(second): None})
+        labelled_ids = [row[0] for row in self.conn.execute(
+            "SELECT image_id FROM prompt_tags WHERE tag='@model:Only first'")]
+        self.assertEqual(labelled_ids, [self.row(first)["id"]])
+
+    def test_replacing_a_rule_id_with_the_same_label_preserves_tags_without_reparsing(self):
+        path = self.image("image.png")
+        original = make_rule(self.root, "Custom")
+        self.scan(model_paths=ModelPathConfig((original,)))
+        image_id = self.row(path)["id"]
+        tags = [tuple(row) for row in self.conn.execute("SELECT * FROM prompt_tags ORDER BY position")]
+        replacement = make_rule(self.root, "Custom", str(uuid.uuid4()))
+
+        with patch.object(scan, "extract_nai_prompt", side_effect=AssertionError("reparsed")), \
+                patch.object(scan, "compute_image_hashes", side_effect=AssertionError("rehashed")):
+            stats = self.scan(model_paths=ModelPathConfig((replacement,)))
+
+        self.assertEqual((stats.indexed, stats.skipped, stats.failed), (0, 1, 0))
+        assigned = self.conn.execute(
+            "SELECT configured_model,model_config_root,model_config_rule_id FROM image_prompts WHERE image_id=?",
+            (image_id,)).fetchone()
+        self.assertEqual(tuple(assigned), ("Custom", str(self.root), replacement.rule_id))
+        self.assertEqual([tuple(row) for row in self.conn.execute("SELECT * FROM prompt_tags ORDER BY position")], tags)
+        self.assertEqual([row.image_row["id"] for row in query_prompt_tags(self.conn, "@model:Custom")], [image_id])
+
+    def test_parallel_scan_keeps_submission_bounded(self):
+        paths = [self.image(f"{index}.png", index) for index in range(7)]
+        executors = []
+
+        class RecordingExecutor(ThreadPoolExecutor):
+            def __init__(inner, *, max_workers, mp_context):
+                self.assertEqual(mp_context.get_start_method(), "spawn")
+                super().__init__(max_workers=max_workers)
+                inner.outstanding = inner.peak = 0
+                executors.append(inner)
+
+            def submit(inner, function, *args):
+                inner.outstanding += 1
+                inner.peak = max(inner.peak, inner.outstanding)
+                future = super().submit(function, *args)
+                result = future.result
+
+                def collected(*result_args, **result_kwargs):
+                    inner.outstanding -= 1
+                    return result(*result_args, **result_kwargs)
+
+                future.result = collected
+                return future
+
+        with patch.object(scan, "ProcessPoolExecutor", RecordingExecutor):
+            stats = scan.scan_roots(self.conn, [self.root], config=ScanConfig(workers=2),
+                                    model_paths=ModelPathConfig())
+        self.assertEqual(self.counts(stats), {"seen": 7, "queued": 7, "indexed": 7})
+        self.assertEqual((len(executors), executors[0].peak, executors[0].outstanding), (1, 4, 0))
+        self.assertEqual(self.count("hashes"), 7)
+        self.assertTrue(all(self.row(path)["sha256"] for path in paths))
+
+
+class ScanPromptPersistenceTests(ScanTestCase):
+    def attach_metadata(self, path, fields):
+        metadata = PngInfo()
+        for key, value in fields.items():
+            metadata.add_text(key, value)
+        with Image.open(path) as image:
+            pixels = image.copy()
+        pixels.save(path, pnginfo=metadata)
+
+    def test_model_tags_colliding_with_prompt_text_keep_their_metadata_type(self):
+        for index, category in enumerate(("sd", "Cool Mix abc123")):
+            with self.subTest(category=category):
+                path = self.image(f"collision-{index}.png", seed=index)
+                self.attach_metadata(path, {"parameters":
+                    f"cat, @model:{category}\nNegative prompt: dog\n"
+                    "Steps: 20, Model: Cool Mix, Model hash: ABC123"})
+                configuration = (ModelPathConfig() if category == "sd" else
+                                 ModelPathConfig((make_rule(path, category),)))
+
+                stats = self.scan(path, model_paths=configuration)
+
+                self.assertEqual((stats.indexed, stats.failed), (1, 0))
+                image_id = self.row(path)["id"]
+                prompt = self.conn.execute(
+                    "SELECT model_identity FROM image_prompts WHERE image_id=?", (image_id,)).fetchone()
+                self.assertEqual(prompt["model_identity"], "Cool Mix abc123")
+                tags = dict(self.conn.execute(
+                    "SELECT tag,tag_kind FROM prompt_tags WHERE image_id=?", (image_id,)))
+                expected = {"cat": "prompt", "@model:abc123": "model_hash"}
+                if category == "sd":
+                    expected.update({"@model:sd": "model_type", "@model:Cool Mix abc123": "model_identity"})
+                else:
+                    expected["@model:Cool Mix abc123"] = "model_config"
+                self.assertEqual(tags, expected)
+                found = query_prompt_tags(self.conn, f"cat, @model:{category}", model_type=category)
+                self.assertEqual([row.image_row["id"] for row in found], [image_id])
+
+    def test_metadata_expanding_past_storage_limit_keeps_searchable_tags_and_reports_failure(self):
+        oversized = self.image("oversized.png")
+        comment = json.dumps({"prompt": "cat", "uc": "x" * (db.MAX_PROMPT_METADATA_BYTES - 40)},
+                             separators=(",", ":"))
+        # Each source chunk is legal, but including the Software and Source
+        # fields in the stored JSON pushes the combined metadata over the limit.
+        self.assertLess(len(comment.encode()), db.MAX_PROMPT_METADATA_BYTES)
+        self.attach_metadata(oversized, {"Software": "NovelAI", "Source": "NovelAI Diffusion V3 ABC123",
+                                         "Comment": comment})
+        kept = self.image("small.png", seed=2)
+        self.attach_metadata(kept, {"parameters": "dog\nSteps: 20, Model hash: abc123"})
+
+        stats = self.scan()
+
+        self.assertEqual((stats.indexed, stats.failed), (2, 0))
+        row = self.conn.execute(
+            "SELECT prompt,prompt_error,prompt_status,raw_metadata,raw_metadata_codec FROM image_prompts WHERE image_id=?",
+            (self.row(oversized)["id"],)).fetchone()
+        self.assertEqual(tuple(row), ("cat", "prompt_metadata_too_large", "prompt_metadata_too_large", None, None))
+        self.assertEqual([item.image_row["id"] for item in query_prompt_tags(self.conn, "cat")], [self.row(oversized)["id"]])
+        self.assertEqual([item.image_row["id"] for item in query_prompt_tags(self.conn, "dog")], [self.row(kept)["id"]])
+        [failure] = iter_failures(self.conn)
+        self.assertEqual(failure["path"], str(oversized))
+        self.assertIn("prompt_metadata_too_large", failure["decode_error"])
 
 
 class OptionalProgressTests(unittest.TestCase):
@@ -268,9 +410,22 @@ class OptionalProgressTests(unittest.TestCase):
         with patch("builtins.__import__", side_effect=without_tqdm):
             namespace = runpy.run_path(str(Path(scan.__file__)), run_name="imgdupe._scan_without_tqdm",
                                        init_globals={"__package__": "imgdupe"})
-        empty = namespace["tqdm"]()
-        self.assertEqual(list(empty), [])
-        progress = namespace["tqdm"]([1, 2], desc="ignored", total=2)
-        self.assertEqual(list(progress), [1, 2])
-        self.assertIsNone(progress.update())
-        self.assertIsNone(progress.close())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = write_image(root / "image.png")
+            with closing(db.connect(root / "index.sqlite")) as conn:
+                db.init_db(conn)
+                for workers in (1, 2):
+                    with self.subTest(workers=workers):
+                        # The fallback is used for both iteration and manual progress.
+                        # Threads keep the loaded module's function local to this test.
+                        with patch.dict(namespace["scan_roots"].__globals__, {
+                            "ProcessPoolExecutor": lambda max_workers, mp_context:
+                                ThreadPoolExecutor(max_workers=max_workers),
+                        }):
+                            stats = namespace["scan_roots"](
+                                conn, [root], config=ScanConfig(workers=workers, reindex_prompts=True),
+                                model_paths=ModelPathConfig())
+                        self.assertEqual((stats.indexed, stats.failed), (1, 0))
+                        self.assertEqual(db.get_existing_image(conn, path)["sha256"], scan.sha256_file(path))
+                        self.assertEqual(db.fetch_stats(conn)["hashed"], 1)

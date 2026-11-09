@@ -33,28 +33,26 @@ class Mutation:
 
 MUTATIONS = (
     Mutation(
-        "unique-tags-deduplication", "web",
-        "FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags",
-        "FROM (SELECT tag_norm FROM prompt_tags) tags",
+        "unique-tags-deduplication", "db",
+        'SELECT unique_tags FROM collection_stats',
+        'SELECT COALESCE(SUM(count),0) FROM tag_stats',
         "Repeated occurrences must contribute only one distinct visible tag.",
     ),
     Mutation(
-        "unique-tags-model-visibility", "web",
-        "WHERE pt.tag_norm = tags.tag_norm\n"
-        "              AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)",
-        "WHERE pt.tag_norm = tags.tag_norm\n"
-        "              AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NULL)",
+        "unique-tags-model-visibility", "db",
+        "AND NOT({row}.tag_kind='model_type' AND s.configured_model IS NOT NULL)",
+        "AND NOT({row}.tag_kind='model_type' AND s.configured_model IS NULL)",
         "Configured labels suppress detected model tags, including empty non-NULL labels.",
     ),
     Mutation(
-        "unique-tags-existential-witness", "web",
-        "FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags\n        WHERE EXISTS (",
-        "FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags\n        WHERE NOT EXISTS (",
+        "unique-tags-existential-witness", "db",
+        "s.image_id={row}.image_id AND s.has_prompt_row AND NOT",
+        "s.image_id={row}.image_id AND NOT s.has_prompt_row AND NOT",
         "A name counts when at least one occurrence has a visible prompt-row witness.",
     ),
     Mutation(
         "web-upload-trailing-crlf", "web",
-        'content = content[:-2]', 'content = content',
+        'content = content.removesuffix(b"\\r\\n")', 'content = content',
         "Multipart framing CRLF must be removed without altering uploaded image bytes.",
     ),
     Mutation(
@@ -101,7 +99,7 @@ MUTATIONS = (
     ),
     Mutation(
         "scan-ambiguous-move", "scan",
-        'if len(image_ids) != 1:', 'if len(image_ids) < 1:',
+        'if found is not None:', 'if False and found is not None:',
         "Identical missing files are ambiguous and must not be claimed as one moved image.",
     ),
     Mutation(
@@ -124,7 +122,7 @@ MUTATIONS = (
     ),
     Mutation(
         "parser-zero-mix-weight", "nai_prompt",
-        'if float(weight) <= 0:', 'if float(weight) < 0:',
+        'if float(weight.translate(NUMERIC_TRANSLATION)) <= 0:', 'if float(weight.translate(NUMERIC_TRANSLATION)) < 0:',
         "Zero-weight NovelAI segments must not enter the searchable positive prompt.",
     ),
     Mutation(
@@ -212,8 +210,8 @@ MUTATIONS = (
     ),
     Mutation(
         "review-match-membership-both-endpoints", "review",
-        'AND m.image_id_b IN (SELECT image_id FROM {membership})',
-        'AND m.image_id_a IN (SELECT image_id FROM {membership})',
+        'WHERE other.image_id = m.image_id_b)',
+        'WHERE other.image_id = m.image_id_a)',
         "Cluster review must exclude matches with either endpoint outside the selected cluster.",
     ),
     Mutation(
@@ -248,6 +246,121 @@ MUTATIONS = (
         'return min(matches, key=lambda rule: (_path_depth(rule.path), rule.rule_id))',
         "The deepest matching model-path rule overrides its ancestor rules.",
     ),
+    Mutation(
+        "query-model-parentheses-boundary", "query",
+        'character in "|｜" or (character == ")" and not depth)',
+        'character in "|｜()" or (character == ")" and not depth)',
+        "Legacy model names containing their own parentheses must remain one searchable term.",
+    ),
+    Mutation(
+        "query-matched-tags-lossless", "query",
+        'tuple(json.loads(row["matched_tags"] or "[]"))',
+        'tuple(",".join(json.loads(row["matched_tags"] or "[]")).split(","))',
+        "Matched metadata tags containing commas must survive result serialization intact.",
+    ),
+    Mutation(
+        "web-autocomplete-debounce-invalidation", "web",
+        '++suggestionRequest;\n        hideAllSuggestions();\n        suggestionTimer =',
+        '++suggestionRequest;\n        suggestionTimer =',
+        "Typing must hide stale selectable suggestions during the debounce delay.",
+    ),
+    Mutation(
+        "web-autocomplete-rendered-input-binding", "web",
+        'id="prompt-tags-input" name="tags"',
+        'id="renamed-prompt-input" name="tags"',
+        "Autocomplete must bind to the actual input rendered in the page.",
+    ),
+    Mutation(
+        "web-autocomplete-json-response-race", "web",
+        'const tags = await response.json();\n        if (request !== suggestionRequest || activePromptInput !== inputElement) return false;',
+        'const tags = await response.json();',
+        "A response finishing JSON decoding after a new request must not replace current suggestions.",
+    ),
+    Mutation(
+        "query-unknown-model-balanced-span", "query",
+        'best_end = _model_token_end(item, start, boundaries)',
+        'best_end = prefix_end',
+        "Unknown model names must keep balanced inner commas out of ordinary prompt terms.",
+    ),
+    Mutation(
+        "query-parenthesized-comma-groups", "query",
+        'item = _strip_query_group_parentheses(item.translate(separators), protected, model_depths)',
+        'item = item.translate(separators)',
+        "Whole and embedded comma-group wrappers must be removed before model placeholders expand.",
+    ),
+    Mutation(
+        'query-overlong-legacy-comma-span', 'query',
+        'elif (atom_end == prefix_end and best_end == atom_end and end > atom_end',
+        'elif (False and atom_end == prefix_end and best_end == atom_end and end > atom_end',
+        'An extended legacy comma model name must remain one metadata term instead of leaking prompt terms or a short model prefix.',
+    ),
+    Mutation(
+        'query-unfinished-legacy-model-stop', 'query',
+        'if stopping or (not depth and character != "("):',
+        'if not depth and character != "(":',
+        'EOF and OR inside parentheses must resolve the final legacy model span without leaking inner comma fragments.',
+    ),
+    Mutation(
+        'query-extended-model-qualifier', 'query',
+        r'return re.sub(r"(?:\(\s*)+", "(", name.rstrip(") "))',
+        r'return re.sub(r"(?:\(\s*)+", "(", name)',
+        'An unmatched extension inside a stored model qualifier must remain metadata, not comma-separated prompt constraints.',
+    ),
+    Mutation(
+        'query-nested-model-qualifier', 'query',
+        r'return re.sub(r"(?:\(\s*)+", "(", name.rstrip(") "))',
+        'return name.rstrip(") ")',
+        'Extra nested model qualifier openers must not expose inner comma fragments as prompt constraints.',
+    ),
+    Mutation(
+        'query-inner-pipe-parenthesis-context', 'query',
+        'openings.extend((-1, False) for _ in range(model_ends[index]))',
+        'openings.extend((-1, False) for _ in range(0))',
+        'Model parentheses cut by an inner pipe must consume their own literal closers before an enclosing group closes.',
+    ),
+    Mutation(
+        'query-model-inner-pipe', 'query',
+        'if character in "|｜":\n            return boundary.start()',
+        'if character in "|｜" and not depth:\n            return boundary.start()',
+        'Both pipe operators must end the initial model span at every parenthesis depth.',
+    ),
+    Mutation(
+        'query-closed-group-suffix-boundary', 'query',
+        'separators.add(index)',
+        'wrappers.add(index)',
+        'Text following a closed model group must form its own term rather than attach to an internal marker.',
+    ),
+    Mutation(
+        'query-literal-marker-restoration', 'query',
+        'protected.sub(lambda match: literal_models[match.group()], normalized_term)',
+        'normalized_term',
+        'Internal markers inside literal qualifiers must restore the typed text instead of becoming database search terms.',
+    ),
+    Mutation(
+        'web-escape-cancels-suggestions', 'web',
+        'event.key === "Escape") {{\n            dismissSuggestions();',
+        'event.key === "Escape") {{\n            hideSuggestions(suggestionsElement);',
+        'Escape must cancel debounce/fetch and invalidate late JSON, not just hide the current menu.',
+    ),
+    Mutation(
+        'web-outside-click-cancels-suggestions', 'web',
+        'if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) dismissSuggestions();',
+        'if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) hideAllSuggestions();',
+        'Clicking outside must cancel pending suggestion work so dismissed results cannot reopen.',
+    ),
+    Mutation(
+        'scan-move-refreshes-path-label', 'scan',
+        'if result.moved and not config.prompt_index:',
+        'if False and result.moved and not config.prompt_index:',
+        'A moved image must reflect destination path labels immediately even when prompt extraction is disabled.',
+    ),
+    Mutation(
+        'parser-nai3-unicode-mix-weight', 'nai_prompt',
+        'TRAILING_MIX_WEIGHT = re.compile(r"(?s)^(.*?):([+\\-－−]?\\d+(?:[.．]\\d+)?)\\s*$")',
+        'TRAILING_MIX_WEIGHT = re.compile(r"(?s)^(.*?):([+\\-]?\\d+(?:\\.\\d+)?)\\s*$")',
+        'Unicode minus and decimal weight syntax must exclude negative/zero NAI3 mix segments without altering literal tag text.',
+    ),
+
 )
 
 
@@ -300,8 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
         for directory in ("imgdupe", "tests"):
             shutil.copytree(repository / directory, workspace / directory, ignore=ignored)
-        (workspace / "scripts").mkdir()
-        shutil.copy2(repository / "scripts" / "compare_reference_prompt_tags.py", workspace / "scripts")
+        shutil.copytree(repository / "scripts", workspace / "scripts", ignore=ignored)
         shutil.copy2(repository / "settings.ini", workspace / "settings.ini")
 
         # Verify the package location in the same isolated environment used by

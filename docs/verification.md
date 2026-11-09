@@ -1,5 +1,177 @@
 # Verification results
 
+## Grouped inner OR and nested qualifiers, 2026-11-09
+
+Addressed both blockers in the latest review of PR #5 head `a1691ea`. Protected
+model spans now carry their unmatched parenthesis depth into group processing.
+Closers after an inner pipe remain literal text until those model openers are
+balanced; enclosing structural query groups then close on their own parentheses.
+Continuation matching also compares qualifier prefixes with redundant nested
+openers normalized, without changing exact matches for fully stored names.
+
+The regressions fail before the fixes and pass afterward. Cases cover both pipe
+operators, one to three enclosing groups, one or two model-parenthesis levels,
+negative and match-any searches, and nested/spaced/fullwidth comma continuations.
+The full suite runs **365 tests**, with two optional corpus skips, at **100%
+statements and branches**: 3,540 statements and 1,100 branches, without exclusions.
+Two new semantic faults restore the reported bugs; the curated set contains 57
+faults. All **12/12 relevant model-query mutations** are rejected by assertions
+on the 365-test baseline, with no survivors, test errors or timeouts. The prior
+full 52-fault result remains recorded below.
+
+Logs are retained locally under the ignored
+`performance-results/model-context-review-2026-11-09/` directory.
+
+## Extended qualifiers and inner OR operators, 2026-11-09
+
+Fixed the two query blockers reported against PR #5 head `f8f4684`. An unmatched
+extension before a stored model qualifier's closing parenthesis stays in one
+metadata term instead of becoming comma-separated prompt constraints. Both `|`
+and `｜` end the initial model span at any parenthesis depth, so the following
+text remains an independent OR alternative even without a stored left-hand name.
+
+The web benchmark now rejects existing non-file output paths before loading its
+fixture, creating output directories, deleting thumbnails or starting a server.
+API and CLI regressions preserve a real generated fixture's cached thumbnails
+when output is a directory, the cache itself, or a symlink to a directory. CLI
+validation returns usage error 2 without a traceback.
+
+The new regressions fail before their fixes and pass afterward. The full suite
+runs **364 tests**, with two optional corpus skips, at **100% statements and
+branches**: 3,535 statements and 1,100 branches, without exclusions. Two new
+semantic mutations restore the qualifier and inner-pipe bugs; the curated set
+now contains 55 faults. All **10/10 relevant model-query mutations** are rejected
+by assertions on the 364-test baseline, with no survivors, test errors or
+timeouts. The previous full 52-fault result remains recorded below.
+
+Logs are retained locally under the ignored
+`performance-results/qualified-model-review-2026-11-09/` directory.
+
+## Unfinished legacy model query follow-up, 2026-11-08
+
+Fixed the re-review blocker against PR #5 head `9ad5190`. The legacy model-name
+scan now checks its final span at EOF or an explicit OR operator even while
+parentheses remain open. An extended comma-containing name cannot fall back to
+a short model prefix and leak its remaining comma fragments into prompt terms.
+Explicit OR alternatives and fully stored unfinished names retain exact matches.
+
+The regression fails before the fix and passes afterward for the reported cases,
+nested parentheses and fullwidth separators, including negative and match-any
+searches. The full suite runs **361 tests**, with two optional corpus skips, at
+**100% statements and branches**: 3,533 statements and 1,098 branches, without
+exclusions. A new curated mutation restores the faulty stopping-point check;
+all **8/8 relevant model-query mutations** are rejected by assertions on the
+361-test baseline, with no survivors, test errors or timeouts. The mutation set
+now contains 53 faults; the previous full 52-fault run remains recorded below.
+
+Validation logs are retained locally under the ignored
+`performance-results/model-stop-review-2026-11-08/` directory.
+
+## Independent-review fixes, 2026-11-08
+
+Fixed the follow-up model-query blockers and autocomplete dismissal race, plus
+the four validated findings from the SWE-2 Flash review experiment. Extended
+legacy comma names remain one metadata term; structural closing parentheses
+finish model terms before following text or groups. Internal markers expand only
+as complete tokens and are restored inside literal prompt qualifiers. Escape and
+outside clicks cancel debounce, abort fetches and invalidate late JSON responses.
+
+NAI3 mix weights recognize Unicode minus and fullwidth number/decimal syntax
+without changing literal tag text. Moved images reconcile existing path-derived
+labels during the first scan with prompt extraction disabled, preserving prompt
+content, other tags and hashes. Benchmark charts define all six cycled colors;
+both benchmark CLIs reject file output paths with usage error 2 before fixture
+or output changes.
+
+The full suite runs **360 tests**, with the same two optional reference-corpus
+skips, and reaches **100% statements and branches**: 3,532 statements and 1,098
+branches, without exclusions. Regression cases failed before their fixes, then
+passed. The curated mutation set now contains 52 faults, including the new parser,
+dismissal, move-label and Unicode-weight regressions. The manual workflow keeps
+the 100% gate and has a 30-minute budget for the expanded full-suite mutation run.
+No GitHub workflow was launched.
+
+Logs are retained locally under the ignored
+`performance-results/independent-review-fixes-2026-11-08/` directory. Historical
+review and experiment reports describe the snapshots they originally tested.
+
+## Model query review follow-up, 2026-11-08
+
+Fixed the two model-query blockers reported against PR #4 head
+`7417664fcca59abb92067b243962e34a608e5fef`. Unknown or longer parenthesized model
+names now remain single metadata terms instead of leaking inner comma fragments
+into ordinary prompt searches. Balanced structural wrappers are removed before
+comma splitting, including nested and embedded groups. Exact model-name matching
+still requires explicit separators before separate tags.
+
+The regressions reproduced failures before the fix. The final suite runs
+**349 tests**, with the same two optional reference-corpus skips, at **100%
+statements and branches**: 3,517 statements and 1,088 branches, without exclusions.
+A bounded-work regression also checks that a model term containing 1,000 inner
+comma fragments is not repeatedly normalized at every fragment.
+
+Logs are retained locally under the ignored
+`performance-results/model-query-review-2026-11-08/` directory.
+
+## Behavioral test audit, 2026-11-08
+
+Reviewed the interrupted draft tests and every unchanged test module against the
+intended app behavior. The [per-module audit](test-audit.md) records replacements,
+retained contracts, source simplifications and the limits of the test boundaries.
+
+The final suite runs **344 tests**, with two optional reference-corpus skips, and
+reaches **100% statements and branches**: 3,489 statements and 1,072 branches,
+with no exclusions, missing statements or partial branches. The existing 100%
+coverage gate remains in `pyproject.toml` and the manual verification workflow.
+Validation used Linux, Python 3.14.4, SQLite 3.46.1, Pillow 13.0.0, coverage.py
+7.17.2 and Node.js 24.21.0. The workflow provisions Node.js 22 for rendered
+JavaScript behavior checks; local tests require Node.js 18 or newer.
+
+All **43/43 curated semantic mutations** are rejected by assertion failures,
+with no survivors, test errors or timeouts on the final 344-test baseline. This
+includes the original 38 faults (with move ambiguity retargeted to the active
+scanner) plus five additional model-name/autocomplete faults. Cardinality
+assertions prevent missing results from becoming accidental runtime-error kills.
+This is a curated check, not an exhaustive mutation score.
+
+The TLA+ checks also pass, including the intentionally invalid negative control:
+82,416 distinct states, 111,145 generated states, depth 9. The model and its
+bounded scope are unchanged. No GitHub workflow was launched.
+
+A broken thumbnail-cache link was converted from a print-only scratch finding
+into a regression: startup failed before the cache enumeration fix and passed
+afterward. The test also checks pruning and restored eviction order.
+
+Final test, coverage, mutation and formal logs are retained locally under the
+ignored `performance-results/test-audit-2026-11-08/` directory. Earlier sections
+below describe their corresponding historical suites and source revisions.
+
+## Performance changes, 2026-11-07
+
+The performance PR starts from main `ce47e444f5d056bc3f1e117e7cda37ffa5998020`.
+Local validation uses Python 3.13.15, SQLite 3.53.1 and coverage.py 7.17.2.
+The complete suite runs **290 tests**, with the same two optional corpus skips,
+and reaches **100% application statements and branches** (3,554 statements,
+1,120 branches), without exclusions.
+All **38/38 curated semantic mutations** are rejected by assertions (288-test
+isolated baseline); both review mutations were also rerun against the final
+290-test baseline. No mutant survived or failed merely with an import/runtime
+error. Validation logs and raw measurements are retained locally under the ignored
+`performance-results/2026-11-07-final/` directory, outside Git. The measured findings
+are summarized in [performance improvements](performance-improvements.md).
+
+New regressions exercise an actual spawned process pool from a background thread
+with a WAL connection open; inaccessible directories and move safety; failed-file
+recovery; bounded scan batches; low SQLite parameter limits; summary updates,
+rollback and migration; score equivalence; linear prompt parsing; atomic export
+and thumbnail failures; and concurrent HTTP requests with separate connections.
+
+The finite TLA+ visibility model still passes with its negative control. Its
+scope is now explicitly the reference visibility semantics; incremental trigger
+transitions are validated by SQLite tests, not claimed to be formally modeled.
+
+## Earlier verification baseline
+
 Validated locally on 2026-11-07, starting from PR #2 head
 `193e75c2ffc98c4ff30658b5d65db4ea45878e38`. Latest `origin/main` was fetched and
 confirmed to be an ancestor before implementation.

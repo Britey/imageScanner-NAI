@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import sqlite3
+import hashlib
+import json
+import multiprocessing
+import re
+from itertools import islice
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,9 +51,8 @@ from .hashing import compute_image_hashes, sha256_file
 from .model_paths import (
     DEFAULT_MODEL_PATHS_PATH,
     ModelPathConfig,
-    ModelPathRule,
     load_model_paths,
-    path_is_within,
+    lexical_path_is_within,
 )
 from .nai_prompt import (
     OTHER_MODEL_IDENTITY,
@@ -55,6 +60,7 @@ from .nai_prompt import (
     PromptResult,
     extract_nai_prompt,
     normalize_prompt_tag,
+    sanitize_model_name,
 )
 from .utils import iter_image_paths, utc_now_sql
 
@@ -134,42 +140,88 @@ def scan_roots(
     if model_paths.issues:
         details = "; ".join(f"{issue.section}: {issue.message}" for issue in model_paths.issues)
         raise ValueError(f"invalid model_paths.ini: {details}")
-    paths = list(iter_image_paths(roots))
-    tasks: list[ScanTask] = []
-    existing_rows = conn.execute("SELECT * FROM images").fetchall()
-    _refresh_model_config_assignments(conn, existing_rows, model_paths)
-    existing_by_path = {str(row["path"]): row for row in existing_rows}
-    existing_by_id = {int(row["id"]): row for row in existing_rows}
-    prompt_rows = {
-        int(row["image_id"]): row
-        for row in conn.execute(
-            """
-            SELECT image_id, model_type, parser_version, classification_root,
-                   configured_model, model_config_root, model_config_rule_id,
-                   classification_status
-            FROM image_prompts
-            """
-        ).fetchall()
-    }
-    center_crop_ids = (
-        {
-            int(row["image_id"])
-            for row in conn.execute(
-                "SELECT image_id FROM crop_hashes WHERE region = 'center_50'"
-            ).fetchall()
-        }
-        if config.crop_index
-        else set()
-    )
-    moved_candidates = _missing_hash_candidates(
-        conn,
-        known_paths={str(path) for path in paths},
-        roots=roots,
-    )
-    precomputed_hashes: dict[Path, bytes] = {}
-    model_rule_cache: dict[Path, ModelPathRule | None] = {}
+    roots = [root.resolve(strict=False) for root in roots]
+    directory_roots = [root for root in roots if root.is_dir()]
+    classification_roots = [root if root in directory_roots else root.parent for root in roots]
+    revision = hashlib.sha256(json.dumps(sorted(
+        (str(rule.path), rule.label, rule.rule_id) for rule in model_paths.rules
+    ), separators=(",", ":")).encode()).hexdigest()
+    previous = conn.execute("SELECT value FROM app_metadata WHERE key = 'model_config_revision'").fetchone()
+    if previous is None or previous[0] != revision:
+        _refresh_model_config_assignments(conn, _image_batches(conn), model_paths)
+        conn.execute("INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('model_config_revision', ?)",
+                     (revision,))
+    claimed_ids: set[int] = set()
+    tasks = _scan_tasks(conn, roots, directory_roots, classification_roots, config,
+                        model_paths, stats, claimed_ids)
+    if workers <= 1:
+        results = (
+            _hash_task(
+                task,
+                config.min_width,
+                config.min_height,
+                config.crop_index,
+                config.prompt_index,
+                config.stealth_prompt,
+            )
+            for task in tasks
+        )
+        iterator = tqdm(results, desc="Hashing images", unit="image")
+        for result in iterator:
+            _store_result(conn, result, config, stats, model_paths)
+            claimed_ids.discard(result.existing_image_id)
+    else:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
+            task_iterator = iter(tasks)
+            pending = set()
 
-    for path in tqdm(paths, desc="Checking images", unit="image"):
+            def submit_next() -> bool:
+                try:
+                    task = next(task_iterator)
+                except StopIteration:
+                    return False
+                pending.add(executor.submit(
+                    _hash_task,
+                    task,
+                    config.min_width,
+                    config.min_height,
+                    config.crop_index,
+                    config.prompt_index,
+                    config.stealth_prompt,
+                ))
+                return True
+
+            max_pending = max(workers, workers * 2)
+            for _ in range(max_pending):
+                if not submit_next():
+                    break
+            progress = tqdm(desc="Hashing images", unit="image")
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    result = future.result()
+                    _store_result(conn, result, config, stats, model_paths)
+                    claimed_ids.discard(result.existing_image_id)
+                    progress.update(1)
+                while len(pending) < max_pending and submit_next():
+                    pass
+            progress.close()
+
+    conn.commit()
+    if config.delete_missing:
+        stats.deleted = _delete_missing_images(conn)
+    _finish_crop_index_state(conn, config.crop_index)
+    conn.commit()
+    return stats
+
+
+def _scan_tasks(conn, roots, directory_roots, classification_roots, config, model_paths,
+                stats, claimed_ids):
+    def listing_error(_error):
+        stats.failed += 1
+
+    resolve_rule = _model_rule_resolver(model_paths)
+    for path, existing in _existing_paths(conn, iter_image_paths(roots, on_error=listing_error), model_paths):
         stats.seen += 1
         try:
             stat = path.stat()
@@ -179,32 +231,30 @@ def scan_roots(
         created_ns = _created_ns_from_stat(stat)
         modified_ns = stat.st_mtime_ns
 
-        existing = existing_by_path.get(str(path))
+        precomputed_sha256 = None
         moved_id = None
-        if existing is None and moved_candidates:
+        if existing is None and conn.execute(
+            "SELECT 1 FROM images WHERE size_bytes=? AND sha256 IS NOT NULL LIMIT 1",
+            (stat.st_size,),
+        ).fetchone() is not None:
             try:
-                moved_id = _claim_moved_image(
-                    path,
-                    stat.st_size,
-                    moved_candidates,
-                    precomputed_hashes=precomputed_hashes,
-                )
+                precomputed_sha256 = sha256_file(path)
+                existing = _find_moved_image(conn, precomputed_sha256, stat.st_size,
+                                             directory_roots, claimed_ids)
             except OSError:
                 stats.failed += 1
                 continue
-            if moved_id is not None:
-                existing = existing_by_id.get(moved_id)
+            if existing is not None:
+                moved_id = int(existing["id"])
+                claimed_ids.add(moved_id)
         existing_id = int(existing["id"]) if existing is not None else None
-        classification_root = _scan_root_for_path(path, roots)
-        model_rule = model_rule_cache.get(path.parent)
-        if path.parent not in model_rule_cache:
-            model_rule = model_paths.resolve(path)
-            model_rule_cache[path.parent] = model_rule
+        classification_root = _scan_root_for_path(path, classification_roots)
+        model_rule = resolve_rule(path)
         classification_status = "configured" if model_rule is not None else "unconfigured"
         configured_model = model_rule.label if model_rule is not None else None
         model_config_root = str(model_rule.path) if model_rule is not None else None
         model_config_rule_id = model_rule.rule_id if model_rule is not None else None
-        prompt_row = prompt_rows.get(existing_id) if existing_id is not None else None
+        prompt_row = existing if existing is not None and existing["prompt_image_id"] is not None else None
         classification_changed = prompt_row is None or any(
             (
                 prompt_row["classification_root"] != str(classification_root),
@@ -228,13 +278,14 @@ def scan_roots(
             existing is not None
             and (moved_id is not None or int(existing["size_bytes"]) == stat.st_size)
             and (moved_id is not None or int(existing["mtime_ns"]) == stat.st_mtime_ns)
-            and existing["decode_error"] is None
             and existing["missing_at"] is None
+            and _reusable_decode_result(existing["decode_error"], config.min_width, config.min_height)
             and (
-                not config.crop_index
+                existing["decode_error"] is not None
+                or not config.crop_index
                 or (existing["width"] is not None and int(existing["width"]) < 64)
                 or (existing["height"] is not None and int(existing["height"]) < 64)
-                or int(existing["id"]) in center_crop_ids
+                or existing["has_center_crop"]
             )
         )
         needs_date_update = (
@@ -251,104 +302,110 @@ def scan_roots(
             stats.skipped += 1
             continue
 
-        tasks.append(
-            ScanTask(
-                path=path,
-                size_bytes=stat.st_size,
-                mtime_ns=stat.st_mtime_ns,
-                created_ns=created_ns,
-                modified_ns=modified_ns,
-                had_existing_hashes=existing is not None,
-                prompt_only=unchanged_hashes and needs_prompt,
-                date_only=unchanged_hashes and (needs_date_update or moved_id is not None) and not needs_prompt,
-                existing_image_id=existing_id,
-                classification_root=str(classification_root),
-                configured_model=configured_model,
-                model_config_root=model_config_root,
-                model_config_rule_id=model_config_rule_id,
-                classification_status=classification_status,
-                precomputed_sha256=precomputed_hashes.get(path),
-                moved=moved_id is not None,
-            )
-        )
         stats.queued += 1
-
-    if not tasks:
-        if config.delete_missing:
-            stats.deleted = _delete_missing_images(conn)
-        _finish_crop_index_state(conn, config.crop_index)
-        conn.commit()
-        return stats
-
-    if workers <= 1:
-        results = (
-            _hash_task(
-                task,
-                config.min_width,
-                config.min_height,
-                config.crop_index,
-                config.prompt_index,
-                config.stealth_prompt,
-            )
-            for task in tasks
+        yield ScanTask(
+            path=path,
+            size_bytes=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            created_ns=created_ns,
+            modified_ns=modified_ns,
+            had_existing_hashes=existing is not None,
+            prompt_only=unchanged_hashes and needs_prompt,
+            date_only=unchanged_hashes and (needs_date_update or moved_id is not None) and not needs_prompt,
+            existing_image_id=existing_id,
+            classification_root=str(classification_root),
+            configured_model=configured_model,
+            model_config_root=model_config_root,
+            model_config_rule_id=model_config_rule_id,
+            classification_status=classification_status,
+            precomputed_sha256=precomputed_sha256,
+            moved=moved_id is not None,
         )
-        iterator = tqdm(results, total=len(tasks), desc="Hashing images", unit="image")
-        for result in iterator:
-            _store_result(conn, result, config, stats)
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            task_iterator = iter(tasks)
-            pending = set()
-
-            def submit_next() -> bool:
-                try:
-                    task = next(task_iterator)
-                except StopIteration:
-                    return False
-                pending.add(executor.submit(
-                    _hash_task,
-                    task,
-                    config.min_width,
-                    config.min_height,
-                    config.crop_index,
-                    config.prompt_index,
-                    config.stealth_prompt,
-                ))
-                return True
-
-            max_pending = max(workers, workers * 2)
-            for _ in range(min(max_pending, len(tasks))):
-                submit_next()
-            progress = tqdm(total=len(tasks), desc="Hashing images", unit="image")
-            while pending:
-                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    _store_result(conn, future.result(), config, stats)
-                    progress.update(1)
-                while len(pending) < max_pending and submit_next():
-                    pass
-            progress.close()
-
-    conn.commit()
-    if config.delete_missing:
-        stats.deleted = _delete_missing_images(conn)
-    _finish_crop_index_state(conn, config.crop_index)
-    conn.commit()
-    return stats
 
 
 def _scan_root_for_path(path: Path, roots: list[Path]) -> Path:
-    canonical = path.resolve(strict=False)
-    candidates: list[Path] = []
-    for supplied_root in roots:
-        supplied = supplied_root.resolve(strict=False)
-        scan_root = supplied if supplied.is_dir() else supplied.parent
-        try:
-            canonical.relative_to(scan_root)
-        except ValueError:
+    """Choose a classification root from the scanner's canonical directory paths."""
+    candidates = [root for root in roots if lexical_path_is_within(path, root)]
+    return max(candidates, key=lambda item: len(item.parts)) if candidates else path.parent
+
+
+def _model_rule_resolver(model_paths):
+    # File rules must not bleed into sibling files sharing a cached directory.
+    exact_rules = {rule.path: rule for rule in model_paths.rules}
+    resolve_directory = lru_cache(maxsize=4096)(
+        lambda directory: model_paths.resolve(directory, canonical=True)
+    )
+    return lambda path: exact_rules.get(path) or resolve_directory(path.parent)
+
+
+_SCAN_ROW_SQL = """
+    SELECT i.*, ip.image_id AS prompt_image_id, ip.parser_version, ip.classification_root,
+           ip.configured_model, ip.model_config_root, ip.model_config_rule_id,
+           ip.classification_status,
+           EXISTS(SELECT 1 FROM crop_hashes ch WHERE ch.image_id=i.id AND ch.region='center_50')
+               AS has_center_crop
+    FROM images i LEFT JOIN image_prompts ip ON ip.image_id=i.id
+"""
+
+
+def _existing_paths(conn, paths, model_paths=None):
+    iterator = iter(paths)
+    while batch := list(islice(iterator, 400)):
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(_SCAN_ROW_SQL + f" WHERE i.path IN ({placeholders})",
+                            [str(path) for path in batch])
+        by_path = {row["path"]: row for row in rows}
+        if model_paths is not None and by_path:
+            # Repair externally inserted or legacy category tags for this scan
+            # without revisiting the rest of an unchanged collection.
+            _refresh_model_batch(conn, list(by_path.values()), model_paths)
+        for path in batch:
+            yield path, by_path.get(str(path))
+
+
+def _image_batches(conn):
+    rows = conn.execute("SELECT id, path FROM images ORDER BY id LIMIT 400").fetchall()
+    while rows:
+        yield from rows
+        rows = conn.execute("SELECT id, path FROM images WHERE id > ? ORDER BY id LIMIT 400",
+                            (rows[-1]["id"],)).fetchall()
+
+
+def _path_is_missing(path):
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        # An inaccessible/offline path is not evidence of a move or deletion.
+        pass
+    return False
+
+
+def _reusable_decode_result(error: str | None, min_width: int, min_height: int) -> bool:
+    if error is None or error.startswith("UnidentifiedImageError:"):
+        return True
+    dimensions = re.fullmatch(r"ImageTooSmallError: image is too small: (\d+)x(\d+)", error)
+    if dimensions is not None:
+        width, height = map(int, dimensions.groups())
+        return width < min_width or height < min_height
+    # Filesystem access and other environmental failures can recover without a
+    # change to the file's size or mtime. Retry those instead of caching them.
+    return False
+
+
+def _find_moved_image(conn, sha256, size_bytes, roots, claimed_ids):
+    found = None
+    for row in conn.execute(_SCAN_ROW_SQL + " WHERE i.sha256=? AND i.size_bytes=?",
+                            (sha256, size_bytes)):
+        if row["id"] in claimed_ids:
             continue
-        candidates.append(scan_root)
-    return max(candidates, key=lambda item: len(item.parts)) if candidates else canonical.parent
+        old_path = Path(row["path"])
+        if any(lexical_path_is_within(old_path, root) for root in roots) and _path_is_missing(old_path):
+            if found is not None:
+                return None  # More than one missing copy: preserve the ambiguity.
+            found = row
+    return found
 
 
 def _refresh_model_config_assignments(
@@ -356,44 +413,37 @@ def _refresh_model_config_assignments(
     image_rows: list[sqlite3.Row],
     model_paths: ModelPathConfig,
 ) -> None:
+    iterator = iter(image_rows)
+    while batch := list(islice(iterator, 400)):
+        _refresh_model_batch(conn, batch, model_paths)
+
+
+def _refresh_model_batch(conn, image_rows, model_paths):
+    placeholders = ",".join("?" for _ in image_rows)
     current = {
         int(row["image_id"]): row
         for row in conn.execute(
-            """
-            SELECT
-                ip.image_id,
-                ip.model_type,
-                ip.configured_model,
-                ip.model_config_root,
-                ip.model_config_rule_id,
-                COALESCE(category.tag_count, 0) AS category_tag_count,
-                category.tag_norm AS category_tag_norm,
-                category.tag_kind AS category_tag_kind
+            f"""
+            SELECT ip.image_id, ip.model_type, ip.configured_model,
+                   ip.model_config_root, ip.model_config_rule_id,
+                   COUNT(pt.image_id) AS category_tag_count,
+                   MIN(pt.tag_norm) AS category_tag_norm, MIN(pt.tag_kind) AS category_tag_kind
             FROM image_prompts ip
-            LEFT JOIN (
-                SELECT
-                    image_id,
-                    COUNT(*) AS tag_count,
-                    MIN(tag_norm) AS tag_norm,
-                    MIN(tag_kind) AS tag_kind
-                FROM prompt_tags
-                WHERE tag_kind IN ('model_type', 'model_config')
-                GROUP BY image_id
-            ) category ON category.image_id = ip.image_id
-            """
-        ).fetchall()
+            LEFT JOIN prompt_tags pt ON pt.image_id=ip.image_id
+                AND pt.tag_kind IN ('model_type', 'model_config')
+            WHERE ip.image_id IN ({placeholders})
+            GROUP BY ip.image_id
+            """, [row["id"] for row in image_rows]
+        )
     }
-    rule_cache: dict[Path, ModelPathRule | None] = {}
+    resolve_rule = _model_rule_resolver(model_paths)
     for image in image_rows:
         image_id = int(image["id"])
         prompt_row = current.get(image_id)
         if prompt_row is None:
             continue
         image_path = Path(image["path"])
-        rule = rule_cache.get(image_path.parent)
-        if image_path.parent not in rule_cache:
-            rule = model_paths.resolve(image_path)
-            rule_cache[image_path.parent] = rule
+        rule = resolve_rule(image_path)
         configured_model = rule.label if rule is not None else None
         config_root = str(rule.path) if rule is not None else None
         rule_id = rule.rule_id if rule is not None else None
@@ -463,13 +513,17 @@ def _store_result(
     result: ScanResult,
     config: ScanConfig,
     stats: ScanStats,
+    model_paths: ModelPathConfig,
 ) -> None:
     indexed_at = utc_now_sql()
+    if result.moved and not config.prompt_index:
+        # A proven move changes path-derived labels even when prompt parsing is
+        # disabled. Reconcile the saved prompt row using the destination path,
+        # leaving its extracted metadata and other tags intact.
+        _refresh_model_batch(conn, [{"id": result.existing_image_id, "path": str(result.path)}], model_paths)
+        conn.execute("UPDATE image_prompts SET classification_root=? WHERE image_id=?",
+                     (result.classification_root, result.existing_image_id))
     if result.date_only:
-        if result.existing_image_id is None:
-            stats.failed += 1
-            _commit_batch_if_needed(conn, config, stats)
-            return
         if result.moved:
             update_image_path(
                 conn,
@@ -494,10 +548,6 @@ def _store_result(
         return
 
     if result.prompt_only:
-        if result.existing_image_id is None:
-            stats.failed += 1
-            _commit_batch_if_needed(conn, config, stats)
-            return
         if result.moved:
             update_image_path(
                 conn,
@@ -775,67 +825,13 @@ def _optional_int(value) -> int | None:
     return int(value) if value is not None else None
 
 
-def _missing_hash_candidates(
-    conn: sqlite3.Connection,
-    *,
-    known_paths: set[str] | None = None,
-    roots: list[Path] | None = None,
-) -> dict[int, dict[bytes, list[int]]]:
-    rows = conn.execute(
-        """
-        SELECT id, path, size_bytes, sha256
-        FROM images
-        WHERE sha256 IS NOT NULL
-        """
-    ).fetchall()
-    directory_roots = (
-        [root.resolve(strict=False) for root in (roots or []) if root.is_dir()]
-        if known_paths is not None
-        else []
-    )
-    candidates: dict[int, dict[bytes, list[int]]] = {}
-    for row in rows:
-        row_path = Path(row["path"])
-        if known_paths is None:
-            if row_path.exists():
-                continue
-        else:
-            if not any(path_is_within(row_path, root) for root in directory_roots):
-                continue
-            if str(row_path) in known_paths:
-                continue
-        hashes_by_size = candidates.setdefault(int(row["size_bytes"]), {})
-        hashes_by_size.setdefault(row["sha256"], []).append(int(row["id"]))
-    return candidates
-
-
-def _claim_moved_image(
-    path: Path,
-    size_bytes: int,
-    candidates: dict[int, dict[bytes, list[int]]],
-    *,
-    precomputed_hashes: dict[Path, bytes] | None = None,
-) -> int | None:
-    hashes_by_size = candidates.get(size_bytes)
-    if not hashes_by_size:
-        return None
-    sha256 = sha256_file(path)
-    if precomputed_hashes is not None:
-        precomputed_hashes[path] = sha256
-    image_ids = hashes_by_size.get(sha256, [])
-    if len(image_ids) != 1:
-        return None
-    image_id = image_ids[0]
-    del hashes_by_size[sha256]
-    if not hashes_by_size:
-        del candidates[size_bytes]
-    return image_id
-
-
 def _delete_missing_images(conn: sqlite3.Connection) -> int:
-    rows = conn.execute("SELECT id, path FROM images").fetchall()
-    image_ids = [int(row["id"]) for row in rows if not Path(row["path"]).exists()]
-    return delete_images(conn, image_ids)
+    deleted = 0
+    iterator = iter(_image_batches(conn))
+    while rows := list(islice(iterator, 400)):
+        image_ids = [int(row["id"]) for row in rows if _path_is_missing(Path(row["path"]))]
+        deleted += delete_images(conn, image_ids)
+    return deleted
 
 
 def _extract_prompt_fields(
@@ -866,20 +862,21 @@ def _store_prompt(
         model_identity = OTHER_MODEL_IDENTITY
     elif model_type == "sd" and model_identity and model_hash and model_identity != OTHER_MODEL_IDENTITY:
         model_identity = f"{model_identity} {model_hash}"
+    if model_identity:
+        model_identity = sanitize_model_name(model_identity)
 
     tag_rows: list[tuple[str, str, str]] = []
     seen_tags: set[str] = set()
 
     def add_tag(tag: str, kind: str) -> None:
         normalized = normalize_prompt_tag(tag)
-        if not normalized:
-            return
+        # Parsed prompt tags are already nonempty and deduplicated. Only the
+        # generated model tags can collide with those tags or with each other.
         if normalized in seen_tags:
-            if kind != "prompt":
-                for index, existing in enumerate(tag_rows):
-                    if existing[1] == normalized and existing[2] == "prompt":
-                        tag_rows[index] = (tag, normalized, kind)
-                        break
+            for index, existing in enumerate(tag_rows):
+                if existing[1] == normalized and existing[2] == "prompt":
+                    tag_rows[index] = (tag, normalized, kind)
+                    break
             return
         seen_tags.add(normalized)
         tag_rows.append((tag, normalized, kind))

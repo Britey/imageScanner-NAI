@@ -157,6 +157,7 @@ def compute_image_hashes(
     min_width: int = 32,
     min_height: int = 32,
     include_crop_regions: bool = False,
+    include_query_tiles: bool = False,
     precomputed_sha256: bytes | None = None,
 ) -> tuple[dict[str, bytes], dict[str, int | str]]:
     img = load_normalized(path, min_width=min_width, min_height=min_height)
@@ -168,9 +169,12 @@ def compute_image_hashes(
     }
     for index, value in enumerate(grid_hashes(img)):
         hashes[f"grid{index}"] = value
-    if include_crop_regions:
+    if include_crop_regions or include_query_tiles:
         for name, value in crop_region_hashes(img).items():
             hashes[f"crop:{name}"] = value
+    if include_query_tiles:
+        for name, value in tile_hashes(img).items():
+            hashes[f"tile:{name}"] = value
     metadata = {
         "width": img.width,
         "height": img.height,

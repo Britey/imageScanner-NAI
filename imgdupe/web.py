@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-import mimetypes
 import ctypes
 import os
 import re
@@ -11,22 +10,28 @@ import socket
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.parse
 import webbrowser
 from ctypes import wintypes
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import islice
 from email.message import Message
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer as BaseHTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 
 from PIL import Image, ImageOps
 
 from .config import ScanConfig
-from .db import checkpoint_database, connect, init_db, is_crop_index_ready
+from . import db as database
+from .db import checkpoint_database, connect, init_db
 from .model_paths import (
     DEFAULT_MODEL_PATHS_PATH,
     build_config,
@@ -89,6 +94,30 @@ MAX_FORM_BYTES = 256 * 1024
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10.0
 BODY_TIMEOUT_SECONDS = 30.0
+
+
+class HTTPServer(ThreadingMixIn, BaseHTTPServer):
+    """Bound request concurrency; each request owns its SQLite connection."""
+
+    max_request_workers = 8
+
+    def __init__(self, *args, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(self.max_request_workers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        self._request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 class RequestError(ValueError):
@@ -342,6 +371,7 @@ def serve(
         thumbs_dir=thumbs_dir,
         thumbnail_cache_limit=settings.thumbnail_cache_limit,
         disable_advanced_options=settings.disable_advanced_options,
+        concurrent_requests=True,
     )
     handler = _make_handler(state)
     server = HTTPServer((host, port), handler)
@@ -378,8 +408,11 @@ class WebState:
         thumbs_dir: Path,
         thumbnail_cache_limit: int,
         disable_advanced_options: bool,
+        concurrent_requests: bool = False,
     ) -> None:
-        self.conn = conn
+        self._conn = conn
+        self._request_state = threading.local()
+        self.concurrent_requests = concurrent_requests
         self.csrf_token = secrets.token_urlsafe(32)
         self.allowed_hosts = frozenset({"localhost", "127.0.0.1", "::1"})
         self.server_port = 8765
@@ -395,10 +428,49 @@ class WebState:
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.thumbs_dir.mkdir(parents=True, exist_ok=True)
         self.scan_lock = threading.Lock()
+        self.mutation_lock = threading.Lock()
+        self.thumbnail_lock = threading.RLock()
+        self.thumbnail_workers = [threading.Lock() for _ in range(64)]
         self.scan_status = WebScanStatus()
         self.scan_thread: threading.Thread | None = None
         _prune_thumbnail_cache(self.thumbs_dir, self.thumbnail_cache_limit)
-        self.thumbnail_cache_count = sum(1 for _ in self.thumbs_dir.glob("*.jpg"))
+        self._thumbnails: OrderedDict[Path, None] = OrderedDict()
+        self._thumbnail_versions: dict[str, set[Path]] = {}
+        for path in _cached_thumbnail_paths(self.thumbs_dir):
+            self._remember_thumbnail(path)
+        self.thumbnail_cache_count = len(self._thumbnails)
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if getattr(self._request_state, "active", False):
+            if not hasattr(self._request_state, "connection"):
+                self._request_state.connection = connect(self.db_path)
+            return self._request_state.connection
+        return self._conn
+
+    @conn.setter
+    def conn(self, value: sqlite3.Connection) -> None:
+        self._conn = value
+
+    @contextmanager
+    def request_context(self):
+        if not self.concurrent_requests:
+            yield
+            return
+        self._request_state.active = True
+        try:
+            yield
+        finally:
+            connection = getattr(self._request_state, "connection", None)
+            if connection is not None:
+                connection.close()
+                del self._request_state.connection
+            self._request_state.active = False
+
+    def _remember_thumbnail(self, path: Path) -> None:
+        self._thumbnails[path] = None
+        self._thumbnails.move_to_end(path)
+        self._thumbnail_versions.setdefault(path.name.split("-", 1)[0], set()).add(path)
 
     def start_scan(self, request: ScanRequest) -> bool:
         with self.scan_lock:
@@ -428,25 +500,40 @@ class WebState:
             thread.join()
 
     def clear_thumbnail_cache(self) -> int:
-        removed = 0
-        for path in self.thumbs_dir.glob("*.jpg"):
-            try:
-                path.unlink()
-                removed += 1
-            except OSError:
-                pass
-        self.thumbnail_cache_count = sum(1 for _ in self.thumbs_dir.glob("*.jpg"))
-        return removed
+        with self.thumbnail_lock:
+            removed = 0
+            for path in self.thumbs_dir.glob("*.jpg"):
+                try:
+                    path.unlink()
+                    self.thumbnail_removed(path)
+                    removed += 1
+                except OSError:
+                    pass
+            return removed
 
-    def thumbnail_removed(self) -> None:
-        self.thumbnail_cache_count = max(0, self.thumbnail_cache_count - 1)
+    def thumbnail_removed(self, path: Path) -> None:
+        with self.thumbnail_lock:
+            self._thumbnails.pop(path, None)
+            key = path.name.split("-", 1)[0]
+            versions = self._thumbnail_versions.get(key)
+            if versions is not None:
+                versions.discard(path)
+                if not versions:
+                    del self._thumbnail_versions[key]
+            self.thumbnail_cache_count = len(self._thumbnails)
 
-    def thumbnail_created(self) -> None:
-        self.thumbnail_cache_count += 1
-        if self.thumbnail_cache_count <= self.thumbnail_cache_limit:
-            return
-        _prune_thumbnail_cache(self.thumbs_dir, self.thumbnail_cache_limit)
-        self.thumbnail_cache_count = sum(1 for _ in self.thumbs_dir.glob("*.jpg"))
+    def thumbnail_created(self, path: Path) -> None:
+        with self.thumbnail_lock:
+            self._remember_thumbnail(path)
+            # Evict only known oldest entries; no directory scan/stat/sort on a
+            # miss. An undeletable file stays accounted for and is retried later.
+            for victim in list(islice(self._thumbnails, max(0, len(self._thumbnails) - max(1, self.thumbnail_cache_limit)))):
+                try:
+                    victim.unlink(missing_ok=True)
+                    self.thumbnail_removed(victim)
+                except OSError:
+                    pass
+            self.thumbnail_cache_count = len(self._thumbnails)
 
     def get_scan_status(self) -> WebScanStatus:
         with self.scan_lock:
@@ -610,6 +697,10 @@ def _make_handler(state: WebState):
                 raise RequestError(HTTPStatus.FORBIDDEN, "invalid CSRF token")
 
         def do_GET(self) -> None:
+            with state.request_context():
+                self._do_GET()
+
+        def _do_GET(self) -> None:
             try:
                 self._check_request_source()
             except RequestError as exc:
@@ -619,6 +710,9 @@ def _make_handler(state: WebState):
             lang = _lang_from_query(parsed.query)
             if parsed.path == "/":
                 self._send_html(_index_page(state, lang, parsed.query))
+                return
+            if parsed.path == "/scan-status":
+                self._send_json({"state": state.get_scan_status().state})
                 return
             if parsed.path == "/failures":
                 self._send_html(_failures_page(state, lang))
@@ -635,11 +729,19 @@ def _make_handler(state: WebState):
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
-            try:
-                self._prepare_post()
-            except RequestError as exc:
-                self.send_error(exc.status, str(exc))
-                return
+            with state.request_context():
+                try:
+                    self._prepare_post()
+                except RequestError as exc:
+                    self.send_error(exc.status, str(exc))
+                    return
+                if urllib.parse.urlparse(self.path).path in {"/scan", "/scan-configure", "/scan-configured", "/clear-thumbnail-cache"}:
+                    with state.mutation_lock:
+                        self._do_POST()
+                else:
+                    self._do_POST()
+
+        def _do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/show-in-folder":
                 self._show_in_folder(self._fields, _normalize_lang(self._fields.get("lang")))
@@ -694,8 +796,7 @@ def _make_handler(state: WebState):
                     if additions:
                         config = build_config((*config.rules, *additions))
                         save_model_paths(DEFAULT_MODEL_PATHS_PATH, config)
-                    if not state.start_scan(request):
-                        raise RuntimeError("an index update is already running")
+                    state.start_scan(request)
                     self._redirect(f"/?lang={request.lang}#scan-index")
                 except Exception as exc:
                     self._send_html(_error_page(exc), status=HTTPStatus.BAD_REQUEST)
@@ -805,7 +906,11 @@ def _make_handler(state: WebState):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             path = Path(row["path"]).resolve()
-            _show_path_in_folder(path)
+            try:
+                _show_path_in_folder(path)
+            except OSError as exc:
+                self._send_html(_error_page(exc), status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
             text = _text(lang)
             self._send_html(
                 _page(
@@ -858,25 +963,41 @@ def _make_handler(state: WebState):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             thumb_path = state.thumbs_dir / (
-                f"{image_id}-{int(row['mtime_ns'])}-{int(row['size_bytes'])}-{state.thumbnail_size}.jpg"
+                f"{image_id}-{int(row['mtime_ns'])}-{int(row['size_bytes'])}-{state.thumbnail_size}-v2.jpg"
             )
-            if not thumb_path.exists():
-                for stale_path in state.thumbs_dir.glob(f"{image_id}-*.jpg"):
+            with state.thumbnail_workers[image_id % len(state.thumbnail_workers)]:
+                with state.thumbnail_lock:
+                    cached = thumb_path.exists()
+                    if cached:
+                        state._remember_thumbnail(thumb_path)
+                        try:
+                            os.utime(thumb_path, None)
+                        except OSError:
+                            pass
+                        data = thumb_path.read_bytes()
+                    else:
+                        for stale_path in tuple(state._thumbnail_versions.get(str(image_id), ())):
+                            try:
+                                stale_path.unlink()
+                                state.thumbnail_removed(stale_path)
+                            except OSError:
+                                pass
+                if not cached:
+                    pending = thumb_path.with_suffix(".pending")
+                    if not _write_thumbnail(Path(row["path"]), pending, state.thumbnail_size):
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
                     try:
-                        stale_path.unlink()
-                        state.thumbnail_removed()
+                        with state.thumbnail_lock:
+                            os.replace(pending, thumb_path)
+                            # Read before eviction so even a one-entry cache is safe.
+                            data = thumb_path.read_bytes()
+                            state.thumbnail_created(thumb_path)
                     except OSError:
-                        pass
-                if not _write_thumbnail(Path(row["path"]), thumb_path, state.thumbnail_size):
-                    self.send_error(HTTPStatus.NOT_FOUND)
-                    return
-                state.thumbnail_created()
-            else:
-                try:
-                    os.utime(thumb_path, None)
-                except OSError:
-                    pass
-            self._send_file(thumb_path, "image/jpeg")
+                        _discard_thumbnail(pending)
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+            self._send_bytes(data, "image/jpeg")
 
         def _send_html(self, document: str, *, status: HTTPStatus = HTTPStatus.OK) -> None:
             data = _csrf_forms(document, state.csrf_token).encode("utf-8")
@@ -894,10 +1015,9 @@ def _make_handler(state: WebState):
             self.end_headers()
             self.wfile.write(data)
 
-        def _send_file(self, path: Path, content_type: str | None = None) -> None:
-            data = path.read_bytes()
+        def _send_bytes(self, data: bytes, content_type: str) -> None:
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -1006,34 +1126,7 @@ def _model_path_prompt_page(request: ScanRequest, roots: tuple[Path, ...]) -> st
 
 
 def _model_filter_options(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-    rows = conn.execute(
-        """
-        SELECT MIN(pt.tag) AS tag, pt.tag_norm
-        FROM prompt_tags pt
-        JOIN image_prompts ip ON ip.image_id = pt.image_id
-        WHERE (
-                pt.tag_kind = 'model_config'
-                OR (pt.tag_kind = 'model_type' AND ip.configured_model IS NULL)
-              )
-          AND pt.tag_norm LIKE '@model:%'
-        GROUP BY pt.tag_norm
-        ORDER BY CASE tag_norm
-            WHEN '@model:sd' THEN 0
-            WHEN '@model:nai3' THEN 1
-            WHEN '@model:nai4' THEN 2
-            WHEN '@model:no_metadata' THEN 4
-            ELSE 3
-        END, tag_norm
-        """
-    ).fetchall()
-    options: list[tuple[str, str]] = []
-    for row in rows:
-        tag = str(row["tag"] or "")
-        if not tag.casefold().startswith("@model:"):
-            continue
-        label = tag[len("@model:"):]
-        options.append((label, label.upper() if label.casefold() in {"sd", "nai3", "nai4"} else label))
-    return options
+    return database.fetch_model_options(conn)
 
 
 def _scan_panel(state: WebState, lang: str) -> str:
@@ -1059,7 +1152,19 @@ def _scan_panel(state: WebState, lang: str) -> str:
           {text["scan_running"].format(started_at=html.escape(status.started_at or ""))}
         </p>
         """
-        refresh_script = "<script>setTimeout(() => window.location.reload(), 3000);</script>"
+        refresh_script = """<script>
+        const pollScan = async () => {
+          try {
+            const response = await fetch('/scan-status');
+            if (response.ok && (await response.json()).state !== 'running') {
+              window.location.reload();
+              return;
+            }
+          } catch (error) { /* Retry after a temporary connection failure. */ }
+          setTimeout(pollScan, 3000);
+        };
+        setTimeout(pollScan, 3000);
+        </script>"""
     elif status.state == "completed" and status.stats is not None:
         stats = status.stats
         status_html = f"""
@@ -1327,12 +1432,19 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
       const hideSuggestions = suggestionsElement => {{
         suggestionsElement.hidden = true;
         suggestionsElement.innerHTML = "";
+        delete suggestionsElement.dataset.request;
+        delete suggestionsElement.dataset.query;
         activeSuggestion = -1;
       }};
       const hideAllSuggestions = () => {{
         hideSuggestions(suggestions);
         hideSuggestions(negativeSuggestions);
       }};
+      const suggestionsCurrent = (inputElement, suggestionsElement) => (
+        !suggestionsElement.hidden
+        && suggestionsElement.dataset.request === String(suggestionRequest)
+        && suggestionsElement.dataset.query === tokenInfo(inputElement).token.trim()
+      );
       const suggestionButtons = suggestionsElement => [...suggestionsElement.querySelectorAll("button[data-tag]")];
       const setActiveSuggestion = (suggestionsElement, index) => {{
         const buttons = suggestionButtons(suggestionsElement);
@@ -1358,7 +1470,26 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         inputElement.setSelectionRange(caret, caret);
         hideSuggestions(suggestionsElement);
       }};
+      let suggestionTimer;
+      let suggestionController;
+      const dismissSuggestions = () => {{
+        clearTimeout(suggestionTimer);
+        suggestionController?.abort();
+        ++suggestionRequest;
+        hideAllSuggestions();
+      }};
+      const scheduleSuggestions = inputElement => {{
+        clearTimeout(suggestionTimer);
+        suggestionController?.abort();
+        ++suggestionRequest;
+        hideAllSuggestions();
+        suggestionTimer = setTimeout(() => refreshSuggestions(inputElement), 180);
+      }};
       const refreshSuggestions = async inputElement => {{
+        clearTimeout(suggestionTimer);
+        suggestionController?.abort();
+        suggestionController = new AbortController();
+        const signal = suggestionController.signal;
         const suggestionsElement = suggestionsForInput(inputElement);
         const request = ++suggestionRequest;
         activePromptInput = inputElement;
@@ -1368,7 +1499,8 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
         const info = tokenInfo(inputElement);
         const query = info.token.trim();
         if (query.length < 1) return hideSuggestions(suggestionsElement);
-        const response = await fetch("/suggest-tags?q=" + encodeURIComponent(query));
+        try {{
+        const response = await fetch("/suggest-tags?q=" + encodeURIComponent(query), {{signal}});
         if (request !== suggestionRequest || activePromptInput !== inputElement) return false;
         if (!response.ok) return hideSuggestions(suggestionsElement);
         const tags = await response.json();
@@ -1380,45 +1512,51 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
              <small>${{item.count}}</small>
            </button>`
         )).join("");
+        suggestionsElement.dataset.request = String(request);
+        suggestionsElement.dataset.query = query;
         suggestionsElement.hidden = false;
         activeSuggestion = -1;
         return true;
+        }} catch (error) {{
+          if (request === suggestionRequest) hideSuggestions(suggestionsElement);
+          return false;
+        }}
       }};
       const bindPromptAutocomplete = inputElement => {{
         const suggestionsElement = suggestionsForInput(inputElement);
-        inputElement.addEventListener("input", () => refreshSuggestions(inputElement));
-        inputElement.addEventListener("click", () => refreshSuggestions(inputElement));
-        inputElement.addEventListener("focus", () => refreshSuggestions(inputElement));
+        inputElement.addEventListener("input", () => scheduleSuggestions(inputElement));
+        inputElement.addEventListener("click", () => scheduleSuggestions(inputElement));
+        inputElement.addEventListener("focus", () => scheduleSuggestions(inputElement));
         inputElement.addEventListener("keydown", async event => {{
           if (event.key === "ArrowDown") {{
             event.preventDefault();
-            if (suggestionsElement.hidden || !suggestionButtons(suggestionsElement).length) {{
+            if (!suggestionsCurrent(inputElement, suggestionsElement)) {{
               await refreshSuggestions(inputElement);
             }}
-            if (suggestionButtons(suggestionsElement).length) {{
+            if (suggestionsCurrent(inputElement, suggestionsElement)) {{
               setActiveSuggestion(suggestionsElement, activeSuggestion + 1);
             }}
           }} else if (event.key === "ArrowUp") {{
             event.preventDefault();
-            if (suggestionsElement.hidden || !suggestionButtons(suggestionsElement).length) {{
+            if (!suggestionsCurrent(inputElement, suggestionsElement)) {{
               await refreshSuggestions(inputElement);
             }}
             const buttons = suggestionButtons(suggestionsElement);
-            if (buttons.length) {{
+            if (suggestionsCurrent(inputElement, suggestionsElement) && buttons.length) {{
               setActiveSuggestion(
                 suggestionsElement,
                 activeSuggestion < 0 ? buttons.length - 1 : activeSuggestion - 1
               );
             }}
           }} else if (event.key === "Enter") {{
-            if (suggestionsElement.hidden) return;
+            if (!suggestionsCurrent(inputElement, suggestionsElement)) return;
             const buttons = suggestionButtons(suggestionsElement);
             if (!buttons.length) return;
             event.preventDefault();
             const button = buttons[activeSuggestion >= 0 ? activeSuggestion : 0];
             if (button) applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
           }} else if (event.key === "Escape") {{
-            hideSuggestions(suggestionsElement);
+            dismissSuggestions();
           }}
         }});
       }};
@@ -1430,12 +1568,12 @@ def _index_page(state: WebState, lang: str, query: str = "") -> str:
           const button = event.target.closest("button[data-tag]");
           if (button) {{
             const inputElement = suggestionsElement === negativeSuggestions ? negativePromptInput : promptInput;
-            applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
+            if (suggestionsCurrent(inputElement, suggestionsElement)) applySuggestion(inputElement, suggestionsElement, button.dataset.tag);
           }}
         }});
       }});
       document.addEventListener("click", event => {{
-        if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) hideAllSuggestions();
+        if (!event.target.closest(".prompt-input-wrap") && event.target !== autocomplete) dismissSuggestions();
       }});
     </script>
     """
@@ -1707,31 +1845,7 @@ def _tag_suggestions(state: WebState, query: str) -> list[dict[str, object]]:
     prefix = (values.get("q", [""])[0] or "").strip().casefold()
     if not prefix:
         return []
-    rows = state.conn.execute(
-        """
-        SELECT
-            MIN(tag) AS tag,
-            COUNT(*) AS count
-        FROM prompt_tags pt
-        JOIN image_prompts ip ON ip.image_id = pt.image_id
-        WHERE pt.tag_norm >= ?
-          AND pt.tag_norm < ?
-          AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)
-        GROUP BY pt.tag_norm
-        ORDER BY count DESC, pt.tag_norm
-        LIMIT 5
-        """,
-        (prefix, _prefix_upper_bound(prefix)),
-    ).fetchall()
-    return [
-        {"tag": row["tag"], "count": int(row["count"])}
-        for row in rows
-        if row["tag"]
-    ]
-
-
-def _prefix_upper_bound(prefix: str) -> str:
-    return prefix + "\U0010ffff"
+    return database.fetch_tag_suggestions(state.conn, prefix)
 
 
 def _error_page(exc: Exception) -> str:
@@ -1832,6 +1946,7 @@ def _page(title: str, body: str, *, lang: str = "zh") -> str:
 
 
 def _write_thumbnail(source: Path, target: Path, thumbnail_size: int) -> bool:
+    temporary = None
     try:
         with Image.open(source) as opened:
             img = ImageOps.exif_transpose(opened).convert("RGB")
@@ -1840,22 +1955,38 @@ def _write_thumbnail(source: Path, target: Path, thumbnail_size: int) -> bool:
             left = (thumbnail_size - img.width) // 2
             top = (thumbnail_size - img.height) // 2
             canvas.paste(img, (left, top))
-            canvas.save(target, "JPEG", quality=82, optimize=True)
+            with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".tmp", delete=False) as output:
+                temporary = Path(output.name)
+                canvas.save(output, "JPEG", quality=82, optimize=True)
+            os.replace(temporary, target)
         return True
     except Exception:
         return False
+    finally:
+        if temporary is not None:
+            _discard_thumbnail(temporary)
+
+
+def _discard_thumbnail(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _cached_thumbnail_paths(cache_dir: Path) -> list[Path]:
+    entries = []
+    for path in cache_dir.glob("*.jpg"):
+        try:
+            entries.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue  # A stale cache entry must not prevent the UI from starting.
+    return [path for _, path in sorted(entries, key=lambda entry: entry[0])]
 
 
 def _prune_thumbnail_cache(cache_dir: Path, limit: int) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        thumbnails = sorted(
-            cache_dir.glob("*.jpg"),
-            key=lambda path: path.stat().st_mtime_ns,
-            reverse=True,
-        )
-    except OSError:
-        return
+    thumbnails = list(reversed(_cached_thumbnail_paths(cache_dir)))
     for path in thumbnails[max(1, limit) :]:
         try:
             path.unlink()
@@ -1870,9 +2001,9 @@ def _show_path_in_folder(path: Path) -> None:
             return
         except OSError:
             pass
-    target = path.parent if path.exists() else path.parent
+    command = "explorer.exe" if os.name == "nt" else ("open" if sys.platform == "darwin" else "xdg-open")
     subprocess.Popen(
-        ["explorer.exe", str(target)],
+        [command, str(path.parent)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1946,8 +2077,7 @@ def _extract_multipart(body: bytes, boundary: bytes) -> tuple[dict[str, str], by
         if not header or not content:
             continue
         header_text = header.decode("utf-8", errors="replace")
-        if content.endswith(b"\r\n"):
-            content = content[:-2]
+        content = content.removesuffix(b"\r\n")
         name = _field_name_from_header(header_text)
         if not name:
             continue
@@ -2013,58 +2143,11 @@ def _float_field(fields: dict[str, str], key: str, default: float) -> float:
 
 
 def _stats(conn: sqlite3.Connection) -> dict[str, int]:
-    row = conn.execute(
-        """
-        SELECT
-            COUNT(*) AS indexed,
-            SUM(CASE WHEN i.decode_error IS NULL AND i.missing_at IS NULL THEN 1 ELSE 0 END) AS ok,
-            SUM(CASE WHEN i.decode_error IS NOT NULL
-                          OR (ip.prompt_error IS NOT NULL
-                              AND ip.prompt_error NOT IN ('no_metadata', 'no_prompt'))
-                     THEN 1 ELSE 0 END) AS failed
-        FROM images i
-        LEFT JOIN image_prompts ip ON ip.image_id = i.id
-        """
-    ).fetchone()
-    hashed = conn.execute("SELECT COUNT(*) AS count FROM hashes").fetchone()["count"]
-    groups = conn.execute("SELECT COUNT(DISTINCT cluster_id) AS count FROM clusters").fetchone()["count"]
-    matches = conn.execute("SELECT COUNT(*) AS count FROM matches").fetchone()["count"]
-    prompts = conn.execute(
-        "SELECT COUNT(*) AS count FROM image_prompts WHERE prompt IS NOT NULL"
-    ).fetchone()["count"]
-    unique_tags = _count_unique_tags(conn)
-    return {
-        "indexed": int(row["indexed"] or 0),
-        "ok": int(row["ok"] or 0),
-        "failed": int(row["failed"] or 0),
-        "hashed": int(hashed or 0),
-        "groups": int(groups or 0),
-        "matches": int(matches or 0),
-        "crop_ready": int(is_crop_index_ready(conn)),
-        "prompts": int(prompts or 0),
-        "unique_tags": int(unique_tags or 0),
-    }
+    return database.fetch_stats(conn)
 
 
 def _count_unique_tags(conn: sqlite3.Connection) -> int:
-    # Enumerate names using the covering tag index, then stop at the first
-    # visible occurrence of each name. Joining every occurrence first causes
-    # millions of scattered reads of the wide prompt/metadata table just to
-    # render the home-page counters.
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS count
-        FROM (SELECT DISTINCT tag_norm FROM prompt_tags) tags
-        WHERE EXISTS (
-            SELECT 1
-            FROM prompt_tags pt
-            JOIN image_prompts ip ON ip.image_id = pt.image_id
-            WHERE pt.tag_norm = tags.tag_norm
-              AND NOT (pt.tag_kind = 'model_type' AND ip.configured_model IS NOT NULL)
-        )
-        """
-    ).fetchone()
-    return int(row["count"])
+    return database.count_unique_tags(conn)
 
 
 def _lang_from_query(query: str) -> str:

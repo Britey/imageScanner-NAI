@@ -1,334 +1,475 @@
 from __future__ import annotations
 
-import gzip
-import struct
+import json
 import tempfile
 import unittest
-import zlib
 from pathlib import Path
+
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 from imgdupe.nai_prompt import (
     OTHER_MODEL_IDENTITY,
-    MAX_TEXT_CHUNK_BYTES,
-    PromptMetadataTooLarge,
-    _gzip_decompress_bounded,
+    PromptResult,
     extract_nai_prompt,
     normalize_prompt_tag,
     parse_a1111_parameters,
-    parse_novelai_metadata,
     parse_novelai_prompt,
-    parse_png_itxt,
-    parse_text_metadata,
-    read_png_text_chunks,
+    sanitize_model_name,
     split_prompt_tags,
 )
 
 
-def test_itxt_uncompressed_and_compressed() -> None:
-    plain = b"parameters\0\0\0\0\0hello"
-    compressed = b"Comment\0\1\0\0\0" + zlib.compress("世界".encode())
-    assert parse_png_itxt(plain) == ("parameters", "hello")
-    assert parse_png_itxt(compressed) == ("Comment", "世界")
-
-
-def test_reads_all_png_text_chunk_types(tmp_path: Path) -> None:
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"tEXt", b"Software\0NovelAI")
-    png += chunk(b"zTXt", b"Source\0\0" + zlib.compress(b"NovelAI Diffusion V4 ABCDEF12"))
-    png += chunk(b"iTXt", b"Comment\0\0\0\0\0{\"prompt\":\"cat\"}")
-    png += chunk(b"IEND", b"")
-    path = tmp_path / "text.png"
-    path.write_bytes(png)
-    assert read_png_text_chunks(path) == {
-        "Software": "NovelAI",
-        "Source": "NovelAI Diffusion V4 ABCDEF12",
-        "Comment": '{"prompt":"cat"}',
-    }
-
-
-def test_a1111_sections_lora_emphasis_alternation_and_hash() -> None:
-    result = parse_a1111_parameters(
-        "kujou miyako, [9-nine-], <lora:miyako5:0.6>, "
-        "(izumi tsubasu:0.75), [cow|horse], [fantasy:cyberpunk:0.5], "
-        r"\[literal\], .chibi, v1.0" + "\n"
-        "Negative prompt: bad anatomy, lowres\n"
-        "Steps: 35, Sampler: Euler a, Model hash: 6681E8E4B1, Model: ignored"
-    )
-    assert result.prompt_format == "a1111"
-    assert result.model_hash == "6681e8e4b1"
-    assert result.tags == (
-        "kujou miyako", "9-nine-", "izumi tsubasu", "cow", "horse",
-        "fantasy", "cyberpunk", "[literal]", "chibi", "v1.0",
-    )
-    assert "bad anatomy" not in result.tags
-    assert "miyako5" not in result.prompt
-
-
-def test_a1111_grouped_tags_and_pipe_fallback() -> None:
-    result = parse_a1111_parameters("(red hair, blue eyes:1.2), rain|snow")
-    assert result.tags == ("red hair", "blue eyes", "rain", "snow")
-
-
-def test_a1111_fullwidth_syntax_and_literal_lowercase_and() -> None:
-    result = parse_a1111_parameters(
-        "（青い目：０．７５），［cat］，black and white，red hair AND blue eyes\n"
-        "Steps：２０，Sampler：Euler a，Model hash：A1B2C3D4"
-    )
-    assert result.tags == ("青い目", "cat", "black and white", "red hair", "blue eyes")
-    assert result.model_hash == "a1b2c3d4"
-
-    separators = parse_a1111_parameters("cat．dog。bird")
-    assert separators.tags == ("cat", "dog", "bird")
-
-
-def test_malformed_wrapper_is_literal_and_deep_nesting_is_reported() -> None:
-    malformed = parse_a1111_parameters("cat, (blue eyes, dog")
-    assert malformed.tags == ("cat", "(blue eyes", "dog")
-
-    deep = parse_a1111_parameters("(" * 65 + "cat" + ")" * 65)
-    assert deep.error == "prompt_nesting_too_deep"
-    assert "cat" in deep.prompt
-
-
-def test_oversized_png_text_chunk_has_distinct_status(tmp_path: Path) -> None:
-    path = tmp_path / "oversized.png"
-    path.write_bytes(
-        b"\x89PNG\r\n\x1a\n"
-        + struct.pack(">I", MAX_TEXT_CHUNK_BYTES + 1)
-        + b"tEXt"
-    )
-    result = extract_nai_prompt(path)
-    assert result.error == "prompt_metadata_too_large"
-
-    compressed_gzip = gzip.compress(b"a" * (MAX_TEXT_CHUNK_BYTES + 1))
-    with unittest.TestCase().assertRaises(PromptMetadataTooLarge):
-        _gzip_decompress_bounded(compressed_gzip)
-
-    compressed = zlib.compress(b"a" * (MAX_TEXT_CHUNK_BYTES + 1))
-    path.write_bytes(
-        b"\x89PNG\r\n\x1a\n"
-        + struct.pack(">I", len(b"parameters\0\0" + compressed))
-        + b"zTXt"
-        + b"parameters\0\0"
-        + compressed
-        + b"\0\0\0\0"
-    )
-    result = extract_nai_prompt(path)
-    assert result.error == "prompt_metadata_too_large"
-
-
-def test_novelai_software_detection_requires_valid_comment() -> None:
-    malformed = parse_text_metadata({"Software": " novelAI ", "Comment": "not json", "parameters": "cat"})
-    assert malformed.prompt_format == "novelai"
-    assert malformed.error == "malformed_metadata"
-
-
-def test_malformed_novelai_comment_still_preserves_source_identity() -> None:
-    result = parse_text_metadata({
-        "Software": "NovelAI",
-        "Source": "NovelAI Diffusion V4.5 37442FCA",
-        "Comment": "{not valid json",
-    })
-
-    assert result.error == "malformed_metadata"
-    assert result.model_type == "nai4"
-    assert result.model_version == "4.5"
-    assert result.model_hash == "37442fca"
-    assert result.model_identity == "NovelAI Diffusion V4.5 37442FCA"
-
-
-def test_nai3_prompt_and_source_hash() -> None:
-    result = parse_text_metadata({
-        "Software": "NovelAI",
-        "Source": "Stable Diffusion XL C1E1DE52",
-        "Comment": '{"prompt":"cat, blue_hair","uc":"bad anatomy"}',
-    })
-    assert result.model_type == "nai3"
-    assert result.model_hash == "c1e1de52"
-    assert result.tags == ("cat", "blue_hair")
-
-
-def test_nai4_structured_base_and_characters_and_negative_exclusion() -> None:
-    metadata = {
-        "Source": "NovelAI Diffusion V4.5 4BDE2A90",
-        "prompt": "duplicate top level",
-        "v4_prompt": {"caption": {
-            "base_caption": "1girl, outdoors",
-            "char_captions": [{"char_caption": "blue hair"}, {"caption": "red eyes"}],
-        }},
-        "v4_negative_prompt": {"caption": {"base_caption": "bad anatomy"}},
-    }
-    result = parse_novelai_metadata(metadata)
-    assert result.model_type == "nai4"
-    assert result.model_version == "4.5"
-    assert result.model_hash == "4bde2a90"
-    assert result.tags == ("1girl", "outdoors", "blue hair", "red eyes")
-
-
-def test_actual_prompt_takes_precedence() -> None:
-    metadata = {
-        "Source": "NovelAI Diffusion V4 37442FCA",
-        "v4_prompt": {"caption": {"base_caption": "||black|white|| thighhighs"}},
-        "actual_prompts": {"prompt": {"base_caption": "white thighhighs"}},
-    }
-    result = parse_novelai_metadata(metadata)
-    assert result.model_version == "4"
-    assert result.tags == ("white thighhighs",)
-
-
-def test_novelai_numeric_scopes_exclude_negative_and_zero() -> None:
-    tags = parse_novelai_prompt(
-        "1girl, 1.5::rain, night::, -2.5::hat, glasses::, 0::tie::, "
-        "-1::negative outer, -1::positive inner:: ::, outdoors"
-    )
-    assert tags == ["1girl", "rain", "night", "positive inner", "outdoors"]
-
-
-def test_unclosed_negative_scope_continues_to_end() -> None:
-    assert parse_novelai_prompt("cat, -1::hat, glasses") == ["cat"]
-
-
-def test_nai3_prompt_mixing_uses_trailing_weight_sign() -> None:
-    assert parse_novelai_prompt("cat:1|happy:-0.2|cute:-0.3|style:name", model_type="nai3") == ["cat", "style:name"]
-
-
-def test_pipe_fallback_and_unicode_separators() -> None:
-    tags = parse_novelai_prompt("||red|blue|| hair｜green，青い目。solo、白髪；帽子")
-    assert tags == ["red", "blue", "hair", "green", "青い目", "solo", "白髪", "帽子"]
-
-
-def test_fullwidth_weight_syntax_and_cjk_preservation() -> None:
-    tags = parse_novelai_prompt("（青い目：0.75），－１：：帽子：：，「title」，《作品》")
-    assert tags == ["青い目", "「title」", "《作品》"]
-
-
-def test_novelai_parenthesized_tag_qualifiers_are_preserved() -> None:
-    tags = parse_novelai_prompt(
-        "yuuki noa, yuuki (princess connect!), yuuki (sao), "
-        "akizuki kanna(cafe stella to shinigami no chou), "
-        "0.5::yd(orange maru), pottsness::"
-    )
-    assert tags == [
-        "yuuki noa",
-        "yuuki (princess connect!)",
-        "yuuki (sao)",
-        "akizuki kanna(cafe stella to shinigami no chou)",
-        "yd(orange maru)",
-        "pottsness",
-    ]
-
-
-def test_novelai_cleans_only_round_wrappers_at_tag_boundaries() -> None:
-    tags = parse_novelai_prompt(
-        "(masterpiece), (digital painting:1.2), artist_name_(circle), "
-        "character (series)"
-    )
-    assert tags == [
-        "masterpiece", "digital painting", "artist_name_(circle)",
-        "character (series)",
-    ]
-
-
-def test_novelai_cleans_unmatched_foreign_round_punctuation_per_tag() -> None:
-    assert parse_novelai_prompt(
-        "(legendary Dragon Queen::, (1 girl), hair flowing) detailed sky"
-    ) == ["legendary Dragon Queen", "1 girl", "hair flowing detailed sky"]
-
-
-def test_novelai_escaped_round_punctuation_remains_literal() -> None:
-    assert parse_novelai_prompt(
-        r"\(literal wrapper\), artist\(circle\), \(unmatched"
-    ) == ["(literal wrapper)", "artist(circle)", "(unmatched"]
-
-
-def test_tag_normalization_preserves_display_but_unifies_underscore() -> None:
-    assert split_prompt_tags("blue_hair, blue hair") == ["blue_hair"]
-    assert normalize_prompt_tag("Blue_Hair") == "blue hair"
-
-
-def test_structured_novelai_generator_identity_uses_full_source() -> None:
-    result = parse_text_metadata({
-        "Software": "NovelAI",
-        "Source": "NovelAI Diffusion V4.5 4BDE2A90",
-        "Comment": '{"prompt":"cat"}',
-    })
-    assert result.model_type == "nai4"
-    assert result.model_identity == "NovelAI Diffusion V4.5 4BDE2A90"
-    assert result.model_name == result.model_identity
-    assert result.model_hash == "4bde2a90"
-    assert result.error is None
-
-
-def test_novelai_source_is_authoritative_for_generation() -> None:
-    result = parse_text_metadata({
-        "Software": "NovelAI",
-        "Source": "Stable Diffusion XL C1E1DE52",
-        "Comment": '{"prompt":"cat","v4_prompt":{"caption":{"base_caption":"v4 text"}}}',
-    })
-    assert result.model_type == "nai3"
-    assert result.tags == ("cat",)
-
-
-def test_non_novelai_json_comment_does_not_claim_novelai() -> None:
-    result = parse_text_metadata({"Comment": '{"prompt":"cat"}'})
-    assert result.error == "no_metadata"
-    assert result.model_type == "sd"
-    assert result.model_identity is None
-
-
-def test_a1111_model_name_and_hash_are_extracted() -> None:
-    result = parse_a1111_parameters(
-        "cat\nSteps: 20, Sampler: Euler, Model hash: ABCDEF12, "
-        "Model: blended_model-v2, Clip skip: 2"
-    )
-    assert result.model_identity == "blended_model-v2"
-    assert result.model_name == "blended_model-v2"
-    assert result.model_hash == "abcdef12"
-    assert result.error is None
-
-
-def test_prompt_metadata_without_name_uses_bilingual_other_model_identity() -> None:
-    result = parse_a1111_parameters("cat\nSteps: 20, Sampler: Euler, Model hash: ABCDEF12")
-    assert result.model_identity == OTHER_MODEL_IDENTITY
-    assert result.model_name == OTHER_MODEL_IDENTITY
-
-
-def test_prompt_metadata_without_hash_returns_distinct_error_but_keeps_tags() -> None:
-    sd = parse_a1111_parameters("cat\nSteps: 20, Sampler: Euler, Model: example")
-    nai = parse_text_metadata({
-        "Software": "NovelAI",
-        "Source": "NovelAI Diffusion V4.5",
-        "Comment": '{"prompt":"dog"}',
-    })
-    assert sd.tags == ("cat",)
-    assert sd.error == "missing_model_hash"
-    assert nai.tags == ("dog",)
-    assert nai.error == "missing_model_hash"
-
-
-def test_prompt_metadata_without_name_or_hash_uses_other_and_missing_hash() -> None:
-    result = parse_text_metadata({"Description": "cat"})
-    assert result.model_type == "sd"
-    assert result.model_identity == OTHER_MODEL_IDENTITY
-    assert result.error == "missing_model_hash"
-
-
-def load_tests(_loader, _tests, _pattern):
-    """Expose the lightweight function tests to the project's unittest suite."""
-    suite = unittest.TestSuite()
-    for name, function in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(function):
-            continue
-        if function.__code__.co_argcount == 1:
-            def run_with_temp_path(test_function=function):
-                with tempfile.TemporaryDirectory() as directory:
-                    test_function(Path(directory))
-
-            test = unittest.FunctionTestCase(run_with_temp_path, description=name)
-        else:
-            test = unittest.FunctionTestCase(function, description=name)
-        suite.addTest(test)
-    return suite
+NAI45_SOURCE = "NovelAI Diffusion V4.5 4BDE2A90"
+NAI4_SOURCE = "NovelAI Diffusion V4 37442FCA"
+NAI3_SOURCE = "Stable Diffusion XL C1E1DE52"
+
+
+def novelai_text(
+    comment: dict[str, object] | str | None,
+    source: str | None = NAI45_SOURCE,
+    *,
+    description: str | None = None,
+    software: str = "NovelAI",
+) -> dict[str, str]:
+    text = {"Title": "NovelAI generated image"}
+    if description is not None:
+        text["Description"] = description
+    text["Software"] = software
+    if source is not None:
+        text["Source"] = source
+    text["Generation time"] = "5.83"
+    if comment is not None:
+        text["Comment"] = comment if isinstance(comment, str) else json.dumps(comment)
+    return text
+
+
+class PngExtractionMixin:
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.written = 0
+
+    def extract(self, text: dict[str, str]) -> PromptResult:
+        info = PngInfo()
+        for key, value in text.items():
+            info.add_text(key, value)
+        self.written += 1
+        path = self.root / f"generated-{self.written}.png"
+        Image.new("RGB", (4, 4), (40, 80, 120)).save(path, pnginfo=info)
+        return extract_nai_prompt(path, stealth_fallback=False)
+
+
+class NovelAIPngExtractionTests(PngExtractionMixin, unittest.TestCase):
+    def test_v45_indexes_only_positive_base_and_character_captions(self) -> None:
+        base = (
+            "1girl, yuuki (sao), {{masterpiece}}, [[sketch]], "
+            "1.3::blue_eyes::, -1::hat::, outdoors"
+        )
+        comment = {
+            "prompt": base,
+            "steps": 28,
+            "height": 1216,
+            "width": 832,
+            "scale": 5.0,
+            "seed": 1234567890,
+            "sampler": "k_euler_ancestral",
+            "noise_schedule": "karras",
+            "uc": "lowres, bad anatomy",
+            "v4_prompt": {
+                "caption": {
+                    "base_caption": base,
+                    "char_captions": [
+                        {"char_caption": "girl, Blue_Eyes, smile", "centers": [{"x": 0.5, "y": 0.5}]},
+                    ],
+                },
+                "use_coords": False,
+                "use_order": True,
+            },
+            "v4_negative_prompt": {
+                "caption": {
+                    "base_caption": "lowres, bad anatomy",
+                    "char_captions": [{"char_caption": "frown", "centers": [{"x": 0.5, "y": 0.5}]}],
+                },
+                "legacy_uc": False,
+            },
+        }
+
+        result = self.extract(novelai_text(comment, description=base))
+
+        self.assertEqual(result.prompt_format, "novelai")
+        self.assertEqual(result.metadata_source, "text:Comment")
+        self.assertEqual(result.model_type, "nai4")
+        self.assertEqual(result.model_version, "4.5")
+        self.assertEqual(result.model_hash, "4bde2a90")
+        self.assertEqual(result.model_identity, NAI45_SOURCE)
+        self.assertEqual(result.model_name, NAI45_SOURCE)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.tags,
+            ("1girl", "yuuki (sao)", "masterpiece", "sketch", "blue_eyes", "outdoors", "girl", "smile"),
+        )
+        self.assertEqual(result.prompt, ", ".join(result.tags))
+        self.assertEqual(
+            json.loads(result.raw_metadata),
+            {
+                "Source": NAI45_SOURCE,
+                "prompt": base,
+                "uc": comment["uc"],
+                "v4_prompt": comment["v4_prompt"],
+                "v4_negative_prompt": comment["v4_negative_prompt"],
+            },
+        )
+
+    def test_nai3_source_ignores_v4_fields_and_drops_non_positive_mix_segments(self) -> None:
+        comment = {
+            "prompt": "cat:1|happy dog:0|rainy:-0.3|night sky, 0::hidden::, {best quality}",
+            "uc": "bad anatomy",
+            "v4_prompt": {"caption": {"base_caption": "v4 only tag"}},
+        }
+
+        result = self.extract(novelai_text(comment, NAI3_SOURCE))
+
+        self.assertEqual(result.model_type, "nai3")
+        self.assertIsNone(result.model_version)
+        self.assertEqual(result.model_hash, "c1e1de52")
+        self.assertEqual(result.model_identity, NAI3_SOURCE)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.tags, ("cat", "night sky", "best quality"))
+
+    def test_actual_prompts_replace_randomized_prompt_syntax(self) -> None:
+        comment = {
+            "prompt": "||black|white|| thighhighs",
+            "v4_prompt": {"caption": {"base_caption": "||black|white|| thighhighs", "char_captions": []}},
+            "actual_prompts": {"prompt": {"base_caption": "white thighhighs"}},
+        }
+
+        result = self.extract(novelai_text(comment, NAI4_SOURCE))
+
+        self.assertEqual(result.model_version, "4")
+        self.assertEqual(result.model_hash, "37442fca")
+        self.assertEqual(result.tags, ("white thighhighs",))
+
+    def test_v4_without_structured_caption_uses_plain_prompt(self) -> None:
+        fallback = self.extract(novelai_text({"prompt": "cat, rain"}, NAI4_SOURCE))
+        self.assertEqual(fallback.model_type, "nai4")
+        self.assertEqual(fallback.tags, ("cat", "rain"))
+        self.assertIsNone(fallback.error)
+
+        empty = self.extract(novelai_text({"steps": 28}, NAI4_SOURCE))
+        self.assertEqual(empty.model_type, "nai4")
+        self.assertEqual(empty.error, "no_prompt")
+        self.assertEqual(empty.tags, ())
+        self.assertIsNone(empty.prompt)
+        self.assertEqual(empty.model_hash, "37442fca")
+
+    def test_non_text_nai3_prompt_records_no_prompt_or_missing_hash(self) -> None:
+        with_source = self.extract(novelai_text({"prompt": 5}, NAI3_SOURCE))
+        self.assertEqual(with_source.error, "no_prompt")
+        self.assertEqual(with_source.model_type, "nai3")
+        self.assertEqual(with_source.model_identity, NAI3_SOURCE)
+
+        without_source = self.extract(novelai_text({"prompt": 5}, None))
+        self.assertEqual(without_source.error, "missing_model_hash")
+        self.assertEqual(without_source.model_identity, OTHER_MODEL_IDENTITY)
+        self.assertIsNone(without_source.model_hash)
+
+    def test_prompt_with_only_excluded_spans_has_no_searchable_tags(self) -> None:
+        result = self.extract(novelai_text({"prompt": "-1::lowres::, 0::watermark::"}, NAI3_SOURCE))
+        self.assertEqual(result.tags, ())
+        self.assertIsNone(result.prompt)
+        self.assertEqual(result.error, "no_prompt")
+        self.assertEqual(result.model_hash, "c1e1de52")
+
+    def test_missing_source_uses_other_model_and_missing_hash_but_keeps_tags(self) -> None:
+        result = self.extract(novelai_text({"prompt": "cat, smile"}, None))
+        self.assertEqual(result.tags, ("cat", "smile"))
+        self.assertEqual(result.error, "missing_model_hash")
+        self.assertEqual(result.model_identity, OTHER_MODEL_IDENTITY)
+        self.assertEqual(result.model_name, OTHER_MODEL_IDENTITY)
+        self.assertEqual(result.model_type, "nai3")
+
+    def test_source_without_hash_is_missing_model_hash_with_full_identity(self) -> None:
+        result = self.extract(novelai_text({"prompt": "dog"}, "NovelAI Diffusion V4.5"))
+        self.assertEqual(result.tags, ("dog",))
+        self.assertEqual(result.error, "missing_model_hash")
+        self.assertEqual(result.model_type, "nai4")
+        self.assertIsNone(result.model_hash)
+        self.assertEqual(result.model_identity, "NovelAI Diffusion V4.5")
+
+    def test_novelai_without_comment_records_identity_without_prompt(self) -> None:
+        with_hash = self.extract(novelai_text(None, NAI3_SOURCE))
+        self.assertEqual(with_hash.prompt_format, "novelai")
+        self.assertEqual(with_hash.metadata_source, "text:Comment")
+        self.assertEqual(with_hash.error, "no_prompt")
+        self.assertEqual(with_hash.model_type, "nai3")
+        self.assertEqual(with_hash.model_hash, "c1e1de52")
+        self.assertEqual(with_hash.model_identity, NAI3_SOURCE)
+        self.assertEqual(with_hash.tags, ())
+
+        v4 = self.extract(novelai_text(None, NAI45_SOURCE))
+        self.assertEqual(v4.model_type, "nai4")
+        self.assertEqual(v4.error, "no_prompt")
+
+        bare = self.extract(novelai_text(None, None))
+        self.assertEqual(bare.error, "missing_model_hash")
+        self.assertEqual(bare.model_identity, OTHER_MODEL_IDENTITY)
+        self.assertIsNone(bare.model_hash)
+
+    def test_malformed_comment_is_reported_and_preserves_source_identity(self) -> None:
+        result = self.extract(novelai_text("{not valid json", NAI45_SOURCE))
+        self.assertEqual(result.error, "malformed_metadata")
+        self.assertEqual(result.prompt_format, "novelai")
+        self.assertEqual(result.model_type, "nai4")
+        self.assertEqual(result.model_version, "4.5")
+        self.assertEqual(result.model_hash, "4bde2a90")
+        self.assertEqual(result.model_identity, NAI45_SOURCE)
+        self.assertEqual(result.raw_metadata, "{not valid json")
+        self.assertEqual(result.tags, ())
+
+        no_source = self.extract(novelai_text("[]", None))
+        self.assertEqual(no_source.error, "malformed_metadata")
+        self.assertEqual(no_source.model_type, "nai3")
+        self.assertIsNone(no_source.model_hash)
+        self.assertIsNone(no_source.model_version)
+        self.assertEqual(no_source.model_identity, OTHER_MODEL_IDENTITY)
+
+    def test_software_field_is_authoritative_even_with_a1111_parameters(self) -> None:
+        text = novelai_text("not json", NAI3_SOURCE, software=" novelAI ")
+        text["parameters"] = "cat\nSteps: 20, Model hash: abcdef12"
+        result = self.extract(text)
+        self.assertEqual(result.prompt_format, "novelai")
+        self.assertEqual(result.error, "malformed_metadata")
+        self.assertEqual(result.tags, ())
+
+    def test_partial_character_captions_skip_invalid_entries(self) -> None:
+        comment = {
+            "v4_prompt": {
+                "caption": {
+                    "base_caption": "  ",
+                    "char_captions": ["solo", {"caption": "red eyes"}, {"char_caption": 3}, 7, "", {"char_caption": "SOLO"}],
+                },
+            },
+        }
+        result = self.extract(novelai_text(comment, NAI45_SOURCE))
+        self.assertEqual(result.tags, ("solo", "red eyes"))
+        self.assertIsNone(result.error)
+
+    def test_pathological_nesting_is_flagged_but_tag_is_still_indexed(self) -> None:
+        nested = "(" * 130 + "cat" + ")" * 130
+        result = self.extract(novelai_text({"prompt": nested}, NAI4_SOURCE))
+        self.assertEqual(result.error, "prompt_nesting_too_deep")
+        self.assertEqual(result.tags, ("cat",))
+
+    def test_json_comment_without_novelai_software_is_not_prompt_metadata(self) -> None:
+        result = self.extract({"Comment": '{"prompt":"cat"}'})
+        self.assertEqual(result.error, "no_metadata")
+        self.assertEqual(result.model_type, "sd")
+        self.assertIsNone(result.model_identity)
+        self.assertEqual(result.tags, ())
+
+
+class StableDiffusionPngExtractionTests(PngExtractionMixin, unittest.TestCase):
+    def test_forge_parameters_index_positive_prompt_and_model_identity(self) -> None:
+        parameters = (
+            "masterpiece, (kujou miyako:1.2), [9-nine-], <lora:miyako5:0.6>, [cow|horse], "
+            r"[fantasy:cyberpunk:0.5], [:sunset:0.7], \(artist\), .chibi, BREAK yuuki (sao), sanoba_witch"
+            "\nNegative prompt: lowres, bad anatomy\n"
+            "Steps: 28, Sampler: Euler a, Schedule type: Automatic, CFG scale: 7, Seed: 1234, "
+            "Size: 832x1216, Model hash: 6681E8E4B1, Model: animagine-xl-3.1, Version: f2.0.1v1.10.1"
+        )
+
+        result = self.extract({"parameters": parameters})
+
+        self.assertEqual(result.prompt_format, "a1111")
+        self.assertEqual(result.metadata_source, "text:parameters")
+        self.assertEqual(result.model_type, "sd")
+        self.assertEqual(result.model_hash, "6681e8e4b1")
+        self.assertEqual(result.model_identity, "animagine-xl-3.1")
+        self.assertEqual(result.model_name, "animagine-xl-3.1")
+        self.assertIsNone(result.model_version)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.raw_metadata, parameters)
+        self.assertEqual(
+            result.tags,
+            (
+                "masterpiece", "kujou miyako", "9-nine-", "cow", "horse", "fantasy", "cyberpunk",
+                "sunset", "(artist)", "chibi", "yuuki sao", "sanoba_witch",
+            ),
+        )
+        self.assertNotIn("miyako5", result.prompt)
+        self.assertNotIn("lowres", result.prompt)
+
+    def test_fullwidth_ime_syntax_in_itxt_parameters(self) -> None:
+        result = self.extract({
+            "parameters": (
+                "（青い目：０．７５），［cat］，black and white，red hair AND blue eyes\n"
+                "Steps：２０，Sampler：Euler a，Model hash：A1B2C3D4"
+            )
+        })
+        self.assertEqual(result.tags, ("青い目", "cat", "black and white", "red hair", "blue eyes"))
+        self.assertEqual(result.model_hash, "a1b2c3d4")
+        self.assertEqual(result.model_identity, OTHER_MODEL_IDENTITY)
+        self.assertIsNone(result.error)
+
+    def test_parameters_without_settings_have_missing_hash_and_other_model(self) -> None:
+        result = self.extract({"parameters": "cat, dog"})
+        self.assertEqual(result.tags, ("cat", "dog"))
+        self.assertEqual(result.error, "missing_model_hash")
+        self.assertEqual(result.model_identity, OTHER_MODEL_IDENTITY)
+        self.assertIsNone(result.model_hash)
+
+    def test_settings_only_parameters_have_no_prompt(self) -> None:
+        result = self.extract({"parameters": "Steps: 20, Sampler: Euler, Model hash: abcdef12, Model: example"})
+        self.assertEqual(result.tags, ())
+        self.assertIsNone(result.prompt)
+        self.assertEqual(result.error, "no_prompt")
+        self.assertEqual(result.model_hash, "abcdef12")
+        self.assertEqual(result.model_identity, "example")
+
+    def test_pathological_nesting_is_flagged_and_bounded(self) -> None:
+        result = self.extract({"parameters": "(" * 66 + "cat" + ")" * 66})
+        self.assertEqual(result.error, "prompt_nesting_too_deep")
+        self.assertTrue(any("cat" in tag for tag in result.tags))
+
+    def test_plain_prompt_fields_are_stable_diffusion_without_model(self) -> None:
+        for key in ("Description", "prompt"):
+            with self.subTest(key=key):
+                text = {"parameters": "   ", key: "cat, blue_eyes"}
+                if key == "prompt":
+                    text["Description"] = " "
+                result = self.extract(text)
+                self.assertEqual(result.metadata_source, f"text:{key}")
+                self.assertEqual(result.prompt_format, "a1111")
+                self.assertEqual(result.model_type, "sd")
+                self.assertEqual(result.model_identity, OTHER_MODEL_IDENTITY)
+                self.assertEqual(result.error, "missing_model_hash")
+                self.assertEqual(result.tags, ("cat", "blue_eyes"))
+
+    def test_image_without_generation_metadata_is_no_metadata(self) -> None:
+        result = self.extract({"Title": "holiday photo"})
+        self.assertEqual(result.error, "no_metadata")
+        self.assertEqual(result.model_type, "sd")
+        self.assertIsNone(result.prompt)
+        self.assertIsNone(result.metadata_source)
+
+
+class NovelAIPromptSyntaxTests(unittest.TestCase):
+    def test_numeric_scopes_exclude_negative_and_zero_weight_spans(self) -> None:
+        tags = parse_novelai_prompt(
+            "1girl, 1.5::rain, night::, -2.5::hat, glasses::, 0::tie::, "
+            "-1::negative outer, -1::positive inner:: ::, outdoors"
+        )
+        self.assertEqual(tags, ["1girl", "rain", "night", "positive inner", "outdoors"])
+
+    def test_unclosed_negative_scope_excludes_rest_of_prompt(self) -> None:
+        self.assertEqual(parse_novelai_prompt("cat, -1::hat, glasses"), ["cat"])
+
+    def test_weighted_scope_closer_separates_tags(self) -> None:
+        self.assertEqual(parse_novelai_prompt("1.2::sanoba_witch::1girl"), ["sanoba_witch", "1girl"])
+        self.assertEqual(parse_novelai_prompt("cat::dog"), ["cat::dog"])
+
+    def test_nai3_mix_keeps_only_positive_weight_segments(self) -> None:
+        self.assertEqual(
+            parse_novelai_prompt("cat:1|happy:-0.2|cute:-0.3|style:name", model_type="nai3"),
+            ["cat", "style:name"],
+        )
+        self.assertEqual(parse_novelai_prompt("cat:1|dog:0", model_type="nai3"), ["cat"])
+        self.assertEqual(parse_novelai_prompt("cat:1|dog:0.01", model_type="nai3"), ["cat", "dog"])
+
+    def test_nai3_mix_excludes_unicode_negative_and_zero_weights(self) -> None:
+        for weight in ("－1", "−1", "－１", "−１．５", "０", "０．０"):
+            with self.subTest(weight=weight):
+                self.assertEqual(
+                    parse_novelai_prompt(f"cat:1|dog:{weight}|bird:1", model_type="nai3"),
+                    ["cat", "bird"],
+                )
+
+    def test_nai3_mix_normalizes_only_numeric_weights_preserving_tag_text(self) -> None:
+        self.assertEqual(
+            parse_novelai_prompt("－１ cats:+１．５|−２ birds:０．０１|series１|style:−noir", model_type="nai3"),
+            ["－１ cats", "−２ birds", "series１", "style:−noir"],
+        )
+
+    def test_pipe_fallback_and_cjk_separators(self) -> None:
+        tags = parse_novelai_prompt("||red|blue|| hair｜green，青い目。solo、白髪；帽子")
+        self.assertEqual(tags, ["red", "blue", "hair", "green", "青い目", "solo", "白髪", "帽子"])
+
+    def test_fullwidth_weight_syntax_and_cjk_brackets_are_preserved(self) -> None:
+        tags = parse_novelai_prompt("（青い目：0.75），－１：：帽子：：，「title」，《作品》")
+        self.assertEqual(tags, ["青い目", "「title」", "《作品》"])
+
+    def test_parenthesized_tag_qualifiers_are_preserved(self) -> None:
+        tags = parse_novelai_prompt(
+            "yuuki noa, yuuki (princess connect!), yuuki (sao), "
+            "akizuki kanna(cafe stella to shinigami no chou), "
+            "0.5::yd(orange maru), pottsness::"
+        )
+        self.assertEqual(tags, [
+            "yuuki noa",
+            "yuuki (princess connect!)",
+            "yuuki (sao)",
+            "akizuki kanna(cafe stella to shinigami no chou)",
+            "yd(orange maru)",
+            "pottsness",
+        ])
+
+    def test_round_wrappers_are_cleaned_only_at_tag_boundaries(self) -> None:
+        tags = parse_novelai_prompt(
+            "(masterpiece), (digital painting:1.2), artist_name_(circle), character (series)"
+        )
+        self.assertEqual(tags, ["masterpiece", "digital painting", "artist_name_(circle)", "character (series)"])
+
+    def test_unmatched_round_punctuation_is_removed_per_tag(self) -> None:
+        self.assertEqual(
+            parse_novelai_prompt("(legendary Dragon Queen::, (1 girl), hair flowing) detailed sky"),
+            ["legendary Dragon Queen::", "1 girl", "hair flowing detailed sky"],
+        )
+        self.assertEqual(parse_novelai_prompt("cat, ("), ["cat"])
+        self.assertEqual(parse_novelai_prompt("cat), dog"), ["cat", "dog"])
+
+    def test_escaped_round_punctuation_remains_literal(self) -> None:
+        self.assertEqual(
+            parse_novelai_prompt(r"\(literal wrapper\), artist\(circle\), \(unmatched"),
+            ["(literal wrapper)", "artist(circle)", "(unmatched"],
+        )
+
+    def test_duplicates_collapse_case_insensitively_keeping_first_spelling(self) -> None:
+        self.assertEqual(parse_novelai_prompt("Blue Eyes, blue_eyes, BLUE  EYES, cat"), ["Blue Eyes", "cat"])
+
+    def test_scope_nesting_beyond_limit_is_bounded_and_keeps_following_tags(self) -> None:
+        self.assertEqual(parse_novelai_prompt("1::" * 65 + "cat" + "::" * 64 + ", dog"), ["cat", "dog"])
+
+
+class StableDiffusionPromptSyntaxTests(unittest.TestCase):
+    def test_grouped_emphasis_and_pipe_fallback(self) -> None:
+        result = parse_a1111_parameters("(red hair, blue eyes:1.2), rain|snow")
+        self.assertEqual(result.tags, ("red hair", "blue eyes", "rain", "snow"))
+
+    def test_prompt_editing_keeps_every_scheduled_branch(self) -> None:
+        result = parse_a1111_parameters("[dog:0.5], [cat:fox:10], [:hat:0.2]")
+        self.assertEqual(result.tags, ("dog", "cat", "fox", "hat"))
+
+    def test_cjk_full_stops_separate_tags(self) -> None:
+        self.assertEqual(parse_a1111_parameters("cat．dog。bird").tags, ("cat", "dog", "bird"))
+
+    def test_unclosed_wrapper_is_kept_literally(self) -> None:
+        self.assertEqual(parse_a1111_parameters("cat, (blue eyes, dog").tags, ("cat", "(blue eyes", "dog"))
+
+
+class TagNormalizationTests(unittest.TestCase):
+    def test_display_keeps_underscores_while_matching_ignores_them_and_case(self) -> None:
+        self.assertEqual(split_prompt_tags("blue_hair, Blue Hair"), ["blue_hair"])
+        self.assertEqual(normalize_prompt_tag("Sanoba_Witch"), "sanoba witch")
+        self.assertEqual(normalize_prompt_tag("sanoba  witch"), normalize_prompt_tag("sanoba_witch"))
+
+    def test_unicode_forms_are_unified(self) -> None:
+        self.assertEqual(normalize_prompt_tag("Cafe\u0301"), normalize_prompt_tag("café"))
+
+    def test_model_identity_stays_one_searchable_tag(self) -> None:
+        self.assertEqual(sanitize_model_name(" Foo, Bar；Baz。 Quux｜model "), "Foo Bar Baz Quux model")
+
+
+if __name__ == "__main__":
+    unittest.main()

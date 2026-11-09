@@ -4,6 +4,8 @@ import sqlite3
 import unittest
 import zlib
 
+from imgdupe.query import query_prompt_tags
+
 from imgdupe.db import (
     MAX_PROMPT_METADATA_BYTES,
     PROMPT_SCHEMA_VERSION,
@@ -110,11 +112,11 @@ class PromptSchemaTests(unittest.TestCase):
         self.assertEqual(
             get_metadata(self.conn, PROMPT_SCHEMA_VERSION_KEY), PROMPT_SCHEMA_VERSION
         )
-        indexes = {
-            str(row[1]) for row in self.conn.execute("PRAGMA index_list(prompt_tags)")
-        }
-        self.assertIn("idx_prompt_tags_norm_image", indexes)
-        self.assertIn("idx_prompt_tags_kind_norm_image", indexes)
+        stored = self.conn.execute("SELECT prompt, metadata_source, prompt_indexed_at FROM image_prompts").fetchone()
+        self.assertEqual(tuple(stored), ("blue_hair", "text", "then"))
+        results = query_prompt_tags(self.conn, "blue hair")
+        self.assertEqual([result.image_row["id"] for result in results], [1])
+        self.assertEqual(results[0].matched_tags, ("blue_hair",))
 
     def test_current_database_skips_collection_wide_prompt_backfill(self) -> None:
         init_db(self.conn)
@@ -179,6 +181,27 @@ class PromptSchemaTests(unittest.TestCase):
             [(row["tag"], row["tag_kind"]) for row in tags],
             [("blue hair", "prompt"), ("@model:abc123", "model_hash")],
         )
+
+    def test_replacing_prompt_removes_stale_tags_and_metadata(self) -> None:
+        init_db(self.conn)
+        self.add_image()
+        raw, codec = encode_prompt_metadata('{"prompt":"cat"}')
+        replace_prompt(self.conn, 1, prompt="cat", metadata_source="text:Comment",
+                       prompt_error=None, indexed_at="before", tags=[("cat", "cat")],
+                       model_type="nai4", model_hash="abcdef12", raw_metadata=raw,
+                       raw_metadata_codec=codec)
+
+        replace_prompt(self.conn, 1, prompt="dog", metadata_source="text:parameters",
+                       prompt_error="missing_model_hash", indexed_at="after", tags=[("dog", "dog")])
+
+        self.assertEqual(query_prompt_tags(self.conn, "cat"), [])
+        self.assertEqual([result.image_row["id"] for result in query_prompt_tags(self.conn, "dog")], [1])
+        row = self.conn.execute("SELECT * FROM image_prompts").fetchone()
+        self.assertEqual((row["prompt"], row["prompt_error"], row["prompt_indexed_at"]),
+                         ("dog", "missing_model_hash", "after"))
+        self.assertIsNone(row["model_hash"])
+        self.assertIsNone(row["raw_metadata"])
+        self.assertIsNone(row["raw_metadata_codec"])
 
     def test_reopening_database_does_not_overwrite_configured_category(self) -> None:
         init_db(self.conn)

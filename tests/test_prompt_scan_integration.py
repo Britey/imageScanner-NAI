@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import struct
+import sqlite3
 import tempfile
 import unittest
-import zlib
 from pathlib import Path
+
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 from imgdupe.config import ScanConfig
 from imgdupe.db import connect, init_db, upsert_image
@@ -14,16 +16,10 @@ from imgdupe.scan import scan_roots
 from imgdupe.utils import utc_now_sql
 
 
-def _png_text_chunk(kind: bytes, data: bytes) -> bytes:
-    crc = zlib.crc32(kind + data)
-    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
-
-
 def _write_prompt_png(path: Path, parameters: str) -> None:
-    payload = b"\x89PNG\r\n\x1a\n"
-    payload += _png_text_chunk(b"tEXt", b"parameters\0" + parameters.encode("utf-8"))
-    payload += _png_text_chunk(b"IEND", b"")
-    path.write_bytes(payload)
+    info = PngInfo()
+    info.add_text("parameters", parameters)
+    Image.new("RGB", (64, 64), (30, 90, 150)).save(path, pnginfo=info)
 
 
 class PromptScanIntegrationTests(unittest.TestCase):
@@ -61,6 +57,21 @@ class PromptScanIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.connection.close()
         self.temporary_directory.cleanup()
+
+    def test_fresh_image_is_decoded_hashed_and_searchable_by_positive_prompt(self) -> None:
+        self.connection.execute("DELETE FROM images")
+        self.connection.commit()
+
+        stats = scan_roots(self.connection, [self.root], config=ScanConfig(workers=1),
+                           model_paths=ModelPathConfig())
+
+        self.assertEqual((stats.indexed, stats.failed), (1, 0))
+        row = self.connection.execute("SELECT width, height, decode_error, sha256 FROM images").fetchone()
+        self.assertEqual((row["width"], row["height"], row["decode_error"]), (64, 64, None))
+        self.assertEqual(len(row["sha256"]), 32)
+        self.assertEqual(len(query_prompt_tags(self.connection, "cat, cow")), 1)
+        self.assertEqual(query_prompt_tags(self.connection, "bad anatomy"), [])
+        self.assertEqual(query_prompt_tags(self.connection, "test"), [])
 
     def test_configured_model_parser_tags_and_query_filter_integrate(self) -> None:
         model_paths = ModelPathConfig((make_rule(self.root, "noob"),))
@@ -204,22 +215,31 @@ class PromptScanIntegrationTests(unittest.TestCase):
         )
         self.connection.commit()
 
-        statements: list[str] = []
-        self.connection.set_trace_callback(statements.append)
-        try:
-            stats = scan_roots(
-                self.connection,
-                [self.root],
-                config=ScanConfig(workers=1, reindex_prompts=True, batch_size=1),
-            )
-        finally:
-            self.connection.set_trace_callback(None)
+        visible_prompt_counts: list[int] = []
+        database = self.base / "images.sqlite"
+
+        class ObservedConnection(sqlite3.Connection):
+            def commit(connection):
+                super().commit()
+                # A separate connection only sees data actually made durable.
+                with sqlite3.connect(database) as reader:
+                    visible_prompt_counts.append(reader.execute("SELECT COUNT(*) FROM image_prompts").fetchone()[0])
+
+        self.connection.close()
+        self.connection = sqlite3.connect(database, factory=ObservedConnection)
+        self.connection.row_factory = sqlite3.Row
+        stats = scan_roots(
+            self.connection,
+            [self.root],
+            config=ScanConfig(workers=1, reindex_prompts=True, batch_size=1),
+            model_paths=ModelPathConfig(),
+        )
 
         self.assertEqual(stats.indexed, 2)
-        self.assertGreaterEqual(
-            sum(statement.strip().upper() == "COMMIT" for statement in statements),
-            2,
-        )
+        self.assertIn(1, visible_prompt_counts)
+        self.assertEqual(visible_prompt_counts[-1], 2)
+        self.assertEqual(len(query_prompt_tags(self.connection, "cat")), 1)
+        self.assertEqual(len(query_prompt_tags(self.connection, "dog")), 1)
 
     def test_missing_model_hash_is_recorded_without_stopping_other_images(self) -> None:
         missing_hash = self.root / "missing-hash.png"
@@ -266,7 +286,7 @@ class PromptScanIntegrationTests(unittest.TestCase):
 
     def test_no_metadata_uses_a_separate_hidden_identity(self) -> None:
         plain = self.root / "plain.png"
-        plain.write_bytes(b"\x89PNG\r\n\x1a\n" + _png_text_chunk(b"IEND", b""))
+        Image.new("RGB", (64, 64), (30, 90, 150)).save(plain)
         stat = plain.stat()
         upsert_image(
             self.connection,

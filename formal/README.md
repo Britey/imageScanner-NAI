@@ -1,9 +1,11 @@
 # Unique-tag counting model
 
-`UniqueTags.tla` specifies the optimized query in
-`imgdupe.web._count_unique_tags`. It enumerates distinct tag names, probes their
-occurrences in any order, and stops at the first visible occurrence. An
-independent set expression specifies the original JOIN + COUNT(DISTINCT).
+`UniqueTags.tla` specifies the visibility and distinct-count semantics used by
+`imgdupe.web._count_unique_tags`. Its reference algorithm enumerates distinct
+tag names, probes their occurrences, and stops at the first visible occurrence.
+The application now maintains the equivalent count transactionally through
+SQLite summary triggers; it does not execute this reference walk on each page.
+An independent set expression specifies the original JOIN + COUNT(DISTINCT).
 
 The input is an immutable database snapshot, matching a single SQLite SELECT.
 The `(image_id, tag_norm)` primary key becomes a function from image/tag pairs
@@ -32,10 +34,12 @@ exit status 12; syntax errors or an unexpectedly successful mutant fail the run.
 
 `tests/test_unique_tags_model.py` connects the abstraction to the implementation:
 it enumerates 10,000 corresponding concrete SQLite databases, distinguishing
-empty from nonempty configured labels, and compares the optimized SQL, original
-SQL, and an independent Python visibility oracle.
+empty from nonempty configured labels, and compares the maintained summary, original
+SQL, and an independent Python visibility oracle. Trigger updates, deletion,
+rollback, replacement, and migration have separate SQLite regression tests.
 
-This is bounded model checking of the query algorithm, not an unbounded proof
+This is bounded model checking of the reference algorithm and semantics, not a
+model of incremental trigger transitions or an unbounded proof
 of the Python program or SQLite query planner. It does not model concurrent
 writes between multiple statements, wall-clock latency, or SQLite's VM cost;
 the separate existing regression checks actual VM work on repeated tags.

@@ -45,6 +45,10 @@ sample_images2/
 .codex-test-deps/
 .codex-smoke.sqlite
 
+# Disposable performance fixtures, environments, and thumbnail caches
+/.perf-work/
+/performance-results/
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

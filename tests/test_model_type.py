@@ -3,6 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from imgdupe import model_type
 
 from imgdupe.model_type import ModelTypeResolver
 
@@ -27,6 +30,7 @@ class ModelTypeResolverTests(unittest.TestCase):
         result = ModelTypeResolver(self.root).resolve_for_image(self.image)
 
         self.assertEqual(result.status, "found")
+        self.assertTrue(result.is_valid_marker)
         self.assertEqual(result.model_type, "noob")
         self.assertEqual(result.marker_path, child_marker.resolve())
         self.assertIsNotNone(result.marker_signature)
@@ -49,6 +53,7 @@ class ModelTypeResolverTests(unittest.TestCase):
         result = ModelTypeResolver(self.root).resolve_for_image(self.image)
 
         self.assertEqual(result.status, "found")
+        self.assertTrue(result.is_valid_marker)
         self.assertEqual(result.model_type, "nai4")
 
     def test_every_supported_value_is_canonicalized(self) -> None:
@@ -72,6 +77,7 @@ class ModelTypeResolverTests(unittest.TestCase):
         result = ModelTypeResolver(self.root).resolve_for_image(self.image)
 
         self.assertEqual(result.status, "invalid_model_marker")
+        self.assertFalse(result.is_valid_marker)
         self.assertIsNone(result.model_type)
         self.assertEqual(result.marker_path, invalid_marker.resolve())
         self.assertIn("unknown model type", result.error or "")
@@ -83,6 +89,7 @@ class ModelTypeResolverTests(unittest.TestCase):
         result = ModelTypeResolver(self.root).resolve_for_image(self.image)
 
         self.assertEqual(result.status, "invalid_model_marker")
+        self.assertFalse(result.is_valid_marker)
         self.assertIn("contains no model type", result.error or "")
 
     def test_directory_results_are_cached_for_one_scan(self) -> None:
@@ -118,6 +125,37 @@ class ModelTypeResolverTests(unittest.TestCase):
         outside = self.base / "outside" / "image.png"
         with self.assertRaisesRegex(ValueError, "outside scan root"):
             ModelTypeResolver(self.root).resolve_for_image(outside)
+
+    def test_unreadable_marker_is_invalid_and_does_not_fall_back_to_ancestor(self) -> None:
+        (self.root / ".model_type").write_text("sd", encoding="utf-8")
+        marker = self.image_directory / ".model_type"
+        marker.mkdir()
+
+        result = ModelTypeResolver(self.root).resolve_for_image(self.image)
+
+        self.assertEqual(result.status, "invalid_model_marker")
+        self.assertFalse(result.is_valid_marker)
+        self.assertIsNone(result.model_type)
+        self.assertIsNone(result.marker_signature)
+        self.assertIn("could not read model marker", result.error)
+
+    def test_non_utf8_marker_is_invalid_with_its_signature_preserved(self) -> None:
+        marker = self.root / ".model_type"
+        marker.write_bytes(b"\xffnai4")
+
+        result = ModelTypeResolver(self.root).resolve_for_image(self.image)
+
+        self.assertEqual(result.status, "invalid_model_marker")
+        self.assertFalse(result.is_valid_marker)
+        self.assertIsNone(result.model_type)
+        self.assertIsNotNone(result.marker_signature)
+        self.assertIn("not valid UTF-8", result.error)
+
+    def test_paths_on_another_drive_are_rejected(self) -> None:
+        resolver = ModelTypeResolver(self.root)
+        with patch.object(model_type.os.path, "commonpath", side_effect=ValueError("different drives")), \
+                self.assertRaisesRegex(ValueError, "outside scan root"):
+            resolver.resolve_directory(self.root)
 
 
 if __name__ == "__main__":
